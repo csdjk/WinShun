@@ -110,7 +110,9 @@ void CaptureEditor::attach(QQuickWindow* window)
     connect(window, &QWindow::widthChanged, this, &CaptureEditor::updateScale);
     connect(window, &QWindow::heightChanged, this, &CaptureEditor::updateScale);
     connect(window, &QWindow::screenChanged, this, &CaptureEditor::updateScale);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
     connect(window, &QQuickWindow::devicePixelRatioChanged, this, &CaptureEditor::updateScale);
+#endif
     // Hidden outside the controller: the picture and the document go as for Esc.
     connect(window, &QWindow::visibleChanged, this, [this](bool visible) {
         if (!visible && m_open)
