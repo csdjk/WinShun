@@ -1,14 +1,16 @@
 #include "ClipModel.h"
+#include "ClipThumbnailProvider.h"
 #include "FileIconProvider.h"
 #include "HotkeySteps.h"
 
 #include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
-#include <QUrl>
+#include <QTimeZone>
 
 using namespace ws;
 using namespace Qt::StringLiterals;
@@ -117,7 +119,7 @@ private slots:
         model.setRows(store.find({}), {});
         const QModelIndex index = model.index(0);
         const QString image = model.data(index, ClipModel::ImageRole).toString();
-        QCOMPARE(image, thumbnail ? QUrl::fromLocalFile(path).toString() : QString());
+        QCOMPARE(image, thumbnail ? ClipThumbnailProvider::url(path, QFileInfo(path).lastModified(QTimeZone::UTC).toMSecsSinceEpoch()) : QString());
         QCOMPARE(model.data(index, ClipModel::KindRole).toInt(), static_cast<int>(kind));
         QCOMPARE(store.payload(id).text, path);
         if (thumbnail) {
@@ -220,7 +222,7 @@ private slots:
         QCOMPARE(f.model.rowOf(held), 2);
         QCOMPARE(ws::hotkeysteps::stepRow(f.model.rowOf(held), f.model.count()), 3);
         const qint64 last = f.model.idAt(f.model.count() - 1);
-        QCOMPARE(ws::hotkeysteps::stepRow(f.model.rowOf(last), f.model.count()), f.model.count() - 1);
+        QCOMPARE(ws::hotkeysteps::stepRow(f.model.rowOf(last), f.model.count()), 0); // wrap to the newest
         const qint64 gone[] {held};
         f.store.remove(gone);
         f.show({});

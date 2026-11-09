@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PinWindow.h"
+#include "platform/Shell.h"
 
 #include <QColor>
 #include <QImage>
@@ -34,10 +35,14 @@ public:
         std::function<void()> closed; // a pin closed: its memory can go back to Windows
         std::function<bool()> dark;
         std::function<QColor()> accent; // a fill that carries white words
+        std::function<QColor()> edge; // PinWindow::Host::edge
+        std::function<qreal()> pillRadius; // PinWindow::Host::pillRadius
         std::function<void(const QString&)> copyText; // the text picked on a pin
-        // The lines of a picture (CaptureOcr::scan), for picking text; empty: no models.
+        // The lines of a picture (CaptureOcr::scan), for picking text.
         std::function<void(const QImage&, double dpr, std::function<void(QList<RedactLine>)> done)> readLines;
-        bool ocrAvailable = false; // the models are there (PaddleOcr::installed)
+        std::function<bool()> ocrAvailable; // checked again after an on-demand installation
+        // The host supplies its themed native menu; standalone previews can use the system menu.
+        std::function<int(HWND, const std::vector<shell::MenuItem>&, POINT)> popupMenu;
     };
 
     explicit PinManager(Callbacks callbacks, QObject* parent = nullptr);
@@ -59,11 +64,16 @@ public:
     // while they are hidden shows them again.
     bool allHidden() const { return m_hidden; }
     void setAllHidden(bool hidden);
+    // Light or dark, or the 界面风格, changed: the pins' borders again.
+    void restyle();
     // 全部置顶: every pin on top of other windows, or none.
     bool allTopmost() const;
     void setAllTopmost(bool on);
     // [Capture] PinDoubleClick: for every pin, and those made later.
     void setDoubleClick(PinDoubleClick action);
+    // The keys inside the pins (and in their menus), for every pin, and those made later.
+    void setKeys(const CaptureKeys& keys);
+    const CaptureKeys& keys() const { return m_keys; }
     // True while the Ctrl watcher runs (some pin is click-through), else no timer at all.
     bool watching() const { return m_watch.isActive(); }
 
@@ -78,6 +88,7 @@ private:
     QTimer m_watch; // a click-through pin under the cursor with Ctrl held takes the mouse (#59)
     bool m_hidden = false; // 隐藏全部贴图
     PinDoubleClick m_doubleClick = PinDoubleClick::Reset;
+    CaptureKeys m_keys;
     const PinWindow* m_menuPin = nullptr; // the pin whose menu is up
     std::vector<std::unique_ptr<PinWindow>> m_closing; // windows gone, deleted once their procedure returned
 };

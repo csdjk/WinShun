@@ -25,22 +25,39 @@ Window {
     // the rows' list and the search bar are the panel's own, and everything
     // here that works a list or the bar goes through `view` and `searchBar`.
     readonly property bool panel: launcher.panel
-    readonly property var view: panel ? panelPage.view : boxList
-    readonly property int gridColumns: panel ? panelPage.gridColumns : 1
+    // Made ahead, a little at a time without holding anything up, when the
+    // app asks (App::createWindow); else on the first expanding. Kept from
+    // then on.
+    property bool preloadPanel: false
+    onPreloadPanelChanged: if (preloadPanel) panelLoader.active = true
+    function makePanel() { // now, all of it (a preload under way is finished)
+        panelLoader.asynchronous = false
+        panelLoader.active = true
+    }
+    readonly property Panel panelPage: panelLoader.item as Panel
+    readonly property bool columnMenuOpen: panelPage !== null && panelPage.columnMenuOpen
+    readonly property var view: panel && panelPage ? panelPage.view : boxList
+    readonly property int gridColumns: panel && panelPage ? panelPage.gridColumns : 1
     // Keep the input method in the text field while arrows browse the grid.
     // Typing or clicking the field returns horizontal arrows to its caret.
     property bool galleryNavigation: false
-    readonly property SearchBar searchBar: panel ? panelPage.searchBar : boxBar
-    readonly property int viewRowHeight: panel ? panelPage.rowHeight : rowHeight
+    readonly property SearchBar searchBar: panel && panelPage ? panelPage.searchBar : boxBar
+    readonly property int viewRowHeight: panel && panelPage ? panelPage.rowHeight : rowHeight
 
-    readonly property int rowHeight: Theme.rowHeight // 界面大小
-    readonly property int maxRows: 8
+    readonly property bool folderMode: !panel && launcher.folderSearch
+    readonly property bool pureEmpty: launcher.pureSearch && !panel && !folderMode && !launcher.inTaskbarBox
+                                      && launcher.query.trim().length === 0 && searchBar.composition.length === 0
+    readonly property int rowHeight: folderMode ? 40 : Theme.rowHeight
+    // Read once here for all the window's parts and rows (GitHub #111): every
+    // item that reads Screen has an attached object of its own.
+    readonly property real dpr: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1
+    readonly property int maxRows: folderMode ? 6 : 8
     readonly property int minRows: 3 // the window settles no lower than these fit below
     // Everything but the rows: header, the strip of kinds of file, divider,
     // the list's margins, footer. Budget the full strip in every scope so
     // opening it does not change the row count. At the taskbar the list
     // gives the strip its room instead.
-    readonly property int chromeHeight: searchBar.implicitHeight + (fullHeight ? 0 : typeStrip.fullHeight) + 1 + 8
+    readonly property int chromeHeight: searchBar.implicitHeight + (fullHeight || folderMode ? 0 : typeStrip.fullHeight) + 1 + 8
                                         + footer.implicitHeight
     // TypeStrip's animated height sizes this window through the column, so
     // its outer edge, rows and footer follow the same animation. At the
@@ -305,10 +322,13 @@ Window {
                 Accessible.role: Accessible.Button
                 Accessible.name: modelData.text + " " + modelData.action
 
-                Rectangle { // raised with the keyboard on it, or hovered, as a row
+                Hook { // with the keyboard on it, or hovered, as a row
                     anchors.fill: parent
-                    radius: Theme.largeControlRadius
-                    color: emptyHint.current ? Theme.selection : emptyHintArea.containsMouse ? Theme.hover : "transparent"
+                    part: Theme.rowHighlight
+                    selected: emptyHint.current
+                    hovered: emptyHintArea.containsMouse
+                    role: "list"
+                    dpr: window.dpr
                 }
                 Row {
                     id: hintLine
@@ -417,7 +437,10 @@ Window {
         target: window
         property: "height"
         value: layout.implicitHeight
-        when: !window.panel
+        // Once the panel's minimumHeight has gone too: both follow `panel` in
+        // no set order, and set while it still held, a box shorter than the
+        // panel stayed 360 tall, empty under its footer.
+        when: !window.panel && window.minimumHeight === 0
         restoreMode: Binding.RestoreNone
     }
     minimumWidth: panel ? 640 : 0
@@ -430,14 +453,19 @@ Window {
     }
     minimumHeight: panel ? 360 : 0
     // See-through to Mica, as the settings window (see there).
-    color: Theme.backdrop && SystemTheme.materials && window.active ? "transparent" : Theme.background
+    color: Theme.backdrop && SystemTheme.materials && (window.active || SystemTheme.uiStyle === "liquid") ? "transparent" : Theme.background
     flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
     title: qsTr("Win顺")
 
     Binding {
         target: window.launcher.results
         property: "highlightColor"
-        value: Theme.accent
+        value: Theme.matchColor
+    }
+    Binding {
+        target: window.launcher.results
+        property: "highlightWeight"
+        value: Theme.matchWeight
     }
     Binding {
         target: window.launcher
@@ -451,10 +479,17 @@ Window {
         property: "roomNeeded"
         value: window.chromeHeight + window.minRows * window.rowHeight
     }
+    Binding { // reserve normal result capacity before choosing a temporary spot beside Explorer
+        target: window.placement
+        property: "roomWanted"
+        value: window.chromeHeight + window.maxRows * window.rowHeight + window.captionHeight
+               + window.headingHeight + window.detailSpace
+    }
 
     onClipboardBelowChanged: closeContextMenu()
 
     function moveSelection(delta) {
+        selectionMoved()
         if (hintIndex >= 0) { // on the hints after the last row: ↓ ↑ along them, ↑ from the first back to the last row
             if (delta > 0)
                 hintIndex = Math.min(hints.length - 1, hintIndex + 1)
@@ -491,15 +526,22 @@ Window {
         window.launcher.selectRange(selectionAnchor, index, add)
         view.currentIndex = index
     }
+    // The keys moved it: Space previews from here (spaceTogglesPreview), and a
+    // hover still waiting does not take the preview off the current row.
+    function selectionMoved() {
+        spaceTogglesPreview = true
+        previewHoverTimer.stop()
+    }
     function extendSelection(delta) {
+        selectionMoved()
         if (view.count > 0)
             selectTo(Math.max(0, Math.min(view.count - 1, view.currentIndex + delta)), false)
     }
 
     // Ctrl+1… (or Alt+1…, Launcher.numberKeys) opens the nth row shown,
     // counted from the first one at least half in view. The keys come here as
-    // the window's own (no hook: GitHub #10); a digit another program holds
-    // as a global hotkey stays its (numberkeys::heldMask).
+    // the window's own, also a digit another program holds as a global hotkey
+    // (numberkeys::Hook, GitHub #175).
     readonly property int numberKey: launcher.numberKeys === "ctrl" ? Qt.Key_Control
                                    : launcher.numberKeys === "alt" ? Qt.Key_Alt : -1
     readonly property int firstShownRow: Math.max(0, rowAtY(view.contentY + viewRowHeight / 2, true) * gridColumns)
@@ -514,11 +556,14 @@ Window {
     }
     Connections {
         target: window.searchBar
-        function onKeyReleased(event) { numberHints.release(event) }
+        function onKeyReleased(event) {
+            numberHints.release(event)
+            typeStrip.showKeywords = event.key !== Qt.Key_Control && (event.modifiers & Qt.ControlModifier) !== 0
+        }
     }
     onActiveFocusItemChanged: numberHints.reset()
-    // A digit another program holds as a global hotkey is its (Launcher.numberKeysLeft):
-    // the row still shows the chord, struck through (ResultRow.hintTaken).
+    // A chord that is one of Win顺's own shortcuts stays that (Launcher.numberKeysLeft):
+    // the row still shows it, struck through (ResultRow.hintTaken).
     function numberUsable(number) {
         return number >= 1 && (launcher.numberKeysLeft & (1 << number)) === 0
     }
@@ -578,9 +623,22 @@ Window {
     }
 
     function closeContextMenu() {
+        if (searchBar) searchBar.closeMenu()
         if (contextMenu)
             contextMenu.dismiss()
-        panelPage.closeColumns() // the panel's columns menu goes with it
+        if (panelPage)
+            panelPage.closeColumns() // the panel's columns menu goes with it
+    }
+
+    function openKeyboardMenu(repeated) {
+        if (clipboardBelow || homeIndex >= 0 || hintIndex >= 0 || searchBar.composition.length > 0
+                || view.currentIndex < 0 || view.currentIndex >= view.count)
+            return false
+        if (!repeated) {
+            window.launcher.keyboardMoved()
+            openContextMenu(view.currentIndex)
+        }
+        return true
     }
 
     // The system's own menu for a file's or folder's row (the shell's, with
@@ -609,11 +667,12 @@ Window {
     onVisibleChanged: {
         if (!visible) {
             closeContextMenu()
+            footer.sortMenuOpen = false // not still open when the launcher comes back
             menuLoader.active = false
             nameTip.dismiss()
         }
     }
-    onActiveChanged: if (!active) nameTip.dismiss() // on its way out, or behind another window
+    onActiveChanged: if (!active) { nameTip.dismiss(); typeStrip.showKeywords = false }
 
     // The whole name and folder of a row that shows them cut, as the mouse
     // rests on it (NameTip; the box's rows and the panel's).
@@ -621,6 +680,27 @@ Window {
         id: nameTip
         objectName: "nameTip" // App's --dump reads it
         host: window.launcher
+    }
+
+    // Space types a space until the selection was moved or the preview
+    // opened, when Space is the preview key; typing brings the space back.
+    property bool spaceTogglesPreview: false
+    Connections {
+        target: window.searchBar
+        function onTyped() {
+            window.spaceTogglesPreview = false
+            previewHoverTimer.stop()
+        }
+    }
+
+    Connections {
+        target: window.searchBar
+        function onCompositionChanged() {
+            if (window.searchBar.composition.length > 0) {
+                window.closeContextMenu()
+                window.galleryNavigation = false
+            }
+        }
     }
 
     // Along the strip under the box: in 文件 the kinds, in 内容 the folders.
@@ -634,13 +714,22 @@ Window {
     }
 
     function handleKey(event) {
+        if (searchBar.menuKey(event)) { event.accepted = true; return }
+        typeStrip.showKeywords = event.key === Qt.Key_Control || (event.modifiers & Qt.ControlModifier) !== 0
         numberHints.press(event)
         nameTip.dismiss() // as Windows' tips go on a key
+        if (panel && panelPage && !menuOpen && !columnMenuOpen && panelPage.handleContentKey(event))
+            return
         if (menuOpen && contextMenu.handleKey(event)) {
             event.accepted = true
             return
         }
-        if (panelPage.columnMenuOpen && panelPage.columnMenu.handleKey(event)) {
+        if (columnMenuOpen && panelPage.columnMenu.handleKey(event)) {
+            event.accepted = true
+            return
+        }
+        if (footer.sortMenuOpen && event.key === Qt.Key_Escape) { // the footer's 更多 menu: Esc closes it, not the launcher
+            footer.sortMenuOpen = false
             event.accepted = true
             return
         }
@@ -655,13 +744,23 @@ Window {
             event.accepted = true
             return
         }
-        if (event.key === Qt.Key_P && (event.modifiers & ~Qt.KeypadModifier) === Qt.AltModifier) {
-            togglePreview()
+        if (searchBar.composition.length === 0 && window.launcher.isPreviewKey(event.key, event.modifiers)
+                && homeIndex < 0 && hintIndex < 0 && (event.key !== Qt.Key_Space || (spaceTogglesPreview && view.currentIndex >= 0))) {
+            if (!event.isAutoRepeat)
+                togglePreview()
             event.accepted = true
             return
         }
         const ctrl = (event.modifiers & Qt.ControlModifier) !== 0
         const shift = (event.modifiers & Qt.ShiftModifier) !== 0
+        if (event.key === Qt.Key_Comma && (event.modifiers & ~Qt.KeypadModifier) === Qt.ControlModifier
+                && searchBar.composition.length === 0) {
+            if (!event.isAutoRepeat)
+                window.launcher.openSettings()
+            event.accepted = true
+            return
+        }
+        const key = SearchKeys.navigationKey(event.key, event.modifiers, searchBar.composition.length > 0)
         // Ctrl+T: pinned, or not (the pin at the box's corner; Lertaro's key,
         // linux.do #157). From the row of apps too.
         if (event.key === Qt.Key_T && ctrl && !shift && (event.modifiers & Qt.AltModifier) === 0) {
@@ -669,8 +768,14 @@ Window {
             event.accepted = true
             return
         }
+        // Ctrl+R: regex mode, as Everything's (the .* chip by the box says it is on).
+        if (event.key === Qt.Key_R && ctrl && !shift && (event.modifiers & Qt.AltModifier) === 0) {
+            window.launcher.toggleRegexMode()
+            event.accepted = true
+            return
+        }
         if (homeIndex >= 0) { // on the row of apps (nothing typed, so ← → move nothing else)
-            switch (event.key) {
+            switch (key) {
             case Qt.Key_Left: homeIndex = Math.max(0, homeIndex - 1); break
             case Qt.Key_Right: homeIndex = Math.min(launcher.frequentApps.length - 1, homeIndex + 1); break
             case Qt.Key_Down: leaveHome(); break
@@ -683,12 +788,12 @@ Window {
             event.accepted = true
             return
         }
-        if (event.key === Qt.Key_Down || event.key === Qt.Key_Up || event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp) {
+        if (key === Qt.Key_Down || key === Qt.Key_Up || key === Qt.Key_PageDown || key === Qt.Key_PageUp) {
             window.launcher.keyboardMoved() // Alt+P is for this row now, not the one under a pointer left where it was
             if (panel && launcher.gallery && searchBar.composition.length === 0)
                 galleryNavigation = true
         }
-        switch (event.key) {
+        switch (key) {
         case Qt.Key_Down: shift ? extendSelection(gridColumns) : moveSelection(gridColumns); break
         case Qt.Key_Up:
             if (!shift && showHome && view.currentIndex <= 0)
@@ -699,12 +804,19 @@ Window {
         case Qt.Key_PageDown: shift ? extendSelection(panel ? Math.max(1, Math.floor(view.height / viewRowHeight)) * gridColumns : fitRows) : moveSelection(panel ? Math.max(1, Math.floor(view.height / viewRowHeight)) * gridColumns : fitRows); break
         case Qt.Key_PageUp: shift ? extendSelection(panel ? -Math.max(1, Math.floor(view.height / viewRowHeight)) * gridColumns : -fitRows) : moveSelection(panel ? -Math.max(1, Math.floor(view.height / viewRowHeight)) * gridColumns : -fitRows); break
         case Qt.Key_Left:
-        case Qt.Key_Right: // Alt+← →: the volume's row, in steps of 5 (held, on and on); plain ← → are the box's caret
+        case Qt.Key_Right: // In the gallery, arrows keep navigating its columns.
             if (panel && launcher.gallery && galleryNavigation && !ctrl && !(event.modifiers & Qt.AltModifier)) {
                 const delta = event.key === Qt.Key_Right ? 1 : -1
                 shift ? extendSelection(delta) : moveSelection(delta)
                 break
             }
+            // At the end of the query, Right enters the selected row's menu.
+            // Holding Right to move the caret never opens it on a repeat.
+            if (event.key === Qt.Key_Right && (event.modifiers & ~Qt.KeypadModifier) === Qt.NoModifier
+                    && !searchBar.hasSelection && searchBar.field.cursorPosition === searchBar.field.length
+                    && openKeyboardMenu(event.isAutoRepeat))
+                break
+            // Alt+← → still adjusts a system switch; other arrows edit the query.
             if ((event.modifiers & ~Qt.KeypadModifier) !== Qt.AltModifier || hintIndex >= 0
                     || searchBar.composition.length > 0
                     || !window.launcher.stepSwitch(view.currentIndex, event.key === Qt.Key_Right ? 1 : -1))
@@ -765,8 +877,13 @@ Window {
                 return
             window.launcher.togglePanel()
             break
-        case Qt.Key_D: // typed in a folder's window: its rows first, or there alone (GitHub #110)
-            if (!ctrl || shift || !window.launcher.switchTypingFolder())
+        case Qt.Key_D: // Ctrl+Shift+D: current folder first, or alone; Ctrl+D pages down.
+            if ((event.modifiers & ~Qt.KeypadModifier) !== (Qt.ControlModifier | Qt.ShiftModifier)
+                    || searchBar.composition.length > 0 || !window.launcher.switchTypingFolder())
+                return
+            break
+        case Qt.Key_O:
+            if ((event.modifiers & ~Qt.KeypadModifier) !== Qt.ControlModifier || !openKeyboardMenu(event.isAutoRepeat))
                 return
             break
         case Qt.Key_Menu: // Shift+Menu: the system's menu for the row; the Menu key alone comes back as a context-menu event (Win顺's menu)
@@ -806,6 +923,8 @@ Window {
                 detailEdit.copy()
                 break
             }
+            if (!shift && window.launcher.copyPreviewSelection()) // picked in the preview's text
+                break
             act(shift ? Launcher.CopyPath : Launcher.CopyItem)
             break
         default:
@@ -821,6 +940,7 @@ Window {
     function togglePreview() {
         if (homeIndex >= 0 || hintIndex >= 0)
             return
+        spaceTogglesPreview = true
         const pointer = window.launcher.pointerIfMoved()
         if (pointer !== undefined && view.count > 0) {
             const p = view.mapFromGlobal(pointer.x, pointer.y)
@@ -891,12 +1011,13 @@ Window {
         function onQueryChanged() {
             window.galleryNavigation = false
             nameTip.dismiss() // typed: the keys go to the field, not handleKey
-            if (boxBar.text !== window.launcher.query)
-                boxBar.text = window.launcher.query
-            if (panelPage.searchBar.text !== window.launcher.query)
-                panelPage.searchBar.text = window.launcher.query
+            boxBar.syncQuery()
+            if (window.panelPage)
+                window.panelPage.searchBar.syncQuery()
         }
         function onPanelChanged() { // the other bar has the keyboard now, the words as they were
+            if (window.launcher.panel)
+                window.makePanel()
             window.galleryNavigation = false
             nameTip.dismiss()
             window.closeContextMenu()
@@ -916,8 +1037,15 @@ Window {
 
     Connections {
         target: window.frame
-        function onDoubleClicked() { window.placement.moveHome() } // on the header or footer
-        function onHandleClicked() { window.launcher.openSettings() } // the search icon (SearchBar.qml)
+        function onDoubleClicked() { window.launcher.togglePanel() } // the visible grip
+        function onHandleClicked(button) {
+            if (button === Qt.MiddleButton)
+                window.launcher.togglePin()
+            else if (button === Qt.RightButton)
+                window.searchBar.showPositionMenu()
+            else if (button === Qt.LeftButton)
+                window.launcher.openSettings()
+        }
     }
     Connections {
         target: window.placement
@@ -938,29 +1066,46 @@ Window {
             closeContextMenu()
     }
 
-    // The panel over everything of the box (which keeps its layout, out of
-    // sight, for when it is back): its own bar and list.
-    Panel {
-        id: panelPage
+    // The full panel's filters and fields are only needed after expanding.
+    // Keep it after its first use so subsequent switches retain their speed.
+    // A preload still under way when the panel opens is finished at once.
+    Loader {
+        id: panelLoader
         anchors.fill: parent
         visible: window.panel
-        launcher: window.launcher
-        placement: window.placement
-        frame: window.frame
-        dimmed: window.dimRows
-        onKeyPressed: (event) => window.handleKey(event)
-        onEditingRequested: window.galleryNavigation = false
-        onRowClicked: (index, modifiers) => window.rowClicked(index, modifiers)
-        onRowDoubleClicked: (index, modifiers) => window.rowDoubleClicked(index, modifiers)
-        onRowMenuRequested: (index, globalPos, modifiers) => window.rowMenuRequested(index, globalPos, modifiers)
-        onRowDragRequested: (index) => window.launcher.dragOut(index)
-        nameTip: nameTip
+        active: false
+        asynchronous: true // for a preload; makePanel() makes it at once
+        Component.onCompleted: {
+            if (window.panel)
+                window.makePanel()
+            else if (window.preloadPanel)
+                active = true
+        }
+        onLoaded: (item as Panel).searchBar.syncQuery()
+        sourceComponent: Panel {
+            showTypeKeywords: typeStrip.showKeywords
+            launcher: window.launcher
+            placement: window.placement
+            frame: window.frame
+            dimmed: window.dimRows
+            onKeyPressed: (event) => window.handleKey(event)
+            onEditingRequested: window.galleryNavigation = false
+            onRowClicked: (index, modifiers) => window.rowClicked(index, modifiers)
+            onRowDoubleClicked: (index, modifiers) => window.rowDoubleClicked(index, modifiers)
+            onRowMenuRequested: (index, globalPos, modifiers) => window.rowMenuRequested(index, globalPos, modifiers)
+            onRowDragRequested: (index) => window.launcher.dragOut(index)
+            onRowPreviewRequested: (index) => window.rowPreviewRequested(index)
+            onRowHoverMoved: (index, globalPos) => window.rowHoverMoved(index, globalPos)
+            nameTip: nameTip
+            dpr: window.dpr
+        }
     }
 
     // A row clicked (the box's or the panel's): Ctrl toggles it in the
     // selection, Shift takes the rows up to it, plain opens it; the right
     // button with Shift the system's menu, else Win顺's.
     function rowClicked(index, modifiers) {
+        spaceTogglesPreview = true
         const ctrl = (modifiers & Qt.ControlModifier) !== 0
         if (modifiers & Qt.ShiftModifier) {
             selectTo(index, ctrl)
@@ -988,6 +1133,44 @@ Window {
         view.currentIndex = index
         launcher.clickRow(index)
     }
+    // A middle click: that row's preview (as Alt+P on it), the file stays shut.
+    function rowPreviewRequested(index) {
+        selectionMoved()
+        if (panel && launcher.gallery)
+            galleryNavigation = true
+        window.launcher.clearSelection()
+        // Before the row is selected: that brings an open preview to it
+        // (followPreview), and the click then closed it as for the file shown.
+        window.launcher.togglePreview(index)
+        view.currentIndex = index
+        window.launcher.keyboardMoved() // the pointer is on this row, as on the keyboard's
+    }
+    // An open preview shows the row the mouse rests on for a moment (as the
+    // clipboard's, GitHub #47 and #186), the current row stays where it is.
+    // It never opens or closes the preview. Moving the selection brings the
+    // preview back to the current row (Launcher.followPreview). Off in the
+    // settings (预览跟随: 选中的行), Launcher.previewHover does nothing.
+    property point previewHoverPos: Qt.point(-1, -1) // the last real mouse move, global
+    property int previewHoverRow: -1
+    function rowHoverMoved(index, globalPos) {
+        // A wheel moving rows under a still mouse sends the same position.
+        if (globalPos.x === previewHoverPos.x && globalPos.y === previewHoverPos.y)
+            return
+        previewHoverPos = globalPos
+        if (Qt.application.keyboardModifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+            return
+        if (index === previewHoverRow && previewHoverTimer.running)
+            return // dwell starts on entering the row, not on the last mouse movement
+        if (index !== previewHoverRow)
+            window.launcher.previewPointerMoved() // a Word file only passed over does not start Word
+        previewHoverRow = index
+        previewHoverTimer.restart()
+    }
+    Timer {
+        id: previewHoverTimer
+        interval: 100
+        onTriggered: window.launcher.previewHover(window.previewHoverRow)
+    }
     // A click on a system switch's own switch: it toggles, whatever the row asks.
     function rowSwitchClicked(index) {
         view.currentIndex = index
@@ -1008,30 +1191,48 @@ Window {
             y: window.placement.contentShift.y
         }
 
-        SearchBar {
-            id: boxBar
+        // The chrome: the search row and the strip under it, a layer over the
+        // window's base (Theme.layer), the rows on the base itself.
+        Item {
+            id: chrome
             width: parent.width
-            launcher: window.launcher
-            placement: window.placement
-            frame: window.frame
-            onKeyPressed: (event) => window.handleKey(event)
+            height: boxBar.height + typeStrip.height
+
+            Rectangle {
+                anchors.fill: parent
+                color: Theme.layer
+            }
+
+            SearchBar {
+                id: boxBar
+                minimal: window.pureEmpty
+                width: parent.width
+                launcher: window.launcher
+                placement: window.placement
+                frame: window.frame
+                dpr: window.dpr
+                onKeyPressed: (event) => window.handleKey(event)
+            }
+
+            TypeStrip {
+                id: typeStrip
+                objectName: "searchTypeStrip"
+                y: boxBar.height
+                width: parent.width
+                launcher: window.launcher
+                frame: window.frame
+                dpr: window.dpr
+                shown: (window.launcher.mergeFileScope || window.launcher.scope === Launcher.Files || window.launcher.scope === Launcher.Folders
+                        || window.launcher.scope === Launcher.Content)
+                       && !window.pureEmpty && !window.clipboardBelow && !window.folderMode && window.launcher.pluginKeyword.length === 0
+            }
         }
 
-        TypeStrip {
-            id: typeStrip
+        Rectangle { // where the chrome meets the rows
             width: parent.width
-            launcher: window.launcher
-            frame: window.frame
-            shown: (window.launcher.scope === Launcher.Files || window.launcher.scope === Launcher.Folders
-                    || window.launcher.scope === Launcher.Content)
-                   && !window.clipboardBelow
-        }
-
-        Rectangle {
-            width: parent.width
-            height: Theme.edge(Screen.devicePixelRatio)
-            color: Theme.divider
-            visible: !window.clipboardBelow && (window.listRows > 0 || window.showEmptyState)
+            height: Theme.edge(window.dpr)
+            color: Theme.layerEdge
+            visible: !window.pureEmpty && !window.clipboardBelow && (window.listRows > 0 || window.showEmptyState)
         }
 
         Item {
@@ -1039,7 +1240,13 @@ Window {
             width: parent.width
             height: window.listRows > 0 ? window.listRows * window.rowHeight + 8 + window.hintSpace + window.captionSpace
                                           + (window.fullHeight ? -typeStrip.height : window.headingHeight + window.detailSpace) : 0
-            visible: window.listRows > 0 && !window.clipboardBelow
+            visible: !window.pureEmpty && window.listRows > 0 && !window.clipboardBelow
+
+            Hook { // the style's tray under the rows (Theme.tray; none in fluent and brand)
+                anchors.fill: parent
+                part: Theme.tray
+                dpr: window.dpr
+            }
 
             Text { // nothing is named as typed: these rows sound like it (window.headingHeight)
                 id: readingHeading
@@ -1089,7 +1296,7 @@ Window {
                             // Vertically on whole device pixels too (see the rows').
                             transform: Translate {
                                 y: {
-                                    const dpr = Screen.devicePixelRatio
+                                    const dpr = window.dpr
                                     const deviceY = (layout.y + listArea.y + home.y + tiles.y) * dpr
                                     return (Math.round(deviceY) - deviceY) / dpr
                                 }
@@ -1109,11 +1316,11 @@ Window {
                                 y: parent.height - 6
                                 width: 18
                                 height: 3
-                                radius: Theme.smallRadius
-                                color: Theme.accent
+                                radius: Theme.pillRadius(height)
+                                color: Theme.accentLine
                             }
                             Image { // as a row's icon (ResultRow.qml): its own pixels, unsmoothed
-                                readonly property real dpr: Screen.devicePixelRatio
+                                readonly property real dpr: window.dpr
                                 readonly property int pixels: Math.round(32 * dpr)
 
                                 x: 44 + 1 / 64
@@ -1165,6 +1372,16 @@ Window {
                 }
             }
 
+            // The rows' buttons: a few sets, lent to the rows that show them.
+            RowActionsPool {
+                id: resultActions
+                bar: Component {
+                    ResultActions {
+                        dpr: window.dpr
+                    }
+                }
+            }
+
             ListView {
                 id: boxList
                 anchors.fill: parent
@@ -1177,7 +1394,37 @@ Window {
                 Behavior on opacity { NumberAnimation { duration: 150 } }
                 model: window.launcher.results
                 boundsBehavior: Flickable.StopAtBounds
-                highlightMoveDuration: 0
+                // The current row's highlight, one for the whole list: it jumps,
+                // or slides as the style says (Theme.rowSlide).
+                highlightMoveDuration: Theme.rowSlide
+                highlightMoveVelocity: -1
+                highlightResizeDuration: 0
+                highlightResizeVelocity: -1
+                highlight: Item {
+                    id: currentHighlight
+                    width: boxList.width
+                    visible: boxList.currentItem !== null
+                    transform: ScrollPixelAlignment { // on whole device pixels, as the rows
+                        view: boxList
+                        viewY: layout.y + listArea.y + boxList.y
+                        itemY: currentHighlight.y
+                    }
+
+                    Hook {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.rowInset
+                        anchors.rightMargin: Theme.rowInset
+                        anchors.topMargin: Theme.edge(window.dpr) // a device pixel apart: 1.5 at 150 % put its edges on half ones
+                        anchors.bottomMargin: Theme.edge(window.dpr)
+                        part: Theme.rowHighlight
+                        current: true
+                        // With rows picked, the current one is marked as picked only when it is.
+                        selected: window.selectedCount === 0 || (boxList.currentItem !== null && boxList.currentItem.selected === true)
+                        position: boxList.currentItem !== null ? boxList.currentItem.y : 0
+                        role: "list"
+                        dpr: window.dpr
+                    }
+                }
                 reuseItems: true
                 function stopScrolling() {
                     wheelScroll.cancel()
@@ -1193,13 +1440,14 @@ Window {
                 }
                 // Typed in a folder's window, its own rows first (GitHub #110):
                 // the rows found elsewhere under a caption, the way to the
-                // folder alone at its end (as Ctrl+D).
+                // folder alone at its end (as Ctrl+Shift+D).
                 section.property: "elsewhere"
                 section.delegate: ElsewhereCaption {
                     id: caption
                     width: boxList.width
                     folder: window.launcher.typingFolder
                     alone: window.elsewhereRow === 0
+                    dpr: window.dpr
                     transform: ScrollPixelAlignment { // on whole device pixels, as the rows
                         view: boxList
                         viewY: layout.y + listArea.y + boxList.y
@@ -1246,31 +1494,25 @@ Window {
                             Accessible.role: Accessible.Button
                             Accessible.name: modelData.text + " " + modelData.action
 
-                            Rectangle { // as a row's: raised with the keyboard on it, or hovered
+                            Hook { // as a row's: with the keyboard on it, or hovered
                                 anchors.fill: parent
-                                anchors.leftMargin: 6
-                                anchors.rightMargin: 6
-                                anchors.topMargin: 1
-                                anchors.bottomMargin: 1
-                                radius: Theme.largeControlRadius
-                                color: hintRow.current ? Theme.selection : hintArea.containsMouse ? Theme.hover : "transparent"
-                            }
-                            Rectangle { // accent pill, as on the current row
-                                visible: hintRow.current
-                                x: 7
-                                anchors.verticalCenter: parent.verticalCenter
-                                width: 3
-                                height: 18
-                                radius: Theme.smallRadius
-                                color: Theme.accent
+                                anchors.leftMargin: Theme.rowInset
+                                anchors.rightMargin: Theme.rowInset
+                                anchors.topMargin: Theme.edge(window.dpr)
+                                anchors.bottomMargin: Theme.edge(window.dpr)
+                                part: Theme.rowHighlight
+                                selected: hintRow.current
+                                hovered: hintArea.containsMouse
+                                role: "list"
+                                dpr: window.dpr
                             }
                             Text {
-                                x: 60 // under the rows' text
+                                x: window.folderMode ? 16 : Theme.textStart // under the rows' text
                                 width: hintAction.x - 16 - x // the leftmost link (the first, with two showing)
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: hintRow.modelData.text
                                 color: Theme.subtext
-                                font.pixelSize: Theme.uiBody
+                                font.pixelSize: window.folderMode ? 12 : Theme.uiBody
                                 elide: Text.ElideRight
                             }
                             Text { // the action: accent words on the plain background, as a link; right, as the rows' labels
@@ -1280,7 +1522,7 @@ Window {
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: hintRow.modelData.action
                                 color: Theme.accent
-                                font.pixelSize: Theme.uiBody
+                                font.pixelSize: window.folderMode ? 12 : Theme.uiBody
                             }
                             Text { // a second link on the row (a hint's kind2), the mouse's
                                 id: hintAction2
@@ -1291,7 +1533,7 @@ Window {
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: hintRow.modelData.action2
                                 color: Theme.accent
-                                font.pixelSize: Theme.uiBody
+                                font.pixelSize: window.folderMode ? 12 : Theme.uiBody
                                 MouseArea {
                                     anchors.fill: parent
                                     cursorShape: Qt.PointingHandCursor
@@ -1325,15 +1567,19 @@ Window {
 
                 delegate: ResultRow {
                     id: resultRow
+                    compact: window.folderMode
                     width: boxList.width
                     height: window.rowHeight
                     showModified: window.launcher.showModified
                     showSize: window.launcher.showFileSize || window.launcher.sort === Launcher.LargestFirst || window.launcher.sort === Launcher.SmallestFirst
                     hint: window.numberOf(index)
+                    reserveHintSpace: window.numberKey >= 0 && window.launcher.numberHints !== "off"
                     hintOpacity: numberHints.hintOpacity
                     hintModifier: window.numberModifier
                     hintTaken: resultRow.hint > 0 && !window.numberUsable(resultRow.hint)
                     nameTip: nameTip
+                    dpr: window.dpr
+                    actionsPool: resultActions
                     // Drawn on whole device pixels, wherever the list has
                     // scrolled to (ResultRow puts its text on whole device
                     // pixels within). Between them (at 150 % most scroll
@@ -1357,10 +1603,13 @@ Window {
                     }
                     onMenuRequested: (index, globalPos, modifiers) => window.rowMenuRequested(index, globalPos, modifiers)
                     onDragRequested: (index) => window.launcher.dragOut(index)
+                    onPreviewRequested: (index) => window.rowPreviewRequested(index)
+                    onHoverMoved: (index, globalPos) => window.rowHoverMoved(index, globalPos)
                 }
             }
 
             ListScrollBar {
+                dpr: window.dpr
                 id: boxScrollBar
                 flickable: boxList
                 anchors.right: parent.right
@@ -1395,10 +1644,11 @@ Window {
                 visible: height > 0
                 clip: true
 
-                Rectangle {
+                Hook { // the style's line between the rows and the text
                     width: parent.width
-                    height: Theme.edge(Screen.devicePixelRatio)
-                    color: Theme.divider
+                    height: Theme.edge(window.dpr)
+                    part: Theme.separator
+                    dpr: window.dpr
                 }
 
                 Flickable {
@@ -1426,7 +1676,7 @@ Window {
                         textFormat: TextEdit.PlainText
                         color: Theme.text
                         selectionColor: Theme.accentFill
-                        selectedTextColor: "white"
+                        selectedTextColor: Theme.accentText
                         font.pixelSize: Theme.uiTitle
                         onTextChanged: deselect()
                     }
@@ -1486,10 +1736,13 @@ Window {
 
         Footer {
             id: footer
+            compact: window.folderMode
+            objectName: "launcherFooter" // the previews read sortMenuOpen
             width: parent.width
-            visible: !window.clipboardBelow
+            visible: !window.pureEmpty && !window.clipboardBelow
             launcher: window.launcher
             frame: window.frame
+            dpr: window.dpr
         }
     }
 
@@ -1497,11 +1750,11 @@ Window {
     // (a right click on a row then opens it again there).
     MouseArea {
         anchors.fill: parent
-        enabled: window.menuOpen || panelPage.columnMenuOpen
+        enabled: window.menuOpen || window.columnMenuOpen || window.searchBar.menuOpen
         acceptedButtons: Qt.AllButtons
         onPressed: (mouse) => {
             // The columns menu is closed by any click, a right click on the header included
-            const columns = panelPage.columnMenuOpen
+            const columns = window.columnMenuOpen
             window.closeContextMenu()
             mouse.accepted = columns || mouse.button !== Qt.RightButton
         }
@@ -1522,5 +1775,8 @@ Window {
         }
     }
 
-    WindowEdge {}
+    WindowEdge {
+        id: windowEdge
+        fill: Theme.background
+    }
 }

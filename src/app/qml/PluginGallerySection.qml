@@ -18,7 +18,7 @@ SettingsSection {
     signal showDeveloper()
     signal showProxySettings() // 设置网络代理: the row on 高级
 
-    note: qsTr("Win顺 插件库里的插件，下载后先核对文件再安装。装好的插件默认关着，打开时会先列出它要的权限。")
+    note: qsTr("只安装你需要的功能。下载后先核对文件，安装并启用时会先列出它要的权限，同意后即可使用。")
 
     SettingRow { // what the install said: not seen on the 已安装 tab from here
         title: qsTr("刚才的结果")
@@ -26,6 +26,7 @@ SettingsSection {
         shown: gallerySection.plugins.message.length > 0
 
         FlatButton {
+            dpr: gallerySection.dpr
             text: qsTr("知道了")
             flat: true
             onClicked: gallerySection.plugins.clearMessage()
@@ -41,6 +42,16 @@ SettingsSection {
         bodyShown: gallerySection.gallery.count > 0 || gallerySection.gallery.problem.length > 0
 
         FlatButton {
+            dpr: gallerySection.dpr
+            objectName: "updateAllPlugins"
+            visible: gallerySection.gallery.updatableCount > 0 || gallerySection.gallery.updatingAll
+            highlighted: true
+            text: qsTr("全部更新")
+            enabled: !gallerySection.gallery.downloading && !gallerySection.gallery.updatingAll
+            onClicked: gallerySection.gallery.updateAll()
+        }
+        FlatButton {
+            dpr: gallerySection.dpr
             text: qsTr("刷新")
             glyph: "" // Refresh
             enabled: !gallerySection.gallery.fetching
@@ -59,17 +70,41 @@ SettingsSection {
                 wrapMode: Text.Wrap
             },
             FlatButton { // GitHub could not be reached: the way round it (GitHub #84)
+                dpr: gallerySection.dpr
                 visible: gallerySection.gallery.problemIsConnection
                 text: qsTr("设置网络代理…")
                 onClicked: gallerySection.showProxySettings()
             },
-            InputBox {
-                id: filterBox
+            Text { // 全部更新: how far it is, then what came of it
+                visible: gallerySection.gallery.updateStatus.length > 0
+                width: parent.width
+                height: Theme.snapUp(implicitHeight, Screen.devicePixelRatio)
+                text: gallerySection.gallery.updateStatus
+                textFormat: Text.PlainText
+                color: gallerySection.gallery.updateFailed ? Theme.danger : Theme.subtext
+                font.pixelSize: Theme.fontCaption
+                wrapMode: Text.Wrap
+            },
+            Row {
                 visible: gallerySection.gallery.count > 0
-                width: Math.min(parent.width, 320)
-                implicitHeight: 32
-                placeholder: qsTr("筛选：名称、关键字、说明")
-                onTextChanged: gallerySection.gallery.filter = text
+                width: parent.width
+                height: 32
+                spacing: 8
+
+                InputBox {
+                    id: filterBox
+                    width: Math.min(parent.width - (updatesChip.visible ? updatesChip.width + parent.spacing : 0), 320)
+                    implicitHeight: 32
+                    placeholder: qsTr("筛选：名称、关键字、说明")
+                    text: gallerySection.gallery.filter
+                    onTextChanged: gallerySection.gallery.filter = text
+                }
+                Chip {
+                    id: updatesChip
+                    visible: gallerySection.gallery.updatesOnly
+                    text: qsTr("只看可更新")
+                    onRemoveClicked: gallerySection.gallery.updatesOnly = false
+                }
             },
             Column {
                 width: parent.width
@@ -88,7 +123,8 @@ SettingsSection {
             Text {
                 visible: gallerySection.gallery.count > 0 && gallerySection.gallery.shownCount === 0
                 width: parent.width
-                text: qsTr("没有找到“%1”").arg(filterBox.text.trim())
+                text: gallerySection.gallery.updatesOnly && filterBox.text.trim().length === 0 ? qsTr("插件都是最新的")
+                    : qsTr("没有找到“%1”").arg(filterBox.text.trim())
                 textFormat: Text.PlainText
                 color: Theme.subtext
                 font.pixelSize: Theme.fontCaption
@@ -103,6 +139,7 @@ SettingsSection {
         description: qsTr("做了好用的插件？可以投稿到插件库，给大家用")
 
         FlatButton {
+            dpr: gallerySection.dpr
             text: qsTr("看看怎么投稿")
             glyph: "" // Link
             onClicked: gallerySection.gallery.openRepository()
@@ -114,10 +151,12 @@ SettingsSection {
         keywords: qsTr("AI;开发;模板;创建;贡献;Python;PowerShell").split(";")
         description: qsTr("从能运行的模板开始，也可以把开发提示和模板一起交给 AI。创建后仍由你决定是否启用插件。")
         FlatButton {
+            dpr: gallerySection.dpr
             text: qsTr("复制 AI 开发提示")
             onClicked: gallerySection.plugins.copyDevelopmentPrompt()
         }
         FlatButton {
+            dpr: gallerySection.dpr
             text: qsTr("创建插件")
             highlighted: true
             onClicked: gallerySection.showDeveloper()

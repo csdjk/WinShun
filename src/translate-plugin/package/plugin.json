@@ -1,0 +1,57 @@
+{
+  "manifest": 1,
+  "id": "winshun.translate",
+  "name": {"zh": "翻译", "en": "Translate"},
+  "version": "2.2.1",
+  "description": {"zh": "tr 翻译、dict AI 词典，支持 DeepL、微软翻译及 OpenAI 兼容模型服务；使用自己的密钥", "en": "tr translation and dict AI dictionary with your own DeepL, Microsoft Translator or OpenAI-compatible service key"},
+  "author": "LingCore",
+  "homepage": "https://github.com/LingCore/WinShun",
+  "license": "MIT",
+  "minWinShun": "0.17.0",
+  "runtime": {"mode": "resident", "program": "WinShunTranslate.exe", "timeoutMs": 10000, "idleExitSec": 900, "debounceMs": 100},
+  "permissions": ["network"],
+  "commands": [{
+    "id": "tr",
+    "keyword": ["tr", "fy"],
+    "title": {"zh": "翻译", "en": "Translate"},
+    "description": {"zh": "中文译成英文，其他译成中文", "en": "Chinese to English, anything else to Chinese"},
+    "icon": "glyph:U+E8C1",
+    "hint": {"zh": "要翻译的句子", "en": "a sentence to translate"},
+    "ai": {"description": "Translate a sentence with the user's configured translation API: Chinese to English, other languages to Chinese. The first item's title is the translation; when no API is configured the item says so."}
+  }, {
+    "id": "dict",
+    "keyword": ["dict", "词典"],
+    "title": {"zh": "AI 词典", "en": "AI dictionary"},
+    "description": {"zh": "音标、词性、释义与例句，使用已配置的模型服务", "en": "Pronunciation, definitions and examples from the configured model"},
+    "icon": "glyph:U+E8C1",
+    "hint": {"zh": "要查的单词", "en": "a word to look up"}
+  }],
+  "settings": [
+    {"key": "provider", "type": "choice", "title": {"zh": "翻译服务", "en": "Service"}, "options": [
+      {"value": "none", "title": {"zh": "未设置", "en": "Not set"}},
+      {"value": "deepl", "title": "DeepL"},
+      {"value": "openai", "title": {"zh": "OpenAI 兼容", "en": "OpenAI-compatible"}},
+      {"value": "deepseek", "title": "DeepSeek"},
+      {"value": "doubao", "title": {"zh": "豆包 / 火山方舟", "en": "Doubao / Volcengine Ark"}},
+      {"value": "hunyuan", "title": {"zh": "腾讯混元", "en": "Tencent Hunyuan"}},
+      {"value": "microsoft", "title": {"zh": "微软翻译", "en": "Microsoft Translator"}}
+    ], "default": "none"},
+    {"key": "deeplKey", "type": "password", "title": {"zh": "DeepL 密钥", "en": "DeepL key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "microsoftKey", "type": "password", "title": {"zh": "微软翻译密钥", "en": "Microsoft Translator key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "openaiKey", "type": "password", "title": {"zh": "OpenAI 兼容服务密钥", "en": "OpenAI-compatible key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "deepseekKey", "type": "password", "title": {"zh": "DeepSeek 密钥", "en": "DeepSeek key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "doubaoKey", "type": "password", "title": {"zh": "豆包 / 方舟密钥", "en": "Doubao / Ark key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "hunyuanKey", "type": "password", "title": {"zh": "混元密钥", "en": "Hunyuan key"}, "hint": {"zh": "存在 Windows 凭据管理器里，不进设置文件", "en": "Kept in Windows Credential Manager, not in the settings file"}},
+    {"key": "endpoint", "type": "text", "title": {"zh": "接口地址", "en": "Endpoint"}, "hint": {"zh": "留空使用所选服务默认地址；自定义 OpenAI 兼容地址需含 /v1 等路径", "en": "Leave empty for the selected service's default; a custom OpenAI-compatible base includes /v1 if required"}, "default": ""},
+    {"key": "model", "type": "text", "title": {"zh": "模型", "en": "Model"}, "hint": {"zh": "留空使用服务默认模型；方舟须填已开通的模型或推理接入点 ID；切换服务时检查此项", "en": "Empty uses the service default; Ark needs an enabled model or endpoint ID. Check this when changing service"}, "default": ""},
+    {"key": "region", "type": "text", "title": {"zh": "微软资源区域", "en": "Microsoft resource region"}, "hint": {"zh": "微软翻译资源需要时填写，如 eastasia；其他服务留空", "en": "For Microsoft resources that require a region, e.g. eastasia; otherwise leave empty"}, "default": ""},
+    {"key": "target", "type": "choice", "title": {"zh": "译成", "en": "Target"}, "options": [
+      {"value": "auto", "title": {"zh": "自动（中⇄英）", "en": "Auto (zh ⇄ en)"}},
+      {"value": "zh", "title": {"zh": "中文", "en": "Chinese"}},
+      {"value": "en", "title": {"zh": "英文", "en": "English"}},
+      {"value": "ja", "title": {"zh": "日文", "en": "Japanese"}}
+    ], "default": "auto"},
+    {"key": "apiKey", "type": "password", "title": {"zh": "旧版共用密钥", "en": "Shared key (older versions)"}, "hint": {"zh": "所选服务没填自己的密钥时用它；各服务的密钥填好后可以清空", "en": "Used by a service without its own key; clear it once each service has its own"}}
+  ],
+  "ai": {"expose": true}
+}

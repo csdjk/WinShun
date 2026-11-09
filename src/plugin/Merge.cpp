@@ -1,5 +1,7 @@
 #include "Merge.h"
 
+#include "Details.h"
+
 #include <QSet>
 
 #include <algorithm>
@@ -117,6 +119,10 @@ SearchResult toRow(const Entry& entry, const Command& command, const Item& item,
     p->valid = item.valid;
     p->score = item.score;
     p->item = itemToJson(item);
+    // "details" (GitHub #202, asksDetails): only a resident plugin is there
+    // to be asked (a once plugin's process has ended, a zero-code one has none).
+    if (!entry.manifest || !entry.manifest->resident())
+        p->item.remove(u"details"_s);
 
     SearchResult r;
     r.name = item.title;
@@ -136,14 +142,17 @@ Merge::Merge(RowSink& sink, const Catalog& catalog)
 {
 }
 
-void Merge::begin(std::uint64_t queryId, const QString& text, const QString& keywordPlugin, const QString& keywordCommand)
+void Merge::begin(std::uint64_t queryId, const QString& text, const QString& keywordPlugin, const QString& keywordCommand, bool contentOnly, bool hints)
 {
     m_queryId = queryId;
     m_text = text;
+    m_contentOnly = contentOnly;
+    m_hints = hints;
     m_keywordPlugin = keywordPlugin;
     m_keywordCommand = keywordCommand;
     m_namesReady = keywordMode(); // no name search to wait for
     m_assigned = false;
+    m_keywordItemIndex = 0;
     m_held.clear();
     m_betterFirstRow = false;
 }
@@ -151,7 +160,7 @@ void Merge::begin(std::uint64_t queryId, const QString& text, const QString& key
 void Merge::namesShown()
 {
     m_namesReady = true;
-    if (!keywordMode())
+    if (!keywordMode() && !m_contentOnly && m_hints)
         placeHint();
     for (auto it = m_held.begin(); it != m_held.end();) {
         if (it->second.complete) {
@@ -160,6 +169,41 @@ void Merge::namesShown()
         } else
             ++it;
     }
+}
+
+// A content provider's complete answer with a row apply() keeps: one that
+// opens a file (it may still turn out a file already listed), or a resident
+// plugin's that tells what it is ("details", GitHub #202).
+bool Merge::answerHeld() const
+{
+    return std::ranges::any_of(m_held, [this](const auto& held) {
+        const Batch& batch = held.second;
+        if (!batch.complete)
+            return false;
+        const Entry* entry = m_catalog.find(batch.pluginId);
+        const Command* command = entry && entry->manifest ? entry->manifest->command(batch.commandId) : nullptr;
+        const bool resident = entry && entry->manifest && entry->manifest->resident();
+        return command && command->contentSearch && std::ranges::any_of(batch.items, [resident](const Item& item) {
+            return item.open.kind == Open::Kind::Path || (item.details && resident);
+        });
+    });
+}
+
+bool Merge::contentRow(const SearchResult& row) const
+{
+    if (!row.isPlugin())
+        return false;
+    const Entry* entry = m_catalog.find(row.plugin->pluginId);
+    const Command* command = entry && entry->manifest ? entry->manifest->command(row.plugin->commandId) : nullptr;
+    return command && command->contentSearch;
+}
+
+int Merge::contentEnd() const
+{
+    int end = m_sink.count();
+    while (end > 0 && contentRow(m_sink.row(end - 1)))
+        --end;
+    return end;
 }
 
 // A list command's keyword typed alone: a row offering it, first and
@@ -199,13 +243,13 @@ int Merge::pluginRows() const
 
 // The rows of an answer, each item once (the first of an id wins), by score
 // when asked (push mode; keyword mode only when some item gave one).
-SearchResults Merge::rowsOf(const Entry& entry, const Command& command, const Items& items, bool sortByScore) const
+SearchResults Merge::rowsOf(const Entry& entry, const Command& command, const Items& items, bool sortByScore, int offset) const
 {
     SearchResults rows;
     QSet<QString> ids;
     bool scored = false;
-    for (int i = 0; i < items.size(); ++i) {
-        SearchResult row = toRow(entry, command, items[i], i, m_locale);
+    for (int i = 0; i < items.size() && i < kMaxItems; ++i) {
+        SearchResult row = toRow(entry, command, items[i], offset + i, m_locale);
         if (ids.contains(row.path))
             continue;
         ids.insert(row.path);
@@ -229,12 +273,22 @@ void Merge::results(std::uint64_t queryId, const QString& pluginId, const QStrin
         const Command* command = entry && entry->manifest ? entry->manifest->command(commandId) : nullptr;
         if (!command)
             return;
-        SearchResults rows = rowsOf(*entry, *command, items, false);
+        if (replace || !m_assigned)
+            m_keywordItemIndex = 0;
+        SearchResults rows = rowsOf(*entry, *command, items, false, m_keywordItemIndex);
+        m_keywordItemIndex += static_cast<int>(items.size());
         if (replace || !m_assigned) {
             m_sink.assign(std::move(rows));
             m_assigned = true;
-        } else
+        } else {
+            QSet<QString> ids;
+            for (int i = 0; i < m_sink.count(); ++i)
+                ids.insert(m_sink.row(i).path);
+            rows.removeIf([&ids](const SearchResult& row) { return ids.contains(row.path); });
+            if (rows.size() > std::max(0, kMaxItems - m_sink.count()))
+                rows.resize(std::max(0, kMaxItems - m_sink.count()));
             m_sink.append(rows);
+        }
         return;
     }
     // Push mode: a command's batches add up until its final answer, which
@@ -245,8 +299,13 @@ void Merge::results(std::uint64_t queryId, const QString& pluginId, const QStrin
     batch.commandId = commandId;
     if (replace)
         batch.items = items;
-    else
-        batch.items.append(items);
+    else {
+        for (const Item& item : items) {
+            if (batch.items.size() >= kMaxItems)
+                break;
+            batch.items.append(item);
+        }
+    }
     batch.complete = !partial;
     if (batch.complete && m_namesReady) {
         const Batch done = std::move(batch);
@@ -263,6 +322,36 @@ void Merge::replace(const QString& pluginId, const QString& commandId, const Ite
         return;
     m_sink.assign(rowsOf(*entry, *command, items, false));
     m_assigned = true;
+    m_keywordItemIndex = static_cast<int>(items.size());
+}
+
+// The first row a pushed row may take: after the last row that is recent, a
+// favorite, or an app named just what was typed, and below the keyboard's row
+// unless that is the first.
+int Merge::floorRow() const
+{
+    const int current = m_sink.currentRow();
+    int floor = current > 0 ? current + 1 : 0;
+    for (int i = 0; i < m_sink.count(); ++i) {
+        const SearchResult& r = m_sink.row(i);
+        if (r.isWindow() || r.recent || r.favorite || (r.exact && r.isApp()))
+            floor = std::max(floor, i + 1);
+    }
+    return std::min(floor, m_sink.count());
+}
+
+// Where a content provider's first rows go (kFirstScreenRows): past the rows
+// placeFor() keeps clear and the first kFirstScreenNames name rows, and past
+// the provider rows already there, so they stay in the provider's order.
+int Merge::firstScreenRow() const
+{
+    const int count = m_sink.count();
+    int at = floorRow();
+    for (int names = 0; at < count && names < kFirstScreenNames; ++at)
+        names += !m_sink.row(at).isPlugin();
+    while (at < count && contentRow(m_sink.row(at)))
+        ++at;
+    return at;
 }
 
 // Where a pushed row of `score` goes: after the last row that is recent
@@ -275,14 +364,7 @@ void Merge::replace(const QString& pluginId, const QString& commandId, const Ite
 int Merge::placeFor(int score) const
 {
     const int count = m_sink.count();
-    const int current = m_sink.currentRow();
-    int floor = current > 0 ? current + 1 : 0;
-    for (int i = 0; i < count; ++i) {
-        const SearchResult& r = m_sink.row(i);
-        if (r.recent || r.favorite || (r.exact && r.isApp()))
-            floor = std::max(floor, i + 1);
-    }
-    int at = std::min(floor, count);
+    int at = floorRow();
     while (at < count && m_sink.row(at).isApp() && m_sink.row(at).score >= score)
         ++at;
     return at;
@@ -295,6 +377,23 @@ void Merge::apply(const Batch& batch)
     if (!command)
         return;
     SearchResults rows = rowsOf(*entry, *command, batch.items, true);
+    const bool content = command->contentSearch;
+    if (content) {
+        rows.removeIf([&](const SearchResult& row) {
+            if (!row.plugin)
+                return true;
+            // A row that is no file stays when the plugin tells what it is
+            // (a mail: "details", GitHub #202); other such rows (setup hints) go.
+            if (row.plugin->openKind != PluginRow::OpenKind::Path)
+                return !asksDetails(*row.plugin);
+            for (int i = 0; i < m_sink.count(); ++i) {
+                const SearchResult& other = m_sink.row(i);
+                if (!other.isPlugin() && other.path.compare(row.plugin->openTarget, Qt::CaseInsensitive) == 0)
+                    return true;
+            }
+            return false;
+        });
+    }
 
     // The quota: this plugin's other commands and the other plugins count.
     int samePlugin = 0;
@@ -304,6 +403,8 @@ void Merge::apply(const Batch& batch)
         const SearchResult& r = m_sink.row(i);
         if (!r.isPlugin() || isHintRow(r))
             continue; // the hint row is nobody's answer: outside the quota
+        if (!content && contentRow(r))
+            continue;
         if (r.plugin->pluginId != batch.pluginId)
             ++others;
         else if (r.plugin->commandId != batch.commandId)
@@ -311,7 +412,7 @@ void Merge::apply(const Batch& batch)
         else
             existing.emplace(r.path, i);
     }
-    const int cap = std::max(0, std::min(kPerPlugin - samePlugin, kTotal - others - samePlugin));
+    const int cap = content ? kMaxItems : std::max(0, std::min(kPerPlugin - samePlugin, kTotal - others - samePlugin));
     const bool cut = rows.size() > cap;
     rows.resize(std::min<qsizetype>(rows.size(), cap));
     if (cut) {
@@ -343,10 +444,21 @@ void Merge::apply(const Batch& batch)
     std::sort(gone.rbegin(), gone.rend());
     for (const int index : gone)
         m_sink.remove(index);
+    // A content provider's first rows are on the first screen (they would
+    // be out of sight past the names, up to a page of them); the rest
+    // follow the native matches (contentEnd). Content only has no names.
+    int onList = 0;
+    if (content) {
+        for (int i = 0; i < m_sink.count(); ++i)
+            onList += contentRow(m_sink.row(i));
+    }
     for (const SearchResult& r : rows) {
         if (kept.contains(r.path))
             continue;
-        const int at = placeFor(r.score);
+        const int at = !content ? placeFor(r.score)
+            : onList < kFirstScreenRows && !m_contentOnly ? firstScreenRow()
+                                                          : m_sink.count();
+        ++onList;
         m_betterFirstRow = m_betterFirstRow || (at == 0 && m_sink.currentRow() == 0);
         m_sink.insert(at, r);
     }

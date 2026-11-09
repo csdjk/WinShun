@@ -5,6 +5,7 @@
 #include "AnnotationFormat.h"
 #include "AnnotationRender.h"
 #include "AnnotationStyles.h"
+#include "CaptureKeys.h"
 #include "SmartRedact.h"
 
 #include <QImage>
@@ -92,6 +93,12 @@ class AnnotationModel : public QObject {
     // What the gesture is changing (image px, set 16 logical px wider): the
     // toolbar steps aside when it reaches it (3.5). Null when no gesture.
     Q_PROPERTY(QRectF gestureBounds READ gestureBounds NOTIFY gestureChanged FINAL)
+    // The pin and save keys as tips and key lists show them ("F3"); empty: none (#187).
+    Q_PROPERTY(QString pinKeyText READ pinKeyText NOTIFY keysChanged FINAL)
+    Q_PROPERTY(QString saveKeyText READ saveKeyText NOTIFY keysChanged FINAL)
+    // A save folder was chosen: Save and its key go straight into it, and the
+    // menu offers 另存为… instead of 保存到旧路径 (#194).
+    Q_PROPERTY(bool saveDirect READ saveDirect NOTIFY keysChanged FINAL)
 
 public:
     explicit AnnotationModel(QObject* parent = nullptr);
@@ -107,6 +114,13 @@ public:
     // picture that never was a screenshot). What the model is asked to keep
     // from here on is measured against this document (modified()).
     void begin(const annot::Project& project, qreal deviceDpr, const annot::StyleMemory& styles);
+    // A capture brought back from the history (, and . in the overlay): its
+    // monitor's frozen picture with the annotations as they were left
+    // (`doc`, on the whole picture), an empty undo stack.
+    void begin(const QImage& base, const annot::Document& doc, const annot::StyleMemory& styles);
+    // The annotations as they stand, a text or path under way included, on
+    // the whole picture (the history keeps them so); document() leaves those out.
+    annot::Document committedDocument() const { return committed(); }
     // Everything let go of (the picture, the caches, the stack).
     void end();
     bool editor() const { return m_editor; }
@@ -142,6 +156,9 @@ public:
     std::optional<quint32> unworded() const;
     // The brush redaction under the mouse (not yet let go): drawn as a mosaic meanwhile.
     std::optional<quint32> draft() const;
+    // What the drawing under way has put in the document (a pen's stroke as
+    // it grows): none from the press to the first move, nor for a move or a resize.
+    std::optional<quint32> drawing() const;
     // The styles as they are now (the tools' remembered ones, including this
     // capture's changes); `stylesChanged()` tells whether any changed.
     const annot::StyleMemory& styles() const { return m_styles; }
@@ -255,13 +272,38 @@ public:
     // tool, where the session copies.
     bool doubleClick(QPoint p);
     // Wheel with a tool or a selected object: size steps; `angleDelta` is
-    // the wheel's, summed until 120 makes a notch, one notch per 200 ms at
-    // most (touchpads). True when the wheel is the model's (tool or selection).
+    // the wheel's, summed until 120 makes a notch: a mouse's notches step at
+    // once, a touchpad's pieces one step per 60 ms at most. True when the wheel is the model's (tool or selection).
     bool wheel(int angleDelta, qint64 nowMs);
     // The tool keys, undo and redo, Delete, arrows on a selected object,
     // [ and ], Ctrl+[ and Ctrl+], Ctrl+A (all objects), Ctrl+D (a copy of
     // the selected ones, a little aside), I (the eyedropper). True when taken.
     bool key(int key, Qt::KeyboardModifiers modifiers);
+    // The keys whose owner decides (the pin and save keys, #187): the text
+    // box hands them over instead of typing them. The defaults until the owner sets them.
+    void setKeys(const CaptureKeys& keys)
+    {
+        if (keys == m_keys)
+            return;
+        m_keys = keys;
+        emit keysChanged();
+    }
+    const CaptureKeys& keys() const { return m_keys; }
+    QString pinKeyText() const { return m_keys.text(KeyAction::Pin); }
+    QString saveKeyText() const { return m_keys.text(KeyAction::Save); }
+    void setSaveDirect(bool on)
+    {
+        if (on == m_saveDirect)
+            return;
+        m_saveDirect = on;
+        emit keysChanged();
+    }
+    bool saveDirect() const { return m_saveDirect; }
+    Q_INVOKABLE bool isFinishKey(int key, int modifiers) const
+    {
+        const auto mods = Qt::KeyboardModifiers(modifiers);
+        return m_keys.matches(KeyAction::Pin, key, mods) || m_keys.matches(KeyAction::Save, key, mods);
+    }
     // Esc, steps 2 and 3 of 3.6: commit the text under way, or cancel the
     // gesture under way; before either, close a number's edit box. True
     // when it did one of them.
@@ -323,6 +365,7 @@ signals:
     void marqueeChanged();
     void pickingChanged();
     void smartChanged();
+    void keysChanged();
     // A word for the user (the overlay shows it by the selection).
     void notice(const QString& text);
 
@@ -380,7 +423,7 @@ private:
     void updateGesture();
     void finishGesture();
     annot::Item shapeTo(QPoint p, bool constrain) const;
-    annot::Item strokeTo(const annot::Item& stroke, QPoint p, bool constrain) const;
+    annot::Item strokeTo(const annot::Item& stroke, QPoint p, bool constrain);
     void beginNewText(QPoint p);
     void beginEdit(const annot::Item& item, QPoint p);
     // The words of a Number: after it was put down (click -1,-1: the caret at the end) or on a click.
@@ -389,7 +432,7 @@ private:
     bool onWords(const annot::Item& item, QPoint p) const;
     annot::NumberGeometry geometryOf(const annot::Item& item) const;
     void commitWords(const QString& text);
-    void stepSize(int direction);
+    void stepSize(int direction, int count = 1);
     void nudge(QPoint delta);
     void reorder(int direction, bool toEnd);
     bool canReorder(int direction) const;
@@ -420,6 +463,8 @@ private:
     Gesture m_gesture = Gesture::None;
     QList<quint32> m_picked; // the selected objects, in the order they were picked
     std::optional<Editing> m_editing;
+    CaptureKeys m_keys;
+    bool m_saveDirect = false;
     std::optional<quint32> m_numberEdit;
     std::unique_ptr<Private> d;
 };

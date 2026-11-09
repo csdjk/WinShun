@@ -569,6 +569,133 @@ private slots:
         QVERIFY(lastOf(m, Kind::Pen)->points.size() >= 9);
     }
 
+    void freehandFiltersSmallJitterWithoutChangingOnRelease()
+    {
+        for (const Kind kind : {Kind::Pen, Kind::Marker}) {
+            Rig rig;
+            AnnotationModel& m = rig.model;
+            m.setTool(toolIndex(kind));
+            QList<QPointF> raw {QPointF(40.5, 100.5)};
+            press(m, QPoint(40, 100));
+            for (int i = 1; i <= 200; ++i) {
+                const QPoint p(40 + i, 100 + ((i / 2) % 2 ? 2 : -2));
+                raw.append(pixelCentre(p));
+                m.move(p, {});
+            }
+            m.move(QPoint(241, 100), {});
+            raw.append(QPointF(241.5, 100.5));
+            const Item draft = m.document().items.last();
+            const auto jitter = [](const QPainterPath& path) {
+                qreal sum = 0;
+                for (int i = 10; i <= 190; ++i) {
+                    const qreal offset = path.pointAtPercent(i / 200.0).y() - 100.5;
+                    sum += offset * offset;
+                }
+                return std::sqrt(sum / 181);
+            };
+            const qreal before = jitter(strokeCentreline(raw));
+            const qreal after = jitter(strokeCentreline(draft.points));
+            qInfo() << "freehand jitter RMS, raw/stabilized:" << before << after;
+            QVERIFY2(after < before * 0.65, "small input jitter must be reduced in the live stroke");
+            // Uniform arc-length samples measure visible tangent changes,
+            // rather than only how far the line strays from its baseline.
+            const QPainterPath curve = strokeCentreline(draft.points);
+            QList<QPointF> uniform;
+            for (qreal distance = 10; distance < curve.length() - 10; distance += 1)
+                uniform.append(curve.pointAtPercent(curve.percentAtLength(distance)));
+            qreal roughness = 0;
+            for (qsizetype i = 1; i + 1 < uniform.size(); ++i) {
+                const QPointF bend = uniform[i - 1] - uniform[i] * 2 + uniform[i + 1];
+                roughness += QPointF::dotProduct(bend, bend);
+            }
+            roughness = std::sqrt(roughness / (uniform.size() - 2));
+            qInfo() << "uniform curve second difference RMS:" << roughness << "stored points:" << draft.points.size();
+            QVERIFY2(roughness < 0.08, "a visually smooth line must not retain dense small waves");
+            QVERIFY(draft.points.size() < raw.size() / 2);
+            QCOMPARE(draft.points.first(), raw.first());
+            QCOMPARE(draft.points.last(), raw.last());
+            m.release(QPoint(241, 100));
+            QCOMPARE(m.document().items.last(), draft);
+            const Document committed = m.document();
+            m.undo();
+            QCOMPARE(m.itemCount(), 0);
+            m.redo();
+            QCOMPARE(m.document(), committed);
+        }
+    }
+
+    void stabilizedFreehandRepaintsAndRoundTripsAtDifferentScales()
+    {
+        for (const Kind kind : {Kind::Pen, Kind::Marker}) {
+            for (qreal dpr : {1.0, 1.5, 2.0}) {
+                for (qreal zoom : {0.5, 1.0, 2.0}) {
+                    Rig rig(QSize(400, 300), dpr);
+                    AnnotationModel& m = rig.model;
+                    m.setView(dpr, zoom);
+                    m.setTool(toolIndex(kind));
+                    Screen screen(m);
+                    CHECK_SCREEN(screen);
+                    const QList<QPoint> points {QPoint(45, 70), QPoint(60, 70), QPoint(62, 72), QPoint(64, 70),
+                        QPoint(66, 69), QPoint(67, 71), QPoint(68, 70), QPoint(90, 70), QPoint(130, 70),
+                        QPoint(130, 110), QPoint(170, 135), QPoint(210, 110), QPoint(170, 90), QPoint(130, 110),
+                        QPoint(250, 190), QPoint(252, 188), QPoint(254, 190), QPoint(255, 189)};
+                    press(m, points.first());
+                    for (qsizetype i = 1; i < points.size(); ++i) {
+                        m.move(points[i], {});
+                        CHECK_SCREEN(screen); // includes a live tip bending and returning to an axis
+                    }
+                    const Item draft = m.document().items.last();
+                    m.release(points.last());
+                    QCOMPARE(m.document().items.last(), draft);
+                    CHECK_SCREEN(screen);
+                    const Document committed = m.document();
+                    QString error;
+                    const auto loaded = fromJson(toJson(committed), &error);
+                    QVERIFY2(loaded.has_value(), qPrintable(error));
+                    QCOMPARE(*loaded, committed); // subpixel anchors survive project serialization
+                    Compositor reopened;
+                    const QImage want = reopened.exportImage(*loaded, rig.base, m.sampleBounds());
+                    const Diff exported = compare(m.composed(), want);
+                    QVERIFY2(exported.count == 0, describe(exported).constData());
+                    m.undo();
+                    CHECK_SCREEN(screen);
+                    m.redo();
+                    CHECK_SCREEN(screen);
+                    QCOMPARE(m.document(), committed);
+                }
+            }
+        }
+    }
+
+    void freehandResumesAfterShiftAndCancel()
+    {
+        Rig rig;
+        AnnotationModel& m = rig.model;
+        m.setTool(toolIndex(Kind::Pen));
+        Screen screen(m);
+        CHECK_SCREEN(screen);
+        press(m, QPoint(40, 60));
+        m.move(QPoint(80, 90), {});
+        m.move(QPoint(130, 65), Qt::ShiftModifier);
+        QCOMPARE(m.document().items.last().points.size(), 2);
+        CHECK_SCREEN(screen);
+        m.move(QPoint(170, 105), {});
+        CHECK_SCREEN(screen);
+        m.release(QPoint(170, 105));
+        QCOMPARE(m.document().items.last().points.first(), QPointF(40.5, 60.5));
+        QCOMPARE(m.document().items.last().points.last(), QPointF(170.5, 105.5));
+        const Document committed = m.document();
+        press(m, QPoint(40, 180));
+        m.move(QPoint(130, 220), {});
+        m.cancelGesture();
+        QCOMPARE(m.document(), committed);
+        CHECK_SCREEN(screen);
+        stroke(m, {QPoint(220, 180), QPoint(260, 190), QPoint(300, 210)});
+        QCOMPARE(m.document().items.last().points.first(), QPointF(220.5, 180.5));
+        QCOMPARE(m.document().items.last().points.last(), QPointF(300.5, 210.5));
+        CHECK_SCREEN(screen);
+    }
+
     void clicksMakeNothing()
     {
         Rig rig;
@@ -1552,52 +1679,64 @@ private slots:
         QCOMPARE(width(), 4); // half a notch
         QVERIFY(m.wheel(60, 1010));
         QCOMPARE(width(), 5); // a notch: one step
-        QVERIFY(m.wheel(120, 1100));
-        QCOMPARE(width(), 5); // within 200 ms of the last one
-        QVERIFY(m.wheel(120, 1250));
-        QCOMPARE(width(), 6);
+        QVERIFY(m.wheel(120, 1020));
+        QCOMPARE(width(), 6); // a mouse's whole notch is a step at once, no waiting (#164)
+        QVERIFY(m.wheel(120, 1030));
+        QCOMPARE(width(), 7);
         QVERIFY(m.wheel(-120, 1500));
-        QCOMPARE(width(), 5);
+        QCOMPARE(width(), 6);
         QVERIFY(m.wheel(-40, 1800));
         QVERIFY(m.wheel(80, 1810)); // turned back: counted again from there
-        QCOMPARE(width(), 5);
-        QVERIFY(m.wheel(480, 2500)); // a flick: one step
         QCOMPARE(width(), 6);
+        QVERIFY(m.wheel(60, 1820));
+        QCOMPARE(width(), 7); // a touchpad's pieces: one step ...
+        QVERIFY(m.wheel(120 + 30, 1830)); // (not a whole number of notches)
+        QCOMPARE(width(), 7); // ... and the next one waits 60 ms
+        QVERIFY(m.wheel(150, 1900));
+        QCOMPARE(width(), 8);
+        QVERIFY(m.wheel(480, 2500)); // a spin: its notches
+        QCOMPARE(width(), 12);
         // [ and ] step the same ladder.
         QVERIFY(m.key(Qt::Key_BracketRight, {}));
-        QCOMPARE(width(), 7);
-        QVERIFY(m.key(Qt::Key_BracketRight, {}));
-        QCOMPARE(width(), 8);
-        QVERIFY(m.key(Qt::Key_BracketRight, {}));
-        QCOMPARE(width(), 10);
+        QCOMPARE(width(), 13);
         QVERIFY(m.key(Qt::Key_BracketLeft, {}));
-        QCOMPARE(width(), 8);
+        QCOMPARE(width(), 12);
         m.setTool(toolIndex(Kind::Number));
+        const int numberSize = m.panel().value(u"size"_s).toInt();
         QVERIFY(m.wheel(120, 3000));
-        QCOMPARE(m.panel().value(u"size"_s).toInt(), 20);
+        QCOMPARE(m.panel().value(u"size"_s).toInt(), numberSize + 1);
         m.setTool(toolIndex(Kind::Redact));
+        const int cell = m.panel().value(u"cell"_s).toInt();
         QVERIFY(m.wheel(-120, 4000));
-        QCOMPARE(m.panel().value(u"cell"_s).toInt(), 10);
-        // The ladder's ends hold.
+        QCOMPARE(m.panel().value(u"cell"_s).toInt(), cell - 1);
+        // The ladder's ends hold, and it has a step for every value in between.
         m.setTool(toolIndex(Kind::Line));
-        for (int i = 0; i < 30; ++i)
+        for (int i = 0; i < 80; ++i)
             m.key(Qt::Key_BracketRight, {});
-        QCOMPARE(width(), 40);
+        QCOMPARE(width(), 64);
+        QVERIFY(m.wheel(1200, 4500));
+        QCOMPARE(width(), 64);
+        for (int i = 0; i < 80; ++i)
+            m.key(Qt::Key_BracketLeft, {});
+        QCOMPARE(width(), 1);
+        QVERIFY(m.wheel(-1200, 4600));
+        QCOMPARE(width(), 1);
         // A selected object: its own size, one undo step for the run.
         m.setTool(toolIndex(Kind::Rect));
         drag(m, QPoint(40, 40), QPoint(100, 100));
         const quint32 id = selectedId(m);
+        const int drawn = findItem(m.document(), id)->style.width;
         m.setTool(-1);
         QVERIFY(m.wheel(120, 10000));
         QVERIFY(m.wheel(120, 10300));
-        QCOMPARE(findItem(m.document(), id)->style.width, 12);
+        QCOMPARE(findItem(m.document(), id)->style.width, drawn + 2);
         m.undo();
-        QCOMPARE(findItem(m.document(), id)->style.width, 8);
+        QCOMPARE(findItem(m.document(), id)->style.width, drawn);
         // Mid-drag the wheel is still the model's, and changes nothing.
         press(m, pointOn(m, id));
         QVERIFY(m.wheel(120, 20000));
         m.release(pointOn(m, id));
-        QCOMPARE(findItem(m.document(), id)->style.width, 8);
+        QCOMPARE(findItem(m.document(), id)->style.width, drawn);
     }
 
     void redactionsStayFirst()

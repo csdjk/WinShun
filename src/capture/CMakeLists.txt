@@ -38,6 +38,7 @@ add_library(wscapture STATIC
     Geometry.cpp Geometry.h
     Hdr.cpp Hdr.h
     Recording.cpp Recording.h
+    RecordingWorker.cpp RecordingWorker.h
     GifExport.cpp GifExport.h
     RecordingPointer.cpp RecordingPointer.h
     Keycaps.cpp Keycaps.h
@@ -60,9 +61,13 @@ add_library(wscapture STATIC
     QrCode.cpp QrCode.h
     PinTools.cpp PinTools.h
     CaptureTools.cpp CaptureTools.h
+    CaptureHistory.cpp CaptureHistory.h
     UiaProbe.cpp UiaProbe.h
     CountdownWindow.cpp CountdownWindow.h
     CaptureDiagnostics.cpp CaptureDiagnostics.h
+    LaserTrail.cpp LaserTrail.h
+    LiveStroke.cpp LiveStroke.h
+    PresenterState.h
 )
 target_include_directories(wscapture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # miniz: the projects' zip (AnnotationFormat). ole32: UI Automation (ScrollInput).

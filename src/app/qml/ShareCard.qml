@@ -15,6 +15,7 @@ Rectangle {
     readonly property var blank: ({ path: "", name: "", tone: "idle", status: "", signIn: false, suspect: false, busy: false, verifiable: false,
                                     content: false, contentStatus: "" })
     property bool marked: false // what the settings search found
+    readonly property real dpr: Screen.devicePixelRatio // one Screen attached object for all its items (GitHub #111)
 
     signal verifyClicked()
     signal startClicked()
@@ -22,6 +23,8 @@ Rectangle {
     signal acceptClicked()
     signal removeClicked()
     signal contentToggled(bool on)
+    signal scanEdited(bool scheduled, string from, string until, int depth)
+
 
     readonly property color toneColor: share.tone === "ok" ? Theme.success
                                      : share.tone === "busy" ? Theme.accent
@@ -31,11 +34,25 @@ Rectangle {
 
     readonly property real headHeight: Math.max(texts.implicitHeight, buttons.implicitHeight)
     // Whole device pixels: the cards below it in the column, and its switch, stay sharp.
-    implicitHeight: Theme.snap(headHeight + 24 + (card.kind === "share" ? contents.height + 10 : 0), Screen.devicePixelRatio)
+    implicitHeight: Theme.snap(headHeight + 24 + (card.kind === "share" ? contents.height + scanSettings.height + 18 : 0), card.dpr)
     radius: Theme.controlRadius
     color: "transparent"
-    border.width: 1
-    border.color: marked ? Theme.accent : Theme.cardBorder
+
+    Hook { // the style's card (Theme.cardPart), a plate inside the section's
+        anchors.fill: parent
+        part: Theme.cardPart
+        corner: Theme.controlRadius
+        extra: ({ inset: true })
+        dpr: card.dpr
+    }
+    Rectangle { // found by the settings search: the edge in the accent
+        visible: card.marked
+        anchors.fill: parent
+        radius: Theme.controlRadius
+        color: "transparent"
+        border.width: Theme.edge(card.dpr)
+        border.color: Theme.accent
+    }
 
     Glyph {
         id: icon
@@ -82,11 +99,11 @@ Rectangle {
                 y: Math.round(status.fontInfo.pixelSize * 0.62 - height / 2)
                 width: 8
                 height: 8
-                radius: 4
+                radius: Theme.pillRadius(width)
                 color: card.toneColor
 
                 SequentialAnimation on opacity { // read just now
-                    running: card.share.busy && SystemTheme.animations
+                    running: card.share.busy && SystemTheme.animations && (card.Window.window?.visible ?? false) // not in the hidden settings window
                     loops: Animation.Infinite
                     alwaysRunToEnd: true
                     NumberAnimation { to: 0.3; duration: 600; easing.type: Easing.InOutSine }
@@ -116,6 +133,7 @@ Rectangle {
         spacing: 4
 
         FlatButton {
+            dpr: card.dpr
             visible: card.share.startable === true
             implicitHeight: 32
             highlighted: true
@@ -123,6 +141,7 @@ Rectangle {
             onClicked: card.startClicked()
         }
         FlatButton {
+            dpr: card.dpr
             visible: card.kind === "share" && card.share.signIn
             implicitHeight: 32
             highlighted: true
@@ -130,12 +149,14 @@ Rectangle {
             onClicked: card.signInClicked()
         }
         FlatButton {
+            dpr: card.dpr
             visible: card.kind === "share" && card.share.suspect
             implicitHeight: 32
             text: qsTr("按现在的内容更新")
             onClicked: card.acceptClicked()
         }
         FlatButton {
+            dpr: card.dpr
             visible: card.kind === "share" ? !card.share.signIn && card.share.startable !== true : card.share.verifiable === true
             enabled: !card.share.busy
             implicitHeight: 32
@@ -144,6 +165,7 @@ Rectangle {
             onClicked: card.verifyClicked()
         }
         FlatButton {
+            dpr: card.dpr
             implicitHeight: 32
             flat: true
             text: qsTr("移除")
@@ -158,15 +180,15 @@ Rectangle {
         anchors.left: texts.left
         anchors.right: parent.right
         anchors.rightMargin: 20 // the switch's edge under 移除's text: the buttons' 8 and a FlatButton's 12 of padding
-        y: Theme.snap(12 + card.headHeight + 10, Screen.devicePixelRatio)
-        height: Theme.snapUp(Math.max(contentTexts.implicitHeight, contentSwitch.implicitHeight), Screen.devicePixelRatio)
+        y: Theme.snap(12 + card.headHeight + 10, card.dpr)
+        height: Theme.snapUp(Math.max(contentTexts.implicitHeight, contentSwitch.implicitHeight), card.dpr)
 
         Column {
             id: contentTexts
             anchors.left: parent.left
             anchors.right: contentSwitch.left
             anchors.rightMargin: 12
-            y: Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio)
+            y: Theme.snap((parent.height - height) / 2, card.dpr)
             spacing: 2
 
             Text {
@@ -188,12 +210,24 @@ Rectangle {
             }
         }
         ToggleSwitch {
+            dpr: card.dpr
             id: contentSwitch
             anchors.right: parent.right
-            y: Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio) // not verticalCenter: the track's edges on whole pixels
+            y: Theme.snap((parent.height - height) / 2, card.dpr) // not verticalCenter: the track's edges on whole pixels
             checked: card.share.content === true
             Accessible.name: qsTr("搜索文件内容")
             onToggled: (on) => card.contentToggled(on)
         }
+    }
+
+    ShareScanControls {
+        dpr: card.dpr
+        id: scanSettings
+        visible: card.kind === "share"
+        anchors.left: contents.left
+        anchors.right: contents.right
+        y: contents.y + contents.height + 8
+        share: card.share
+        onEdited: (scheduled, from, until, depth) => card.scanEdited(scheduled, from, until, depth)
     }
 }

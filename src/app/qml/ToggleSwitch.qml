@@ -16,19 +16,20 @@ Item {
     property bool busy: false
     property bool word: true // false: just the track (a label of its own beside it)
     property bool mixable: false // room for "自定义" too, so that the switch stays put whatever its state
-    property int wordAlign: Text.AlignLeft
+    property int wordAlign: Text.AlignRight
     property bool animated: true // false: the colours and the knob jump (a row taken for another switch)
     readonly property bool hovered: area.containsMouse
+    property real dpr: 0 // the window's, passed by a host that has it (GitHub #111)
+    // Screen.* only when no host passed it (one attached object for all its
+    // items then): a default binding to it would make one even where the
+    // host's value replaces it.
+    readonly property real pixelRatio: dpr > 0 ? dpr : Screen.devicePixelRatio
     signal toggled(bool on)
 
     // Taken for another switch (a recycled row), it is that switch's from the first frame.
+    // (The part's settle(): its animations to their end.)
     function settle() {
-        if (slide.running)
-            slide.complete()
-        if (tint.running)
-            tint.complete()
-        if (knobTint.running)
-            knobTint.complete()
+        toggleHook.call("settle", [], null)
         dimmed = false
     }
     // Asked for what it already is: the track lights up for 160 ms.
@@ -41,7 +42,7 @@ Item {
     activeFocusOnTab: true
 
     property bool dimmed: false // busy for over 150 ms
-    opacity: toggle.busy && toggle.dimmed ? 0.5 : 1
+    opacity: !enabled ? toggleHook.out("disabledOpacity", 0.4) : toggle.busy && toggle.dimmed ? 0.5 : 1
     Behavior on opacity { NumberAnimation { duration: 80 } }
     onBusyChanged: if (!busy) dimmed = false
 
@@ -64,7 +65,7 @@ Item {
 
     Row {
         id: row
-        y: Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio) // whole device pixels, so that the track's edges are crisp
+        y: Theme.snap((parent.height - height) / 2, toggle.pixelRatio) // whole device pixels, so that the track's edges are crisp
         spacing: 10
 
         Text { // as wide as the longest word, so the switch stays put ("On" / "Off")
@@ -81,33 +82,25 @@ Item {
             TextMetrics { id: mixedWord; text: qsTr("自定义"); font.pixelSize: Theme.fontBody }
         }
 
-        Rectangle {
+        Item {
             id: track
             readonly property bool lit: toggle.checked && !toggle.mixed && !toggle.unknown
-            y: Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio)
+            readonly property real radius: Theme.pillRadius(height)
+            y: Theme.snap((parent.height - height) / 2, toggle.pixelRatio)
             width: 40
             height: 20
-            radius: 10
-            // Fading to or from "transparent" would pass through black: from the fill's own colour instead.
-            color: lit ? Theme.accentFill : area.containsMouse ? Theme.controlHover : Qt.rgba(Theme.controlHover.r, Theme.controlHover.g, Theme.controlHover.b, 0)
-            border.width: lit ? 0 : 1
-            border.color: Theme.subtext
 
-            Behavior on color { enabled: toggle.animated; ColorAnimation { id: tint; duration: 120 } }
-
-            Rectangle {
-                id: knob
-                readonly property real size: area.pressed ? 14 : area.containsMouse ? 14 : 12
-                visible: !toggle.unknown
-                anchors.verticalCenter: parent.verticalCenter
-                x: toggle.mixed ? (parent.width - width) / 2 : toggle.checked ? parent.width - width - 4 : 4
-                width: area.pressed ? 17 : size
-                height: size
-                radius: size / 2
-                color: track.lit ? Theme.accentText : Theme.subtext
-
-                Behavior on x { enabled: toggle.animated; NumberAnimation { id: slide; duration: 120; easing.type: Easing.OutCubic } }
-                Behavior on color { enabled: toggle.animated; ColorAnimation { id: knobTint; duration: 120 } }
+            Hook { // the style's track and knob (Theme.toggle)
+                id: toggleHook
+                anchors.fill: parent
+                part: Theme.toggle
+                extra: ({ animated: toggle.animated })
+                checked: toggle.checked
+                mixed: toggle.mixed
+                active: !toggle.unknown
+                hovered: area.containsMouse
+                pressed: area.pressed
+                dpr: toggle.pixelRatio
             }
 
             Rectangle { // asked for what it already is: a light that comes and goes
@@ -128,7 +121,7 @@ Item {
                 visible: toggle.activeFocus
                 anchors.fill: parent
                 anchors.margins: -3
-                radius: 13
+                radius: track.radius > 0 ? track.radius + 3 : 0 // concentric with the track
                 color: "transparent"
                 border.width: 2
                 border.color: Theme.text

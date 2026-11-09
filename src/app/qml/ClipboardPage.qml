@@ -6,7 +6,7 @@ import WinShun
 // The clipboard window's page (Win+V, ClipboardWindow.qml): a search field,
 // the categories and groups, the history, hints below; the current entry in
 // full on the right when asked for (a click on the row, Alt+P, → at the end
-// of the search), and again the next time if left open. A row's paste
+// of the search). A brief hover opens a separate, temporary preview. A row's paste
 // button or a double click pastes it into the program that was in front,
 // as Enter does; Shift+Enter as plain text, Alt+1…9 the first nine rows, Ctrl/Shift pick
 // several, Tab switches categories. Opened from a field of Win顺's own (a
@@ -23,7 +23,8 @@ import WinShun
 Item {
     id: page
 
-    required property Clipboard clipboard
+    required property var clipboard
+    property bool controllerEventsEnabled: true
     required property WindowFrame frame
     property int rows: 8 // the list shows this many (ClipboardWindow.qml: what fits below)
     property int listWidth: width // the list's part; the preview takes the rest
@@ -32,13 +33,51 @@ Item {
 
     property int previewWidth: 400 // as the window has it (ClipboardWindow.qml)
     property bool previewSizing: false // its edge is being dragged
+    property bool findingGroup: false
+    property string groupQuery
+    property bool syncingSearch: false
+    readonly property var currentCategory: clipboard.categories[clipboard.category] ?? ({})
+
+    function syncSearch() {
+        const text = findingGroup ? groupQuery : clipboard.query
+        if (input.text === text) return
+        syncingSearch = true
+        input.text = text
+        syncingSearch = false
+    }
+    function beginGroupSearch() {
+        previewClickTimer.stop()
+        clearHover()
+        closeContextMenu()
+        tabs.stopNaming()
+        groupQuery = clipboard.query
+        findingGroup = true
+        focusSearch()
+        input.selectAll()
+    }
+    function cancelGroupSearch() {
+        findingGroup = false
+        focusSearch()
+    }
+    function enterGroup(group) {
+        if (clipboard.enterGroup(group)) {
+            clipboard.query = "" // also update the independent display before its next state frame
+            findingGroup = false
+            focusSearch()
+        }
+    }
+    onFindingGroupChanged: syncSearch()
+    onGroupQueryChanged: if (findingGroup) syncSearch()
 
     signal previewOpening() // just before: the window sizes it (ClipboardWindow.qml)
     signal previewResizing(int wanted) // the edge dragged: the width asked for
     signal previewResized() // ... let go
     signal previewWidthReset() // ... double clicked: the default
 
-    readonly property int rowHeight: Theme.rowHeight // what the window's height is counted in
+    // The window's, read once here and passed down (GitHub #111).
+    readonly property real dpr: Screen.devicePixelRatio
+    readonly property UiScale metrics: UiScale { size: page.clipboard.uiSize } // its own 界面大小 (Settings 剪贴板大小)
+    readonly property int rowHeight: page.metrics.rowHeight // what the window's height is counted in
     // A picture's row: its thumbnail larger (ClipRow), larger still with largePictures.
     readonly property int pictureRowHeight: clipboard.largePictures ? 142 : 80
     // Opened from a field of Win顺's own: Enter pastes there, Esc goes back.
@@ -64,7 +103,7 @@ Item {
     readonly property real footerFrom: header.height + tabs.height + 1 + body.height
     // ... as a y, for a section that tall.
     function placed(from: real, size: real): real {
-        return flipped ? implicitHeight - from - size : from
+        return flipped ? height - from - size : from
     }
     // ↑ in rows: toward the first row; flipped, away from it.
     readonly property int rowUp: flipped ? 1 : -1
@@ -91,8 +130,8 @@ Item {
         list.positionViewAtIndex(row, ListView.Contain)
     }
     function windowHidden() {
-        previewClickTimer.stop()
-        clearHover()
+        findingGroup = false
+        closePreview()
         list.stopScrolling()
         numberHints.reset()
         closeContextMenu()
@@ -126,8 +165,9 @@ Item {
         if (list.count > 0)
             selectTo(Math.max(0, Math.min(list.count - 1, list.currentIndex + delta)), false)
     }
-    // The number keys (Clipboard.numberKeys): Alt+1... pastes the first nine
-    // rows; showing their hints never changes which keys paste them.
+    // The number keys (Clipboard.numberKeys): Alt+1... pastes the rows shown,
+    // counted from the first one at least half in view (ShownRows); showing
+    // their hints never changes which keys paste them.
     readonly property int numberKey: clipboard.numberKeys === "alt" ? Qt.Key_Alt
                                    : clipboard.numberKeys === "ctrl" ? Qt.Key_Control : -1
     NumberHints {
@@ -137,8 +177,13 @@ Item {
         // Over another app the existing KeyRouter delivers modifier keys too.
         listening: page.visible && (page.Window.active || page.clipboard.keysRouted) && !page.menuOpen
     }
-    // A digit another program holds as a global hotkey is its (Clipboard.numberKeysLeft):
-    // the row still shows the chord, struck through (ClipRow.hintTaken).
+    ShownRows {
+        id: shownRows
+        view: list
+        tracking: numberHints.hintOpacity > 0 // not per frame of a scroll while no number shows
+    }
+    // A chord that is one of Win顺's own shortcuts stays that (Clipboard.numberKeysLeft):
+    // the row still shows it, struck through (ClipRow.hintTaken).
     function numberUsable(number) {
         return (clipboard.numberKeysLeft & (1 << number)) === 0
     }
@@ -151,8 +196,7 @@ Item {
     }
 
     // The preview, of the row asked about; asked about the row it shows (or
-    // with nothing to show), it closes. Opened or closed so, it is so the
-    // next time the window opens too (clipboard.previewOpen).
+    // with nothing to show), it closes. Explicit previews last this opening.
     function togglePreview(index) {
         previewClickTimer.stop()
         if (previewOpen && (index === list.currentIndex || index < 0 || index >= list.count)) {
@@ -164,6 +208,7 @@ Item {
         }
     }
     function showPreview() {
+        clearHover()
         if (!previewOpen)
             previewOpening()
         previewOpen = true
@@ -194,16 +239,19 @@ Item {
         }
     }
 
-    // An open preview shows the row the mouse rests on for a moment (GitHub
-    // #47), the current row stays where it is. It never opens or closes the
-    // preview: the window's width must not jump under the mouse.
+    // Hover follows a manual preview or opens a separate compact window.
+    // The list and keyboard selection never move under the pointer (#174).
     property int hoverIndex: -1 // -1: the current row
     property int hoverCandidate: -1
+    property bool hoverShown: false
+    property rect hoverRect: Qt.rect(0, 0, 0, 0)
     property point hoverPos: Qt.point(-1, -1) // the last real mouse move, global
     // The row the preview shows; out of range (rows went) counts as none.
     readonly property int previewIndex: hoverIndex >= 0 && hoverIndex < list.count ? hoverIndex : list.currentIndex
     function clearHover() {
         hoverTimer.stop()
+        hoverLeaveTimer.stop()
+        hoverShown = false
         hoverIndex = -1
         hoverCandidate = -1
     }
@@ -212,21 +260,56 @@ Item {
         if (globalPos.x === hoverPos.x && globalPos.y === hoverPos.y)
             return
         hoverPos = globalPos
-        if (!previewOpen || previewSizing || list.rowDragging || (Qt.application.keyboardModifiers & (Qt.ControlModifier | Qt.ShiftModifier)))
+        hoverLeaveTimer.stop()
+        if (findingGroup || menuOpen || previewSizing || list.rowDragging || (Qt.application.keyboardModifiers & (Qt.ControlModifier | Qt.ShiftModifier)))
+            return
+        // Counted from entering the row, not from the last move: a hand
+        // never holds quite still, so restarting on each move kept the
+        // preview waiting.
+        if (index === hoverCandidate && hoverTimer.running)
             return
         hoverCandidate = index
-        if (index === previewIndex)
+        if (index === previewIndex && (previewOpen || hoverShown))
             hoverTimer.stop()
         else
             hoverTimer.restart()
     }
     Timer {
         id: hoverTimer
-        interval: 100
+        interval: page.previewOpen ? 60 : 200
         onTriggered: {
-            if (page.previewOpen && !page.previewSizing && !list.rowDragging && !(Qt.application.keyboardModifiers & (Qt.ControlModifier | Qt.ShiftModifier))
-                    && page.hoverCandidate >= 0 && page.hoverCandidate < list.count)
+            if (!page.findingGroup && !page.menuOpen && !page.previewSizing && !list.rowDragging
+                    && !(Qt.application.keyboardModifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+                    && page.hoverCandidate >= 0 && page.hoverCandidate < list.count) {
                 page.hoverIndex = page.hoverCandidate === list.currentIndex ? -1 : page.hoverCandidate
+                const row = list.itemAtIndex(page.hoverCandidate)
+                if (!page.previewOpen && row) {
+                    const p = row.mapToGlobal(0, 0)
+                    const left = listArea.mapToGlobal(0, 0).x
+                    page.hoverRect = Qt.rect(left, p.y, listArea.width, row.height)
+                    page.hoverShown = true
+                }
+            }
+        }
+    }
+    Timer {
+        id: hoverLeaveTimer
+        interval: 120 // let the pointer cross the gap to scroll/read the preview
+        onTriggered: if (!(hoverLoader.item?.hovered ?? false)) page.clearHover()
+    }
+    Loader {
+        id: hoverLoader
+        active: page.hoverShown && !page.previewOpen && !page.findingGroup
+        sourceComponent: Component {
+            ClipHoverPreview {
+                host: page.Window.window
+                anchorRect: page.hoverRect
+                availableArea: page.frame.availableArea(page)
+                metrics: page.metrics
+                info: page.previewRevision >= 0 ? page.clipboard.preview(page.previewIndex) : ({})
+                onCopyRequested: (text, remember) => page.clipboard.copyText(text, remember)
+                onHoveredChanged: if (!hovered) hoverLeaveTimer.restart()
+            }
         }
     }
 
@@ -239,6 +322,7 @@ Item {
     // caret, as the window is).
     function openContextMenu(index, globalPos) {
         previewClickTimer.stop()
+        clearHover()
         if (index < 0 || index >= list.count)
             return
         if (!clipboard.items.isSelected(index))
@@ -256,6 +340,7 @@ Item {
                    fromKeyboard && flipped)
     }
     function openCategoryMenu(category, globalPos) {
+        clearHover()
         const entries = clipboard.categoryMenuItems(category)
         if (entries.length === 0)
             return
@@ -321,14 +406,31 @@ Item {
         const ctrl = (event.modifiers & Qt.ControlModifier) !== 0
         const shift = (event.modifiers & Qt.ShiftModifier) !== 0
         const alt = (event.modifiers & Qt.AltModifier) !== 0
+        if (ctrl && !alt && !shift && event.key === Qt.Key_G) {
+            findingGroup ? cancelGroupSearch() : beginGroupSearch()
+            event.accepted = true
+            return
+        }
+        if (findingGroup) {
+            if (event.key === Qt.Key_Escape) {
+                cancelGroupSearch()
+                event.accepted = true
+            } else {
+                groupPicker.handleKey(event)
+            }
+            return // editing stays in the field; clipboard actions cannot run on a group row
+        }
         if (event.key === Qt.Key_Alt) {
             event.accepted = true // alone, it would open the window menu
             return
         }
         const others = (event.modifiers & ~(Qt.ShiftModifier | Qt.KeypadModifier)) !== numberModifier
         if (numberModifier >= 0 && !others && event.key >= Qt.Key_1 && event.key <= Qt.Key_9) {
-            if (numberUsable(event.key - Qt.Key_0))
-                clipboard.quickPaste(event.key - Qt.Key_0, shift)
+            const row = shownRows.rowOf(event.key - Qt.Key_0)
+            if (row >= 0 && numberUsable(event.key - Qt.Key_0)) {
+                list.currentIndex = row
+                clipboard.quickPaste(row, shift)
+            }
             event.accepted = true
             return
         }
@@ -378,7 +480,7 @@ Item {
         case Qt.Key_Escape:
             if (selectedCount > 0)
                 clipboard.clearSelection()
-            else // an open preview stays (clipboard.previewOpen): it is there next time
+            else
                 clipboard.dismiss()
             break
         case Qt.Key_Tab: clipboard.cycleCategory(1); break
@@ -459,7 +561,10 @@ Item {
 
     Connections {
         target: page.clipboard
+        enabled: page.controllerEventsEnabled
         function onShown() {
+            page.closePreview()
+            page.findingGroup = false
             input.text = ""
             page.pinyinHint = false
             pinyinHintTimer.stop()
@@ -470,12 +575,10 @@ Item {
             page.selectFirst()
             page.focusSearch()
         }
-        function onPlaced() { // ... then the preview, if it was left open
+        function onPlaced() {
             // Placed only now (over the caret, maybe upside down, its rows):
             // at the first row as it ends up.
             page.selectFirst()
-            if (page.clipboard.previewOpen && list.count > 0)
-                page.showPreview()
         }
         function onListChanged() {
             page.selectionAnchor = -1
@@ -486,10 +589,14 @@ Item {
                 page.selectHeld(held)
         }
         function onStepped(row) { page.selectHeld(row) }
+        function onBrowseStepRequested() {
+            if (page.findingGroup) return
+            if (list.count > 0)
+                page.selectHeld((list.currentIndex + 1) % list.count)
+        }
         function onQueryChanged() {
             pinyinHintTimer.stop() // also for a paste, which goes past handleKey
-            if (input.text !== page.clipboard.query)
-                input.text = page.clipboard.query
+            if (!page.findingGroup) page.syncSearch()
         }
         // The keys back from the program in front (pinned, or unpinned):
         // what is typed now replaces the last search, not adds to it.
@@ -497,7 +604,8 @@ Item {
             if (page.clipboard.keysRouted)
                 input.selectAll()
         }
-        function onContextMenuKeyPressed() { page.openContextMenu(list.currentIndex) }
+        function onContextMenuKeyPressed() { if (!page.findingGroup) page.openContextMenu(list.currentIndex) }
+        function onGroupSearchRequested() { page.findingGroup ? page.cancelGroupSearch() : page.beginGroupSearch() }
         function onPinyinHintRequested() {
             if (input.text.length === 0)
                 page.pinyinHint = true
@@ -520,35 +628,63 @@ Item {
 
     Item { // the sections, each where page.placed() puts it
         width: page.width
-        height: page.implicitHeight
+        height: page.height
 
         Item { // header: drags the window, except for the field
             id: header
             y: page.placed(page.headerFrom, height)
             width: parent.width
-            height: Theme.headerHeight
+            height: page.metrics.headerHeight
+
+            // The pointer over the header: Windows takes its drag area as a
+            // title bar, so QML hears of the pointer there only from the frame.
+            readonly property bool hovered: headerHover.hovered || contains(mapFromItem(null, page.frame.pointer))
+            HoverHandler { id: headerHover }
 
             Component.onCompleted: {
                 page.frame.addDragArea(header)
                 page.frame.addControl(input)
                 page.frame.addControl(pinButton)
                 page.frame.addControl(eyeButton)
+                page.frame.addControl(groupButton)
             }
 
-            Glyph {
+            // The style's search field (Theme.searchField), as the launcher's
+            // row: inset by fieldInset (0 in fluent, where the row is the
+            // field and nothing is drawn: flat), a box where the style has one.
+            Hook {
+                id: fieldPart
+                anchors.fill: parent
+                anchors.margins: Theme.fieldInset
+                part: Theme.searchField
+                flat: Theme.fieldInset <= 0
+                focused: input.activeFocus
+                hovered: header.hovered
+                corner: Theme.fieldRadius
+                dpr: page.dpr
+            }
+
+            Image {
                 id: icon
+                objectName: "clipboardSearchLogo"
                 anchors.left: parent.left
-                anchors.leftMargin: 20
+                anchors.leftMargin: Math.max(20, Theme.fieldInset + 12)
                 anchors.verticalCenter: parent.verticalCenter
-                glyph: "" // Paste
-                size: Theme.searchIconSize
+                width: page.metrics.searchIconSize
+                height: width
+                source: "qrc:/branding/logo.svg"
+                sourceSize.width: width
+                sourceSize.height: height
+                smooth: false
+                Accessible.ignored: true
             }
 
             TextInput {
                 id: input
+                objectName: "clipboardSearchField"
                 anchors.left: icon.right
                 anchors.leftMargin: 14
-                anchors.right: pausedTag.visible ? pausedTag.left : eyeButton.left
+                anchors.right: pausedTag.visible ? pausedTag.left : groupButton.left
                 anchors.rightMargin: pausedTag.visible ? 16 : 8
                 anchors.verticalCenter: parent.verticalCenter
                 focus: true
@@ -556,12 +692,22 @@ Item {
                 // where, steady (it blinks only with the focus).
                 cursorVisible: activeFocus || page.clipboard.keysRouted
                 clip: true
-                color: Theme.text
-                font.pixelSize: Theme.uiSearch
+                color: fieldPart.out("textColor", Theme.text)
+                font.pixelSize: page.metrics.uiSearch
                 selectByMouse: true
                 selectionColor: Theme.textSelection
                 selectedTextColor: Theme.text
-                onTextChanged: page.clipboard.query = text
+                // The style's caret colour, where it has one (Qt's own caret otherwise).
+                cursorDelegate: fieldPart.out("caretColor", "transparent").a > 0 ? caretPart : null
+                Component {
+                    id: caretPart
+                    Caret { color: fieldPart.out("caretColor", Theme.text); dpr: page.dpr }
+                }
+                onTextChanged: {
+                    if (page.syncingSearch) return
+                    if (page.findingGroup) page.groupQuery = text
+                    else page.clipboard.query = text
+                }
                 Keys.onPressed: (event) => page.handleKey(event)
                 Keys.onReleased: (event) => {
                     numberHints.release(event)
@@ -573,8 +719,11 @@ Item {
                 Text {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
-                    text: page.pinyinHint ? page.pinyinHintText : qsTr("搜索剪贴板，支持拼音")
-                    color: Theme.faint
+                    text: page.findingGroup ? qsTr("输入分组名，回车进入")
+                        : (page.currentCategory.group ?? 0) > 0 ? qsTr("在“%1”中搜索").arg(page.currentCategory.title)
+                        : page.pinyinHint ? page.pinyinHintText : qsTr("搜索剪贴板，支持拼音")
+                    textFormat: Text.PlainText
+                    color: fieldPart.out("placeholderColor", Theme.faint)
                     font: input.font
                     elide: Text.ElideRight
                     visible: input.text.length === 0 && input.preeditText.length === 0
@@ -601,10 +750,12 @@ Item {
             // Pinned: stays up, on top, through pastes and clicks elsewhere
             // (Clipboard.pinned). Not while pasting into a field of Win顺's.
             RowAction {
+                dpr: page.dpr
                 id: pinButton
+                small: page.metrics.dense
                 visible: !page.intoField
                 anchors.right: parent.right
-                anchors.rightMargin: 14
+                anchors.rightMargin: Math.max(14, Theme.fieldInset + 6)
                 anchors.verticalCenter: parent.verticalCenter
                 glyph: page.clipboard.pinned ? "" : "" // PinnedFill, Pin
                 glyphOverlay: page.clipboard.pinned ? "" : "" // Pin: the needle (lines up with PinnedFill in Fluent and MDL2)
@@ -618,9 +769,12 @@ Item {
             // switch as Alt+P and →, so one state and one memory
             // (clipboard.previewOpen); it only makes it visible and clickable.
             RowAction {
+                dpr: page.dpr
                 id: eyeButton
+                enabled: !page.findingGroup
+                small: page.metrics.dense
                 anchors.right: pinButton.visible ? pinButton.left : parent.right
-                anchors.rightMargin: pinButton.visible ? 4 : 14
+                anchors.rightMargin: pinButton.visible ? 4 : Math.max(14, Theme.fieldInset + 6)
                 anchors.verticalCenter: parent.verticalCenter
                 glyph: page.previewOpen ? "" : "" // View, Hide
                 checked: page.previewOpen
@@ -628,10 +782,25 @@ Item {
                 onClicked: page.togglePreview(list.currentIndex)
             }
 
+            RowAction {
+                id: groupButton
+                objectName: "clipboardGroupButton"
+                dpr: page.dpr
+                small: page.metrics.dense
+                anchors.right: eyeButton.left
+                anchors.rightMargin: 4
+                anchors.verticalCenter: parent.verticalCenter
+                glyph: "\uE8B7"
+                checked: page.findingGroup
+                tip: page.findingGroup ? qsTr("返回内容搜索") : qsTr("查找分组")
+                tipShortcut: "Ctrl+G"
+                onClicked: page.findingGroup ? page.cancelGroupSearch() : page.beginGroupSearch()
+            }
+
             Rectangle { // paused from the tray menu
                 id: pausedTag
                 visible: page.clipboard.paused
-                anchors.right: eyeButton.left
+                anchors.right: groupButton.left
                 anchors.rightMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
                 width: pausedText.implicitWidth + 20
@@ -644,13 +813,15 @@ Item {
                     anchors.centerIn: parent
                     text: qsTr("已暂停记录")
                     color: Theme.accent
-                    font.pixelSize: Theme.uiCaption
+                    font.pixelSize: page.metrics.uiCaption
                 }
             }
         }
 
         ClipTabs {
             id: tabs
+            visible: !page.findingGroup
+            metrics: page.metrics
             y: page.placed(page.tabsFrom, height)
             width: parent.width
             parentLeft: page.x
@@ -663,40 +834,95 @@ Item {
             onMenuRequested: (category, globalPos) => page.openCategoryMenu(category, globalPos)
         }
 
-        Rectangle { // between the categories and the history
-            y: page.placed(page.lineFrom, Theme.edge(Screen.devicePixelRatio))
+        Text {
+            visible: page.findingGroup
+            x: 18
+            y: tabs.y
+            height: tabs.height
+            width: parent.width - 36
+            text: qsTr("查找分组")
+            color: Theme.subtext
+            font.pixelSize: page.metrics.uiBody
+            verticalAlignment: Text.AlignVCenter
+        }
+
+        Hook { // between the categories and the history (the style's seam)
+            y: page.placed(page.lineFrom, Theme.edge(page.dpr))
             width: parent.width
-            height: Theme.edge(Screen.devicePixelRatio)
-            color: Theme.divider
+            height: Theme.edge(page.dpr)
+            part: Theme.separator
+            dpr: page.dpr
         }
 
         Item {
             id: body
             y: page.placed(page.bodyFrom, height)
             width: parent.width
-            height: page.rows * page.rowHeight + 8
+            height: Math.max(0, page.height - page.chromeHeight) + 8
 
             // The mouse left the list and the preview: the preview is the
             // current row's again. Into the preview it stays (to scroll it,
             // pick words in it).
             HoverHandler {
-                onHoveredChanged: if (!hovered) page.clearHover()
+                onHoveredChanged: if (!hovered) hoverLeaveTimer.restart()
             }
 
             Item {
                 id: listArea
+                visible: !page.findingGroup
                 width: page.previewOpen ? page.listWidth : parent.width
                 height: parent.height
+                readonly property real scrollbarInset: page.previewOpen ? 0 : page.frame.resizeMargin(Screen.devicePixelRatio)
+
+                // The rows' buttons: a few sets, lent to the rows that show them.
+                RowActionsPool {
+                    id: clipActions
+                    bar: Component {
+                        ClipActions {}
+                    }
+                }
 
                 ListView {
                     id: list
+                    onContentYChanged: page.clearHover()
+                    objectName: "clipboardEntries"
                     anchors.fill: parent
                     topMargin: 4
                     bottomMargin: 4
                     clip: true
                     model: page.clipboard.items
                     boundsBehavior: Flickable.StopAtBounds
-                    highlightMoveDuration: 0
+                    // The current row's highlight, one for the whole list: it
+                    // jumps, or slides as the style says (Theme.rowSlide).
+                    highlightMoveDuration: Theme.rowSlide
+                    highlightMoveVelocity: -1
+                    highlightResizeDuration: 0
+                    highlightResizeVelocity: -1
+                    highlight: Item {
+                        id: currentHighlight
+                        width: list.width
+                        visible: list.currentItem !== null
+                        transform: ScrollPixelAlignment { // on whole device pixels, as the rows
+                            view: list
+                            viewY: page.y + body.y + list.y
+                            itemY: currentHighlight.y
+                        }
+
+                        Hook {
+                            anchors.fill: parent
+                            anchors.leftMargin: Theme.rowInset
+                            anchors.rightMargin: Theme.rowInset
+                            anchors.topMargin: Theme.edge(page.dpr) // a device pixel apart: 1.5 at 150 % put its edges on half ones
+                            anchors.bottomMargin: Theme.edge(page.dpr)
+                            part: Theme.rowHighlight
+                            current: true
+                            // With rows picked, the current one is marked as picked only when it is.
+                            selected: page.selectedCount === 0 || (list.currentItem !== null && list.currentItem.order > 0)
+                            position: list.currentItem !== null ? list.currentItem.y : 0
+                            role: "list"
+                            dpr: page.dpr
+                        }
+                    }
                     reuseItems: true
                     // Upside down (page.flipped): the first row at the bottom,
                     // by the caret, the later ones up from it.
@@ -708,6 +934,7 @@ Item {
                     // Any transition declared here, enabled or not, makes Qt
                     // leave some pooled rows drawn after removals (ClipRow hides them).
                     property bool rowDragging: false
+                    onRowDraggingChanged: if (rowDragging) page.clearHover()
                     move: Transition {
                         enabled: SystemTheme.animations && !list.rowDragging
                         NumberAnimation { property: "y"; duration: 150; easing.type: Easing.OutCubic }
@@ -764,13 +991,16 @@ Item {
                         objectName: "clipboardRow-" + index
                         width: list.width
                         height: clipRow.picture ? page.pictureRowHeight : page.rowHeight
-                        hint: page.numberKey >= 0 && index < 9 ? index + 1 : 0
+                        hint: page.numberKey >= 0 ? shownRows.numberOf(index) : 0
+                        reserveHintSpace: page.numberKey >= 0 && page.clipboard.numberHints !== "off"
                         hintOpacity: numberHints.hintOpacity
                         hintModifier: page.numberKey === Qt.Key_Control ? "Ctrl" : "Alt"
                         hintTaken: clipRow.hint > 0 && !page.numberUsable(clipRow.hint)
                         pasteTip: page.pasteLabel
                         clickToPaste: page.clipboard.clickToPaste
                         largePictures: page.clipboard.largePictures
+                        metrics: page.metrics
+                        actionsPool: clipActions
                         onDragRequested: (index) => page.clipboard.dragOut(index)
                         onMoveHeld: (held) => {
                             list.rowDragging = held
@@ -789,6 +1019,10 @@ Item {
                             itemY: clipRow.y
                         }
                         onHoverMoved: (index, globalPos) => page.hoverRow(index, globalPos)
+                        onHoverLeft: (index) => {
+                            if (!page.previewOpen && page.hoverCandidate === index)
+                                hoverLeaveTimer.restart()
+                        }
                         onClicked: (index, modifiers) => {
                             previewClickTimer.stop()
                             page.clearHover()
@@ -822,8 +1056,11 @@ Item {
                 }
 
                 ListScrollBar {
+                    dpr: page.dpr
+                    objectName: "clipboardListScrollBar"
                     flickable: list
                     anchors.right: parent.right
+                    anchors.rightMargin: listArea.scrollbarInset
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
                 }
@@ -851,7 +1088,7 @@ Item {
                         textFormat: Text.PlainText
                         elide: Text.ElideMiddle // a long query keeps its end and the quotes
                         color: Theme.subtext
-                        font.pixelSize: Theme.uiTitle
+                        font.pixelSize: page.metrics.uiTitle
                     }
                     Text {
                         width: parent.width
@@ -864,7 +1101,7 @@ Item {
                             : (parent.category.group ?? 0) > 0 ? qsTr("在条目上点右键，选“移到…”放进来；放进分组的内容不会过期")
                             : qsTr("按 Tab 看看别的分类")
                         color: Theme.faint
-                        font.pixelSize: Theme.uiBody
+                        font.pixelSize: page.metrics.uiBody
                     }
                     Item {
                         width: 1
@@ -872,6 +1109,7 @@ Item {
                         visible: parent.off
                     }
                     FlatButton {
+                        dpr: page.dpr
                         anchors.horizontalCenter: parent.horizontalCenter
                         visible: parent.off
                         highlighted: true
@@ -881,26 +1119,30 @@ Item {
                 }
             }
 
-            Rectangle {
-                visible: page.previewOpen
+            Hook { // between the list and the preview
+                visible: page.previewOpen && !page.findingGroup
                 x: listArea.width
-                width: Theme.edge(Screen.devicePixelRatio)
+                width: Theme.edge(page.dpr)
                 height: parent.height
-                color: Theme.divider
+                part: Theme.separator
+                orientation: Qt.Vertical
+                dpr: page.dpr
             }
 
             ClipPreview {
                 id: preview
-                visible: page.previewOpen
+                metrics: page.metrics
+                visible: page.previewOpen && !page.findingGroup
                 onCopyRequested: (text, remember) => page.clipboard.copyText(text, remember)
                 x: listArea.width + 1
                 width: parent.width - x
                 height: parent.height
                 parentTop: page.y + body.y
+                resizeMargin: page.frame.resizeMargin(Screen.devicePixelRatio)
                 // Re-read when the rows change. The revision is part of the
                 // condition: a bare read of it would be dropped by the QML
                 // compiler, and the binding would not depend on it.
-                info: page.previewRevision >= 0 && list.count > 0 && page.previewIndex >= 0
+                info: page.previewOpen && page.previewRevision >= 0 && list.count > 0 && page.previewIndex >= 0
                       ? page.clipboard.preview(page.previewIndex) : ({})
             }
 
@@ -909,7 +1151,7 @@ Item {
             // default.
             MouseArea {
                 id: edge
-                visible: page.previewOpen
+                visible: page.previewOpen && !page.findingGroup
                 x: listArea.width // the line and 7 px of the preview; the scroll bar ends before it
                 width: 8
                 height: parent.height
@@ -952,11 +1194,38 @@ Item {
             }
         }
 
+        ClipGroupPicker {
+            id: groupPicker
+            visible: page.findingGroup
+            x: body.x
+            y: body.y
+            width: body.width
+            height: body.height
+            groups: page.clipboard.categories
+            query: page.groupQuery
+            flipped: page.flipped
+            dpr: page.dpr
+            rowHeight: page.rowHeight
+            onChosen: group => page.enterGroup(group)
+        }
+        Text {
+            visible: page.findingGroup
+            y: footer.y
+            height: footer.height
+            width: parent.width
+            text: qsTr("↑ ↓ 选择 · Enter 进入 · Esc 返回")
+            color: Theme.faint
+            font.pixelSize: page.metrics.uiCaption
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+
         Item { // footer: status or how picked rows are joined, and key hints; drags the window
             id: footer
+            visible: !page.findingGroup
             y: page.placed(page.footerFrom, height)
             width: parent.width
-            implicitHeight: Theme.footerHeight
+            implicitHeight: page.metrics.footerHeight
             height: implicitHeight
 
             Component.onCompleted: {
@@ -964,11 +1233,12 @@ Item {
                 page.frame.addControl(separatorChip)
             }
 
-            Rectangle { // on its inner edge
+            Hook { // on its inner edge
                 y: page.flipped ? parent.height - height : 0
                 width: parent.width
-                height: Theme.edge(Screen.devicePixelRatio)
-                color: Theme.divider
+                height: Theme.edge(page.dpr)
+                part: Theme.separator
+                dpr: page.dpr
             }
 
             Text {
@@ -986,7 +1256,7 @@ Item {
                 text: page.clipboard.statusText
                 textFormat: Text.PlainText
                 color: Theme.subtext
-                font.pixelSize: Theme.uiBody
+                font.pixelSize: page.metrics.uiBody
                 elide: Text.ElideRight
             }
 
@@ -1002,25 +1272,34 @@ Item {
                     text: page.selectedCount === 1 ? qsTr("已选 1 条，Esc 取消选择")
                                                    : qsTr("已选 %Ln 条，合在一起，用", "", page.selectedCount)
                     color: Theme.subtext
-                    font.pixelSize: Theme.uiBody
+                    font.pixelSize: page.metrics.uiBody
                 }
-                Rectangle {
+                Item {
                     id: separatorChip
                     visible: page.selectedCount >= 2
                     anchors.verticalCenter: parent.verticalCenter
                     width: separatorText.implicitWidth + 20
                     height: 26
-                    radius: Theme.pillRadius(height)
-                    color: separatorArea.containsMouse ? Theme.chipHover : Theme.track
-                    border.width: 1
-                    border.color: Theme.chipBorder
+
+                    Hook { // the style's key (a button in the footer), round as a chip
+                        id: separatorKey
+                        anchors.fill: parent
+                        part: Theme.keySurface
+                        hovered: separatorArea.containsMouse
+                        pressed: separatorArea.pressed
+                        flat: false
+                        corner: Theme.pillRadius(separatorChip.height)
+                        role: "footer"
+                        dpr: page.dpr
+                    }
 
                     Text {
                         id: separatorText
                         anchors.centerIn: parent
+                        anchors.verticalCenterOffset: separatorKey.out("contentOffsetY", 0)
                         text: page.clipboard.separatorName
-                        color: Theme.text
-                        font.pixelSize: Theme.uiCaption
+                        color: separatorKey.out("foreground", Theme.text)
+                        font.pixelSize: page.metrics.uiCaption
                     }
                     MouseArea {
                         id: separatorArea
@@ -1035,7 +1314,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("隔开")
                     color: Theme.subtext
-                    font.pixelSize: Theme.uiBody
+                    font.pixelSize: page.metrics.uiBody
                 }
             }
 
@@ -1072,11 +1351,13 @@ Item {
                 readonly property bool previewFits: page.selectedCount === 0
                     && (tabFits ? spacing + tabHint.fullWidth : 0) + spacing + previewHint.fullWidth <= free
 
-                KeyHint { id: enterHint; keys: "Enter"; label: page.pasteLabel }
-                KeyHint { id: backHint; keys: "Esc"; label: qsTr("返回"); visible: page.intoField && hints.roomy }
-                KeyHint { id: tabHint; keys: "Tab"; label: qsTr("分类"); visible: hints.tabFits }
+                KeyHint { dpr: page.dpr; id: enterHint; metrics: page.metrics; keys: "Enter"; label: page.pasteLabel }
+                KeyHint { dpr: page.dpr; id: backHint; metrics: page.metrics; keys: "Esc"; label: qsTr("返回"); visible: page.intoField && hints.roomy }
+                KeyHint { dpr: page.dpr; id: tabHint; metrics: page.metrics; keys: "Tab"; label: qsTr("分类"); visible: hints.tabFits }
                 KeyHint {
+                    dpr: page.dpr
                     id: previewHint
+                    metrics: page.metrics
                     keys: "→"
                     label: page.previewOpen ? qsTr("关闭预览") : qsTr("预览")
                     visible: hints.previewFits
@@ -1100,7 +1381,7 @@ Item {
                 text: page.pinyinHintText
                 textFormat: Text.PlainText
                 color: Theme.faint
-                font.pixelSize: Theme.uiBody
+                font.pixelSize: page.metrics.uiBody
                 elide: Text.ElideRight
             }
 
@@ -1121,13 +1402,14 @@ Item {
                 visible: opacity > 0
                 Behavior on opacity { enabled: SystemTheme.animations; NumberAnimation { id: holdFade; duration: 150 } }
 
-                KeyHint { id: holdReleaseHint; keys: page.clipboard.holdKeys; label: qsTr("松开粘贴") }
-                KeyHint { id: holdEscHint; keys: "Esc"; label: qsTr("取消"); visible: holdNote.escFits }
+                KeyHint { dpr: page.dpr; id: holdReleaseHint; metrics: page.metrics; keys: page.clipboard.holdKeys; label: qsTr("松开粘贴") }
+                KeyHint { dpr: page.dpr; id: holdEscHint; metrics: page.metrics; keys: "Esc"; label: qsTr("取消"); visible: holdNote.escFits }
             }
 
-            // The other keys, while the mouse rests on it.
+            // The other keys, when it is clicked.
             ShortcutsButton {
                 id: infoButton
+                objectName: "shortcutsButton"
 
                 readonly property string modifier: page.numberKey === Qt.Key_Alt ? "Alt" : "Ctrl"
 
@@ -1136,24 +1418,12 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: 6
                 anchors.verticalCenter: parent.verticalCenter
-                shortcuts: (page.numberKey < 0 ? [] : [[modifier + "+1…9", qsTr("粘贴第几条")]]) // the numbers on the rows' icons
-                    .concat(page.intoField ? [] : [["Shift+Enter", qsTr("粘贴为纯文本")]])
-                    .concat(page.numberKey < 0 ? []
-                            : [[modifier + "+Shift+1…9", qsTr("第几条粘贴为纯文本")]])
-                    // Only where it works: a hotkey with something to hold (a lone F9 has not), over another program.
-                    .concat(!page.clipboard.holdToStep || page.intoField || !page.clipboard.shortcut.includes("+") ? []
-                            : [[page.clipboard.shortcut, qsTr("按住连按往下选，松开粘贴")]])
-                    .concat([
-                        ["→  Alt+P", qsTr("打开或关闭预览")],
-                        ["Shift+Tab", qsTr("上一个分类")],
-                        ["↑ ↓", qsTr("上下移动，PgUp PgDn 翻页")],
-                        ["Shift+↑ ↓", qsTr("选中多条，也可 Ctrl+单击、Shift+单击；按选的顺序一起粘贴")],
-                        ["Ctrl+C", qsTr("复制；预览里选中了图中的字时，复制那一段")],
-                        ["Ctrl+P", qsTr("固定或取消固定")],
-                        ["Delete", qsTr("删除，Ctrl+Z 撤销")],
-                        ["Shift+F10", qsTr("右键菜单")],
-                        ["Esc", qsTr("关闭；选中了多条时先取消选择")]
-                    ])
+                where: "clipboard"
+                context: ({
+                    numberModifier: page.numberKey < 0 ? "" : modifier, // the numbers in the rows' left column
+                    intoField: page.intoField,
+                    holdKey: page.clipboard.holdToStep ? page.clipboard.shortcut : ""
+                })
             }
         }
     }
@@ -1166,6 +1436,11 @@ Item {
     HoverTip {
         target: pinButton.tipWanted ? pinButton : null
         text: pinButton.tip
+    }
+    HoverTip {
+        target: groupButton.tipWanted ? groupButton : null
+        text: groupButton.tip
+        shortcut: groupButton.tipShortcut
     }
 
     HoverTip {

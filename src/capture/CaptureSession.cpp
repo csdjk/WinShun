@@ -33,6 +33,20 @@ void CaptureScreen::setGeometry(const QRect& rect, qreal dpr, QSize logicalWindo
     emit geometryChanged();
 }
 
+void CaptureScreen::setWorkArea(const QRect& rect)
+{
+    if (rect == m_work)
+        return;
+    m_work = rect;
+    emit geometryChanged();
+}
+
+QRect CaptureScreen::workArea() const
+{
+    const QRect work = m_work.intersected(m_rect).translated(-m_rect.topLeft());
+    return work.isEmpty() ? bounds() : work;
+}
+
 void CaptureScreen::setImage(const QImage& image)
 {
     m_image = image;
@@ -171,7 +185,129 @@ CaptureSession::CaptureSession(QObject* parent)
             s->setNotice({});
     });
     connect(&m_annot, &AnnotationModel::notice, this, &CaptureSession::showNotice);
+    // The toolbar sets the tool on the model itself, not through publish():
+    // a tool chosen counts as input (KeyHintPolicy rule 3).
+    connect(&m_annot, &AnnotationModel::toolChanged, this, &CaptureSession::hintInput);
+    for (const auto change : {&AnnotationModel::gestureChanged, &AnnotationModel::editingChanged,
+             &AnnotationModel::numberEditChanged, &AnnotationModel::pickingChanged})
+        connect(&m_annot, change, this, &CaptureSession::refreshKeyHints);
+    m_hintClock.start();
+    m_hintTimer.setSingleShot(true);
+    connect(&m_hintTimer, &QTimer::timeout, this, &CaptureSession::refreshKeyHints);
 }
+
+QStringList CaptureSession::keyHintRows() const
+{
+    if (!m_active || m_phase == Phase::Dragging || m_phase == Phase::Adjusting || m_phase == Phase::Annotating)
+        return {};
+    if (m_annot.active() && (m_annot.gestureActive() || m_annot.pathActive() || m_annot.editingText()
+            || m_annot.editingNumber() || m_annot.picking()))
+        return {};
+    QStringList rows;
+    if (m_ocrOnly) // 识别屏幕文字: picking a region is all there is
+        return {u"wheel"_s, u"wasd"_s, u"quit"_s};
+    if (m_selection.screen < 0) { // a press not yet a drag too: what it was over
+        rows = {u"wheel"_s, u"wasd"_s};
+        if (!m_selectionHistory.empty())
+            rows.append(u"recall"_s);
+        if (m_historyAvailable)
+            rows.append(u"history"_s);
+        if (m_ocrAvailable)
+            rows.append(u"ocr"_s);
+        rows.append(u"quit"_s);
+    } else if (m_annot.active() && m_annot.tool() >= 0) {
+        // Shift: squares and circles, 15° lines, straight strokes; nothing for text, numbers or redaction.
+        const auto kind = annot::tools().value(m_annot.tool()).kind;
+        if (kind != annot::Kind::Text && kind != annot::Kind::Number && kind != annot::Kind::Redact)
+            rows.append(u"shift"_s);
+        rows.append({u"width"_s, u"undo"_s, u"delete"_s, u"toolOff"_s, u"hide"_s});
+    } else {
+        rows = {u"copy"_s};
+        if (m_annot.keys().has(KeyAction::Save)) // none when the user cleared it (#187)
+            rows.append(u"save"_s);
+        if (m_annot.keys().has(KeyAction::Pin))
+            rows.append(u"pin"_s);
+        rows.append(u"arrows"_s);
+        if (m_ocrAvailable)
+            rows.append(u"ocr"_s);
+        rows.append(u"long"_s);
+        if (m_recalledSelection >= 0)
+            rows.append(u"recalled"_s);
+    }
+    return rows;
+}
+
+void CaptureSession::refreshKeyHints()
+{
+    QStringList rows = keyHintRows();
+    const qint64 now = hintNow();
+    using Stage = KeyHintPolicy::Stage;
+    m_hintPolicy.setStage(!m_active || rows.isEmpty() ? Stage::None
+            : m_selection.screen >= 0                ? Stage::Selected
+                                                     : Stage::Choosing,
+        now);
+    m_hintPolicy.tick(now);
+    if (const qint64 due = m_hintPolicy.nextDeadline(); due >= 0)
+        m_hintTimer.start(static_cast<int>(std::max<qint64>(0, due - now)));
+    else
+        m_hintTimer.stop();
+    const bool shown = m_hintPolicy.shown();
+    if (rows == m_keyHints && shown == m_hintsShown)
+        return;
+    m_keyHints = std::move(rows);
+    m_hintsShown = shown;
+    emit keyHintsChanged();
+}
+
+void CaptureSession::hintInput()
+{
+    m_hintPolicy.input(hintNow());
+    refreshKeyHints();
+}
+
+void CaptureSession::setKeys(const CaptureKeys& keys)
+{
+    m_annot.setKeys(keys);
+    refreshKeyHints();
+}
+
+void CaptureSession::setKeyHints(bool on)
+{
+    m_hintPolicy.setEnabled(on);
+    refreshKeyHints();
+}
+
+void CaptureSession::quietKeyHints()
+{
+    m_hintPolicy.setQuiet();
+    refreshKeyHints();
+}
+
+void CaptureSession::setOcrOnly(bool on)
+{
+    if (std::exchange(m_ocrOnly, on) == on)
+        return;
+    emit ocrOnlyChanged();
+    refreshKeyHints();
+}
+
+void CaptureSession::setHistoryAvailable(bool on)
+{
+    m_historyAvailable = on;
+    refreshKeyHints();
+}
+
+void CaptureSession::keepKeyHints(bool on)
+{
+    // The setting now, for this capture too: 不再显示 hides them, 一直显示 leaves them up.
+    m_hintPolicy.keep(on);
+    refreshKeyHints();
+    emit keyHintsKept(on);
+    if (!on && m_active)
+        showNotice(tr("已关闭快捷键提示 · 按 ? 临时显示，截图设置里可重新打开"));
+}
+
+
 
 void CaptureSession::setStyles(const annot::StyleMemory& styles)
 {
@@ -254,6 +390,7 @@ void CaptureSession::begin(std::vector<CaptureScreen*> screens, Windows windows)
     m_flyout = {};
     m_phase = Phase::Hover;
     m_releaseClock.invalidate();
+    m_recalledSelection = -1;
     m_selection = {};
     m_previous = {};
     m_handle = Handle::None;
@@ -269,6 +406,7 @@ void CaptureSession::begin(std::vector<CaptureScreen*> screens, Windows windows)
     m_annotScreen = -1;
     if (std::exchange(m_toolbarHidden, false))
         emit toolbarHiddenChanged();
+    m_hintPolicy.begin(hintNow()); // afresh (rule 8); publish() below sets its stage
     for (CaptureScreen* s : m_screens) {
         s->setFlash({});
         s->setNotice({});
@@ -280,6 +418,49 @@ void CaptureSession::begin(std::vector<CaptureScreen*> screens, Windows windows)
     if (!was)
         emit activeChanged();
     emit selectionChanged();
+}
+
+void CaptureSession::replaceShot(Windows windows, int screen, const QRect& rect, const std::optional<annot::Document>& doc)
+{
+    retireAnnotation();
+    m_recalledSelection = -1;
+    m_pendingButton = Qt::NoButton;
+    m_windows = std::move(windows);
+    m_flyout = {};
+    m_selection = {};
+    m_previous = {};
+    m_handle = Handle::None;
+    m_hoverScreen = -1;
+    m_chain.clear();
+    m_level = 0;
+    m_parked = false;
+    m_parkedSelection = {};
+    m_phase = Phase::Hover;
+    if (CaptureScreen* s = screenAt(screen); s && !rect.isEmpty() && s->bounds().contains(rect)) {
+        m_selection = {screen, rect};
+        m_phase = Phase::Selected;
+        if (doc && !doc->items.isEmpty() && doc->canvas == s->image().size()) {
+            m_annot.begin(s->image(), *doc, m_styles);
+            m_annotScreen = screen;
+        }
+        syncAnnotation();
+    }
+    emit selectionChanged();
+    if (m_cursorScreen >= 0) {
+        if (m_phase == Phase::Hover)
+            updateHover(m_cursorScreen, m_cursorAt);
+        updateCursor(m_cursorScreen, m_cursorAt);
+    }
+    publish();
+}
+
+CaptureSession::Kept CaptureSession::kept() const
+{
+    const Pick& pick = m_parked ? m_parkedSelection : m_selection;
+    Kept k {pick.screen, pick.rect, std::nullopt};
+    if (m_annot.active() && m_annot.hasItems() && m_annotScreen == pick.screen)
+        k.doc = m_annot.committedDocument();
+    return k;
 }
 
 void CaptureSession::setFlyout(const QRect& rect)
@@ -313,6 +494,7 @@ void CaptureSession::setOcrAvailable(bool on)
 {
     if (std::exchange(m_ocrAvailable, on) != on)
         emit ocrAvailableChanged();
+    refreshKeyHints();
 }
 
 void CaptureSession::setHiddenButtons(const QStringList& ids)
@@ -343,9 +525,12 @@ void CaptureSession::end()
     m_selection = {};
     m_previous = {};
     m_phase = Phase::Hover;
+    if (std::exchange(m_ocrOnly, false))
+        emit ocrOnlyChanged();
     if (std::exchange(m_active, false))
         emit activeChanged();
     emit selectionChanged();
+    refreshKeyHints();
 }
 
 CaptureScreen* CaptureSession::screenAt(int index) const
@@ -475,6 +660,7 @@ void CaptureSession::publish()
         const QRect selection = s->index() == shown.screen ? shown.rect : QRect();
         s->setState(hover, selection, m_active, adjusting, magnifier && s->index() == m_cursorScreen);
     }
+    refreshKeyHints();
 }
 
 CaptureSession::Pick CaptureSession::hovered() const
@@ -496,6 +682,9 @@ void CaptureSession::pointerMove(int screen, QPoint p, Qt::KeyboardModifiers mod
         && (screen != m_pendingScreen || (p - m_pendingAt).manhattanLength() > dragStart(screen)))
         m_pendingButton = Qt::NoButton; // moved before the release: not a click
     m_cursorCovered = false;
+    // Windows sends moves without a move too (a window shown, a timer):
+    // only a real one counts as the user's input for the hints.
+    const bool moved = screen != m_cursorScreen || clampTo(screen, p) != m_cursorAt;
     switch (m_phase) {
     case Phase::Hover:
         updateHover(screen, clampTo(screen, p));
@@ -537,6 +726,8 @@ void CaptureSession::pointerMove(int screen, QPoint p, Qt::KeyboardModifiers mod
         break;
     }
     updateCursor(screen, p);
+    if (moved)
+        m_hintPolicy.input(hintNow()); // publish() below shows that
     publish();
 }
 
@@ -544,6 +735,8 @@ void CaptureSession::pointerPress(int screen, QPoint p, Qt::MouseButton button, 
 {
     if (!m_active || !screenAt(screen))
         return;
+    m_hintPolicy.press(); // any button: the hints go at once (KeyHintPolicy rule 2)
+    refreshKeyHints();
     m_pendingButton = Qt::NoButton; // another press voids one waiting for its release
     m_shiftAlone = false; // Shift held for the press (a square, a straight line): not a Shift alone
     if (button == Qt::RightButton && m_annot.finishPath()) {
@@ -634,13 +827,17 @@ void CaptureSession::pointerRelease(int screen, QPoint p, Qt::MouseButton button
         m_selection = hovered(); // a click picks the window or control under it
         m_phase = Phase::Selected;
         emit selectionChanged();
-        if (m_copyOnSelect) {
-            finish(Action::Copy);
+        if (m_ocrOnly || m_copyOnSelect) {
+            finish(m_ocrOnly ? Action::OcrCopy : Action::Copy);
             return;
         }
         break;
     case Phase::Dragging:
         m_phase = Phase::Selected;
+        if (m_ocrOnly) {
+            finish(Action::OcrCopy);
+            return;
+        }
         if (m_copyOnSelect) {
             finish(Action::Copy);
             return;
@@ -823,6 +1020,7 @@ void CaptureSession::wheelAngle(int screen, QPoint p, int angleDelta, qint64 now
     if (!m_active || angleDelta == 0)
         return;
     m_shiftAlone = false;
+    hintInput();
     if (m_annot.active() && m_annotScreen == screen && m_selection.screen == screen
         && (m_phase == Phase::Selected || m_phase == Phase::Annotating) && m_annot.wheel(angleDelta, nowMs)) {
         publish();
@@ -841,11 +1039,103 @@ bool CaptureSession::key(int key, Qt::KeyboardModifiers modifiers)
         || m_phase == Phase::Annotating;
     // Shift with no other modifier may be a Shift alone (keyReleased); any other key ends that.
     m_shiftAlone = key == Qt::Key_Shift && !(modifiers & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier));
+    const bool plain = !(modifiers & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier));
+    // ? (the / key, with Shift or not) and F1: the key hints, at any time.
+    // F1 is often another screenshot tool's hotkey, so ? is the one shown.
+    if (plain && (key == Qt::Key_Slash || key == Qt::Key_Question || key == Qt::Key_F1)) {
+        if (m_annot.editingText() || m_annot.editingNumber())
+            return false; // typed
+        m_hintPolicy.toggle();
+        refreshKeyHints();
+        return true;
+    }
+    // Any other key (not a modifier alone, which comes before one) is input for the hints.
+    if (key != Qt::Key_Shift && key != Qt::Key_Control && key != Qt::Key_Alt && key != Qt::Key_Meta)
+        hintInput();
+    const bool wasd = key == Qt::Key_W || key == Qt::Key_A || key == Qt::Key_S || key == Qt::Key_D;
+    if (m_ocrOnly) {
+        // 识别屏幕文字 (#198): the pointer (WASD, the arrows), Enter for what is
+        // under it, Shift+C as Enter, C for the colour the magnifier shows, Esc.
+        // Nothing else: no picture is taken, saved, pinned or brought back
+        // here, and R would leave a selection nothing finishes.
+        const int step = shift ? 10 : 1;
+        switch (key) {
+        case Qt::Key_Escape:
+            back();
+            return true;
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            if (!busy && plain)
+                finish(Action::OcrCopy);
+            return true;
+        case Qt::Key_W:
+        case Qt::Key_A:
+        case Qt::Key_S:
+        case Qt::Key_D:
+            if (plain)
+                movePointer((key == Qt::Key_A ? -1 : key == Qt::Key_D ? 1 : 0) * step,
+                    (key == Qt::Key_W ? -1 : key == Qt::Key_S ? 1 : 0) * step);
+            return true;
+        case Qt::Key_Left:
+        case Qt::Key_Right:
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+            if (!busy && plain && m_selection.screen < 0)
+                nudgeSelection(key == Qt::Key_Left ? -1 : key == Qt::Key_Right ? 1 : 0,
+                    key == Qt::Key_Up ? -1 : key == Qt::Key_Down ? 1 : 0, false);
+            return true;
+        case Qt::Key_C:
+            if (busy || !plain)
+                return true;
+            if (shift) {
+                finish(Action::OcrCopy);
+            } else if (CaptureScreen* s = screenAt(m_cursorScreen); s && s->magnifierShown() && !s->colorText().isEmpty()) {
+                emit colorCopied(s->colorText());
+                finish(Action::Cancel);
+            }
+            return true;
+        case Qt::Key_Shift:
+        case Qt::Key_Control:
+        case Qt::Key_Alt:
+        case Qt::Key_Meta:
+            return false;
+        default:
+            return true;
+        }
+    }
+    // Crop keys take precedence over the tools' letters in the overlay.
+    // The editor keeps its own tool keys; 1 and 3 still select rectangle/arrow here.
+    if (plain && (wasd || key == Qt::Key_R)) {
+        if (m_annot.editingText() || m_annot.editingNumber())
+            return false;
+        if (key == Qt::Key_R) {
+            if (!busy)
+                recallSelection(shift);
+            return true;
+        }
+        // WASD is the mouse pointer in every phase (a pixel, Shift ten); with a
+        // button held the system's mouse move it causes carries the drag,
+        // the adjustment or the stroke along.
+        const int step = shift ? 10 : 1;
+        movePointer((key == Qt::Key_A ? -1 : key == Qt::Key_D ? 1 : 0) * step,
+            (key == Qt::Key_W ? -1 : key == Qt::Key_S ? 1 : 0) * step);
+        return true;
+    }
     // The tools, undo, delete and the arrows on a selected annotation come
     // first; what the model leaves is the selection's and the capture's own.
     if (m_annot.active() && (m_phase == Phase::Selected || m_phase == Phase::Annotating) && key != Qt::Key_Escape
         && m_annot.key(key, modifiers)) {
         publish();
+        return true;
+    }
+    // The pin and save keys, as the user set them (#187; Ctrl+S, F3 by
+    // default). CaptureKeys::problem keeps them off every key below and off
+    // the plain letters above, so plain S still moves the pointer.
+    if (const auto action = m_annot.keys().triggered(KeyContext::Capture, key, modifiers)) {
+        if (*action == KeyAction::Save && busy)
+            return false;
+        if (!busy)
+            finish(*action == KeyAction::Pin ? Action::Pin : Action::Save);
         return true;
     }
     switch (key) {
@@ -856,16 +1146,6 @@ bool CaptureSession::key(int key, Qt::KeyboardModifiers modifiers)
     case Qt::Key_Enter:
         if (!busy)
             finish(Action::Copy);
-        return true;
-    case Qt::Key_S:
-        if (ctrl && !busy) {
-            finish(Action::Save);
-            return true;
-        }
-        return false;
-    case Qt::Key_F3:
-        if (!busy)
-            finish(Action::Pin);
         return true;
     case Qt::Key_L:
         if (!ctrl)
@@ -921,19 +1201,25 @@ bool CaptureSession::key(int key, Qt::KeyboardModifiers modifiers)
             act(static_cast<int>(Action::Record));
             return true;
         }
-        // Shift+R before there is a selection: the one of the last capture.
-        if (!shift || ctrl || busy || m_selection.screen >= 0 || m_phase != Phase::Hover)
-            return false;
-        useLastSelection();
-        return true;
+        return false;
     case Qt::Key_Q:
         if (ctrl || shift)
             return false;
         if (!busy)
             act(static_cast<int>(Action::Qr));
         return true;
+    case Qt::Key_Comma:
+    case Qt::Key_Less:
+    case Qt::Key_Period:
+    case Qt::Key_Greater:
+        // The history (PixPin's and Snipaste's keys): not while a text or a stroke is under way.
+        if (ctrl || modifiers & Qt::AltModifier)
+            return false;
+        if (!busy && !(m_annot.active() && (m_annot.gestureActive() || m_annot.editingText() || m_annot.editingNumber())))
+            emit historyStep(key == Qt::Key_Comma || key == Qt::Key_Less ? 1 : -1);
+        return true;
     case Qt::Key_D:
-        if (ctrl || shift)
+        if (!ctrl || !shift || modifiers & (Qt::AltModifier | Qt::MetaModifier))
             return false;
         if (!busy)
             act(static_cast<int>(Action::Delay));
@@ -946,16 +1232,7 @@ bool CaptureSession::key(int key, Qt::KeyboardModifiers modifiers)
             return true;
         const int dx = key == Qt::Key_Left ? -1 : key == Qt::Key_Right ? 1 : 0;
         const int dy = key == Qt::Key_Up ? -1 : key == Qt::Key_Down ? 1 : 0;
-        if (m_selection.screen >= 0) {
-            const QRect moved = nudge(m_selection.rect, dx, dy, shift, screenAt(m_selection.screen)->bounds());
-            if (moved != m_selection.rect) {
-                m_selection.rect = moved;
-                publish();
-            }
-        } else if (const CaptureScreen* s = screenAt(m_cursorScreen)) {
-            // Nothing selected: the cursor itself, for the magnifier.
-            emit cursorMoveRequested(s->rect().topLeft() + clampTo(m_cursorScreen, m_cursorAt + QPoint(dx, dy)));
-        }
+        nudgeSelection(dx, dy, shift);
         return true;
     }
     default:
@@ -963,28 +1240,81 @@ bool CaptureSession::key(int key, Qt::KeyboardModifiers modifiers)
     }
 }
 
-void CaptureSession::useLastSelection()
+void CaptureSession::movePointer(int dx, int dy)
 {
+    // m_cursorAt follows every pointer move, in the held-button phases too.
+    if (const CaptureScreen* cursorScreen = screenAt(m_cursorScreen))
+        emit cursorMoveRequested(cursorScreen->origin() + clampTo(m_cursorScreen, m_cursorAt + QPoint(dx, dy)));
+}
+
+void CaptureSession::nudgeSelection(int dx, int dy, bool resize)
+{
+    if (CaptureScreen* s = screenAt(m_selection.screen)) {
+        const QRect moved = nudge(m_selection.rect, dx, dy, resize, s->bounds());
+        if (moved != m_selection.rect) {
+            m_selection.rect = moved;
+            emit selectionChanged();
+            publish();
+        }
+    } else if (const CaptureScreen* cursorScreen = screenAt(m_cursorScreen)) {
+        // Nothing selected: the cursor itself, for the magnifier.
+        emit cursorMoveRequested(cursorScreen->origin() + clampTo(m_cursorScreen, m_cursorAt + QPoint(dx, dy)));
+    }
+}
+
+void CaptureSession::rememberSelection(const QRect& rect)
+{
+    if (rect.isEmpty())
+        return;
+    std::erase(m_selectionHistory, rect);
+    m_selectionHistory.insert(m_selectionHistory.begin(), rect);
+    if (m_selectionHistory.size() > kSelectionHistoryLimit)
+        m_selectionHistory.resize(kSelectionHistoryLimit);
+    m_recalledSelection = -1;
+    emit selectionHistoryChanged();
+    emit selectionChanged();
+    refreshKeyHints();
+}
+
+void CaptureSession::recallSelection(bool previous)
+{
+    if (hasAnnotations() && !m_parked) {
+        showNotice(tr("先完成或放弃标注，再恢复选区"));
+        return;
+    }
     std::vector<QRect> monitors;
     for (const CaptureScreen* s : m_screens)
         monitors.push_back(s->rect());
-    const std::optional<RememberedSelection> last = lastSelectionOn(m_lastSelection, monitors);
-    if (!last) {
-        if (CaptureScreen* target = screenAt(m_cursorScreen))
-            target->setFlash(tr("还没有上次的选区"));
+    const int count = selectionHistoryCount();
+    for (int step = 1; step <= count; ++step) {
+        const int at = m_recalledSelection < 0 ? step - 1
+            : (m_recalledSelection + (previous ? -step : step) + count) % count;
+        const auto last = lastSelectionOn(m_selectionHistory[static_cast<std::size_t>(at)], monitors);
+        if (!last)
+            continue; // Its monitor may have been disconnected; try the next region.
+        dropParked();
+        retireAnnotation();
+        m_recalledSelection = at;
+        m_selection = {m_screens[static_cast<std::size_t>(last->monitor)]->index(), last->rect};
+        m_previous = {};
+        m_phase = Phase::Selected;
+        emit selectionChanged();
+        if (m_cursorScreen >= 0)
+            updateCursor(m_cursorScreen, m_cursorAt);
+        publish();
+        for (CaptureScreen* s : m_screens)
+            s->setNotice({}); // The persistent keyboard strip shows the index, away from the size label.
         return;
     }
-    m_selection = {m_screens[static_cast<std::size_t>(last->monitor)]->index(), last->rect};
-    m_previous = {};
-    m_phase = Phase::Selected;
-    emit selectionChanged();
-    if (m_cursorScreen >= 0)
-        updateCursor(m_cursorScreen, m_cursorAt);
-    publish();
+    showNotice(count == 0 ? tr("还没有最近选区，完成一次截图后即可恢复") : tr("最近选区所在的显示器已断开"));
 }
 
 void CaptureSession::back()
 {
+    if (m_ocrOnly) { // 识别屏幕文字: nothing to step back to
+        finish(Action::Cancel);
+        return;
+    }
     // Esc, in steps (3.6): a text under way is kept and closed, a gesture
     // under way is dropped; only then the selection and its annotations.
     if (m_annot.active() && (m_phase == Phase::Selected || m_phase == Phase::Annotating) && m_annot.escape()) {
@@ -1012,6 +1342,7 @@ void CaptureSession::back()
         m_phase = m_selection.screen >= 0 ? Phase::Selected : Phase::Hover;
         break;
     case Phase::Selected:
+        m_recalledSelection = -1;
         if (m_annot.active() && m_annot.hasItems()) {
             // The selection and its annotations are put down together; Ctrl+Z
             // brings them back as they were.
@@ -1042,6 +1373,12 @@ void CaptureSession::finish(Action action)
 {
     if (action == Action::Copy && m_pinOnCopy)
         action = Action::CopyPin;
+    // A save folder chosen: Save (button, key, mouse) goes straight into it,
+    // as before 0.18; 另存为… asks. Past here Save means the picker (#194).
+    if (action == Action::Save && saveDirect())
+        action = Action::SavePrevious;
+    else if (action == Action::SaveAs)
+        action = Action::Save;
     if (m_annot.active())
         m_annot.commitPending(); // the words typed so far are part of the picture
     Pick pick;
@@ -1049,6 +1386,10 @@ void CaptureSession::finish(Action action)
         pick = m_selection.screen >= 0 ? m_selection : hovered();
     if (action != Action::Cancel && action != Action::Delay && (pick.screen < 0 || pick.rect.isEmpty()))
         action = Action::Cancel;
+    // Save first asks for a destination. The controller remembers its region
+    // only once the picker is accepted; cancelling keeps this capture intact.
+    if (const CaptureScreen* s = screenAt(pick.screen); s && action != Action::Cancel && action != Action::Delay && action != Action::Save)
+        rememberSelection(pick.rect.translated(s->origin()));
     emit finished(action, pick.screen, pick.rect);
 }
 
@@ -1095,8 +1436,11 @@ void CaptureSession::wheeled(int screen, qreal x, qreal y, int angleDeltaY)
     wheelAngle(screen, QPoint(toPhysical(x, s->dpr()), toPhysical(y, s->dpr())), angleDeltaY, QDateTime::currentMSecsSinceEpoch());
 }
 
-bool CaptureSession::keyPressed(int key, int modifiers)
+bool CaptureSession::keyPressed(int key, int modifiers, bool autoRepeat)
 {
+    if (m_active && key == Qt::Key_R && autoRepeat
+        && !(modifiers & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)))
+        return true; // One press recalls one region; WASD still repeats while held.
     return this->key(key, Qt::KeyboardModifiers(modifiers));
 }
 
@@ -1115,7 +1459,7 @@ void CaptureSession::keyReleased(int key)
 
 void CaptureSession::act(int action)
 {
-    if (!m_active || action < static_cast<int>(Action::Copy) || action > static_cast<int>(Action::Record))
+    if (!m_active || action < static_cast<int>(Action::Copy) || action > static_cast<int>(Action::SaveAs))
         return;
     if (action == static_cast<int>(Action::Long) || action == static_cast<int>(Action::Record)) {
         // Its picture is the screen's, scrolled: annotations would be lost.

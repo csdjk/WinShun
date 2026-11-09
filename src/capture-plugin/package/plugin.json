@@ -1,0 +1,23 @@
+{
+  "manifest": 1,
+  "id": "winshun.capture",
+  "name": {"zh": "截图与录屏", "en": "Screenshot and recording"},
+  "version": "1.1.7",
+  "description": {"zh": "截图、标注、贴图、长截图、识别文字、录屏和演示白板", "en": "Screenshots, annotations, pins, long screenshots, text recognition, screen recording and a presentation whiteboard"},
+  "author": "LingCore",
+  "homepage": "https://github.com/LingCore/WinShun",
+  "license": "MIT",
+  "minWinShun": "0.18.0",
+  "runtime": {"mode": "resident", "program": "WinShunCapture.exe", "start": "eager", "sandbox": "normal", "timeoutMs": 10000, "idleExitSec": 0, "memoryMB": 2048},
+  "permissions": ["ui", "processes", "clipboard:read", "clipboard:write", "files:write", "notifications", "winshun:open"],
+  "trayMenu": {"zh": "截图", "en": "Screenshot"},
+  "pictures": ["pin", "edit"],
+  "settingsWindow": true,
+  "commands": [{
+    "id": "capture",
+    "keyword": ["cap"],
+    "title": {"zh": "截图", "en": "Screenshot"},
+    "description": {"zh": "开始截图、识别屏幕文字、延时截图、贴图、截图设置", "en": "Take a screenshot, read text on screen, after a delay, pin an image, settings"},
+    "icon": "glyph:U+E722"
+  }]
+}

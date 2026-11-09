@@ -17,6 +17,8 @@ Window {
 
     required property DialogBar bar
 
+    // The window's, read once here and passed down (GitHub #111).
+    readonly property real dpr: Screen.devicePixelRatio
     readonly property int listHeight: bar.rows > 0 ? bar.rows * bar.rowHeight + 9 : 0
     readonly property bool asking: bar.asking && bar.rows === 0
     // What is above or below the box: the list, or the line that asks.
@@ -60,7 +62,12 @@ Window {
     Binding {
         target: window.bar.results
         property: "highlightColor"
-        value: Theme.accent
+        value: Theme.matchColor
+    }
+    Binding {
+        target: window.bar.results
+        property: "highlightWeight"
+        value: Theme.matchWeight
     }
 
     function move(delta) {
@@ -95,6 +102,14 @@ Window {
             contextMenu.dismiss()
     }
 
+    function openKeyboardMenu(repeated) {
+        if (input.preeditText.length > 0 || !list.visible || list.currentIndex < 0 || list.currentIndex >= list.count)
+            return false
+        if (!repeated)
+            openMenu(list.currentIndex)
+        return true
+    }
+
     // Ctrl+1… (or Alt+1…) as in the launcher (see Main.qml): the nth row
     // shown, its number up while the modifier is held.
     readonly property int numberKey: bar.numberKeys === "ctrl" ? Qt.Key_Control
@@ -113,8 +128,8 @@ Window {
         showNumbers = false
     }
     readonly property string numberModifier: numberKey === Qt.Key_Alt ? "Alt" : "Ctrl"
-    // As the launcher's (Main.qml): a digit another program holds is its,
-    // its row's chord struck through.
+    // As the launcher's (Main.qml): a chord that is one of Win顺's own
+    // shortcuts stays that, its row's chord struck through.
     function numberUsable(number) {
         return number >= 1 && (bar.numberKeysLeft & (1 << number)) === 0
     }
@@ -173,11 +188,21 @@ Window {
         const ctrl = (event.modifiers & Qt.ControlModifier) !== 0
         const shift = (event.modifiers & Qt.ShiftModifier) !== 0
         const row = list.count > 0 ? list.currentIndex : -1
-        switch (event.key) {
+        const key = SearchKeys.navigationKey(event.key, event.modifiers, input.preeditText.length > 0)
+        switch (key) {
         case Qt.Key_Down: move(1); break
         case Qt.Key_Up: move(-1); break
         case Qt.Key_PageDown: move(Math.max(1, window.bar.rows)); break
         case Qt.Key_PageUp: move(-Math.max(1, window.bar.rows)); break
+        case Qt.Key_Right:
+            if ((event.modifiers & ~Qt.KeypadModifier) !== Qt.NoModifier || input.selectedText.length > 0
+                    || input.cursorPosition !== input.length || !openKeyboardMenu(event.isAutoRepeat))
+                return
+            break
+        case Qt.Key_O:
+            if ((event.modifiers & ~Qt.KeypadModifier) !== Qt.ControlModifier || !openKeyboardMenu(event.isAutoRepeat))
+                return
+            break
         case Qt.Key_Return:
         case Qt.Key_Enter:
             if (window.bar.holdUntilShown(0, ctrl))
@@ -248,19 +273,26 @@ Window {
         width: window.width
         height: window.bar.barHeight
 
-        Glyph {
+        Image {
             id: searchIcon
+            objectName: "dialogSearchLogo"
             anchors.left: parent.left
-            anchors.leftMargin: 14
+            anchors.leftMargin: 12
             anchors.verticalCenter: parent.verticalCenter
-            glyph: "" // Search
-            size: 16
+            width: 20
+            height: width
+            source: "qrc:/branding/logo.svg"
+            sourceSize.width: width
+            sourceSize.height: height
+            smooth: false
+            Accessible.ignored: true
         }
 
         TextInput {
             id: input
+            objectName: "dialogSearchField"
             anchors.left: searchIcon.right
-            anchors.leftMargin: 10
+            anchors.leftMargin: 8
             anchors.right: trailing.left
             anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
@@ -272,6 +304,7 @@ Window {
             selectionColor: Theme.textSelection
             selectedTextColor: Theme.text
             onTextChanged: window.bar.query = text
+            onPreeditTextChanged: if (preeditText.length > 0) window.closeMenu()
             Keys.onPressed: (event) => window.handleKey(event)
             Keys.onReleased: (event) => window.handleKeyRelease(event)
             Accessible.role: Accessible.EditableText
@@ -282,7 +315,7 @@ Window {
                 anchors.fill: parent
                 verticalAlignment: Text.AlignVCenter
                 text: window.bar.pathCopied ? qsTr("路径已复制，请粘贴到对话框的路径输入框")
-                      : window.bar.copyOnly ? (window.bar.copyOnlyHint === "installed" ? qsTr("管理员窗口：搜索后复制路径再手动粘贴（安装版才能直接跳转）")
+                      : window.bar.copyOnly ? (window.bar.copyOnlyHint === "other" ? qsTr("管理员窗口：搜索后复制路径再手动粘贴（服务属于另一份 Win顺）")
                                                : window.bar.copyOnlyHint === "service" ? qsTr("管理员窗口：搜索后复制路径再手动粘贴（装 Win顺 服务可直接跳转）")
                                                : qsTr("管理员窗口：搜索后复制路径再手动粘贴"))
                       : window.bar.elevatedJump ? qsTr("管理员窗口：直接跳转到文件夹")
@@ -317,7 +350,7 @@ Window {
                 font.pixelSize: Theme.uiCaption
             }
 
-            Rectangle {
+            Item {
                 id: chip
 
                 // After the dialog went to the file manager's folder by
@@ -328,12 +361,23 @@ Window {
                 anchors.verticalCenter: parent.verticalCenter
                 width: chipRow.implicitWidth + 16
                 height: 32
-                radius: Theme.largeControlRadius
-                color: chipArea.pressed ? Theme.controlPressed : chipArea.containsMouse ? Theme.hover : "transparent"
+
+                Hook { // the style's key, flat until hovered
+                    id: chipKey
+                    anchors.fill: parent
+                    part: Theme.keySurface
+                    hovered: chipArea.containsMouse
+                    pressed: chipArea.pressed
+                    flat: true
+                    corner: Theme.largeControlRadius
+                    role: "dialog"
+                    dpr: window.dpr
+                }
 
                 Row {
                     id: chipRow
                     anchors.centerIn: parent
+                    anchors.verticalCenterOffset: chipKey.out("contentOffsetY", 0)
                     spacing: 8
 
                     Glyph {
@@ -349,22 +393,28 @@ Window {
                         text: chip.toOrigin ? qsTr("回到“%1”").arg(window.bar.originName) : window.bar.explorerName
                         textFormat: Text.PlainText
                         elide: Text.ElideMiddle
-                        color: Theme.text
+                        color: chipKey.out("foreground", Theme.text)
                         font.pixelSize: Theme.uiCaption
                     }
-                    Rectangle { // the key that does the same; not where the box would be too short (beside the dialog)
+                    Item { // the key that does the same; not where the box would be too short (beside the dialog)
                         visible: !chip.toOrigin && window.width >= 560
                         anchors.verticalCenter: parent.verticalCenter
                         width: keyText.implicitWidth + 10
                         height: Theme.keycapHeight - 2
-                        radius: Theme.controlRadius
-                        color: Theme.keycap
+
+                        Hook { // the style's key cap (Theme.keyHint): it only tells, never pressed
+                            id: capPart
+                            anchors.fill: parent
+                            part: Theme.keyHint
+                            dpr: window.dpr
+                        }
 
                         Text {
                             id: keyText
                             anchors.centerIn: parent
+                            anchors.verticalCenterOffset: capPart.out("contentOffsetY", 0)
                             text: "Ctrl+G"
-                            color: Theme.subtext
+                            color: capPart.out("foreground", Theme.subtext)
                             font.pixelSize: Theme.uiSmall
                         }
                     }
@@ -391,15 +441,24 @@ Window {
                 }
             }
 
-            Rectangle {
+            Item {
                 id: moreButton
                 anchors.verticalCenter: parent.verticalCenter
                 width: 32
                 height: 32
-                radius: Theme.largeControlRadius
-                color: moreArea.pressed ? Theme.controlPressed
-                     : moreArea.containsMouse || (window.menuOpen && window.contextMenu.row < 0) ? Theme.hover
-                     : "transparent"
+
+                Hook { // the style's key, flat until hovered; lit too while its menu is open
+                    id: moreKey
+                    anchors.fill: parent
+                    part: Theme.keySurface
+                    hovered: moreArea.containsMouse
+                    pressed: moreArea.pressed
+                    flat: true
+                    corner: Theme.largeControlRadius
+                    role: "dialog"
+                    current: window.menuOpen && window.contextMenu.row < 0
+                    dpr: window.dpr
+                }
 
                 Glyph {
                     anchors.centerIn: parent
@@ -426,12 +485,13 @@ Window {
         }
     }
 
-    Rectangle {
+    Hook { // between the box and the list (the style's seam)
         visible: window.bar.rows > 0 || window.asking
         y: window.bar.listAbove ? window.extraHeight - height : window.bar.barHeight
         width: window.width
-        height: Theme.edge(Screen.devicePixelRatio)
-        color: Theme.divider
+        height: Theme.edge(window.dpr)
+        part: Theme.separator
+        dpr: window.dpr
     }
 
     Item { // asks once: go by itself as a dialog opens, as the user comes back to it, or not
@@ -465,22 +525,33 @@ Window {
                 // [what it says, the answer]: the first two turn it on
                 model: [[qsTr("打开时就转"), "open"], [qsTr("切回来时再转"), "back"], [qsTr("不用"), ""]]
 
-                Rectangle {
+                Item {
                     id: answer
 
                     required property var modelData
 
                     width: answerText.implicitWidth + 16
                     height: Theme.chipHeight
-                    radius: Theme.largeControlRadius
-                    color: answerArea.pressed ? Theme.controlPressed : answerArea.containsMouse ? Theme.hover : "transparent"
                     Accessible.role: Accessible.Button
                     Accessible.name: answerText.text
                     Accessible.onPressAction: window.bar.answerAutoJump(answer.modelData[1])
 
+                    Hook { // the style's key, flat until hovered
+                        id: answerKey
+                        anchors.fill: parent
+                        part: Theme.keySurface
+                        hovered: answerArea.containsMouse
+                        pressed: answerArea.pressed
+                        flat: true
+                        corner: Theme.largeControlRadius
+                        role: "dialog"
+                        dpr: window.dpr
+                    }
+
                     Text {
                         id: answerText
                         anchors.centerIn: parent
+                        anchors.verticalCenterOffset: answerKey.out("contentOffsetY", 0)
                         text: answer.modelData[0]
                         color: answer.modelData[1].length > 0 ? Theme.accent : Theme.subtext
                         font.pixelSize: Theme.uiCaption
@@ -500,6 +571,7 @@ Window {
 
     ListView {
         id: list
+        objectName: "dialogResults"
         visible: window.bar.rows > 0
         y: window.bar.listAbove ? 0 : window.bar.barHeight + 1
         width: window.width
@@ -509,7 +581,36 @@ Window {
         clip: true
         model: window.bar.results
         boundsBehavior: Flickable.StopAtBounds
-        highlightMoveDuration: 0
+        // The current row's highlight, one for the whole list: it jumps, or
+        // slides as the style says (Theme.rowSlide).
+        highlightMoveDuration: Theme.rowSlide
+        highlightMoveVelocity: -1
+        highlightResizeDuration: 0
+        highlightResizeVelocity: -1
+        highlight: Item {
+            id: currentHighlight
+            width: list.width
+            visible: list.currentItem !== null
+            transform: ScrollPixelAlignment { // on whole device pixels, as the rows
+                view: list
+                viewY: list.y
+                itemY: currentHighlight.y
+            }
+
+            Hook {
+                anchors.fill: parent
+                anchors.leftMargin: Theme.rowInset
+                anchors.rightMargin: Theme.rowInset
+                anchors.topMargin: Theme.edge(window.dpr)
+                anchors.bottomMargin: Theme.edge(window.dpr)
+                part: Theme.rowHighlight
+                current: true
+                selected: true
+                position: list.currentItem !== null ? list.currentItem.y : 0
+                role: "list"
+                dpr: window.dpr
+            }
+        }
         function stopScrolling() {
             wheelScroll.cancel()
             cancelFlick()
@@ -565,6 +666,7 @@ Window {
     }
 
     ListScrollBar {
+        dpr: window.dpr
         visible: window.bar.rows > 0
         flickable: list
         x: window.width - width
@@ -594,5 +696,8 @@ Window {
         }
     }
 
-    WindowEdge {}
+    WindowEdge {
+        id: windowEdge
+        fill: Theme.background
+    }
 }

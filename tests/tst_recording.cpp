@@ -2,10 +2,14 @@
 #include "GifExport.h"
 #include "KeyStream.h"
 #include "RecordingPointer.h"
+#include "RecordingWorker.h"
 
 #include <QDir>
 #include <QFile>
 #include <QGuiApplication>
+#include <QElapsedTimer>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QImage>
 #include <QImageReader>
 #include <QScopeGuard>
@@ -19,6 +23,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -90,6 +95,82 @@ HRESULT forEachFrame(const QString& path, const std::function<void(qint64 ms, co
 class TestRecording : public QObject {
     Q_OBJECT
 private slots:
+    void isolatedEncoding()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        for (const bool software : {false, true}) {
+            Options options;
+            options.path = temporary.filePath(software ? u"software.mp4"_s : u"hardware.mp4"_s);
+            options.region = QRect(0, 0, 641, 361);
+            options.software = software;
+            options.systemAudio = true;
+            Control control;
+            const WorkerProgram program {QCoreApplication::applicationFilePath(), {}};
+            const auto result = recordIsolated(program, options, control, {}, 600);
+            QVERIFY2(result.error.isEmpty(), qPrintable(result.error));
+            QVERIFY(result.frames >= 10);
+            QCOMPARE(result.path, options.path);
+            HRESULT decoded = E_FAIL;
+            int frames = 0;
+            std::jthread reader([&] {
+                const HRESULT com = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                if (FAILED(com)) return;
+                const auto uninit = qScopeGuard([] { ::CoUninitialize(); });
+                decoded = forEachFrame(result.path, [&](qint64, const unsigned char*, LONG) { ++frames; });
+            });
+            reader.join();
+            QVERIFY(SUCCEEDED(decoded));
+            QVERIFY(frames >= 10);
+            control.stop = true; // the production Stop and save path leaves this set
+            const auto gif = exportGifIsolated(program, result.path,
+                {temporary.filePath(software ? u"software.gif"_s : u"hardware.gif"_s), 15, 1280}, control, {});
+            QVERIFY2(gif.error.isEmpty(), qPrintable(gif.error));
+            QVERIFY(QFileInfo::exists(result.path));
+            QImageReader image(gif.path);
+            QVERIFY(image.canRead());
+            QVERIFY(image.imageCount() >= 5);
+            QCOMPARE(image.size(), QSize(642, 362));
+        }
+    }
+
+    void isolatedHardwareFailureFallsBack()
+    {
+        QTemporaryDir temporary;
+        Options options;
+        options.path = temporary.filePath(u"fallback.mp4"_s);
+        options.region = QRect(0, 0, 320, 180);
+        Control control;
+        const WorkerProgram program {QCoreApplication::applicationFilePath(), {u"--test-fail-hardware"_s}};
+        const auto result = recordIsolated(program, options, control, {}, 400);
+        QVERIFY2(result.error.isEmpty(), qPrintable(result.error));
+        QCOMPARE(result.path, options.path);
+        QVERIFY(result.frames > 0);
+        QVERIFY(!result.hardware);
+        QCOMPARE(QDir(temporary.path()).entryList({u"*.partial.mp4"_s}, QDir::Files).size(), 0);
+    }
+
+    void isolatedStallIsBoundedAndCancellable()
+    {
+        QTemporaryDir temporary;
+        Options options;
+        options.path = temporary.filePath(u"stalled.mp4"_s);
+        options.region = QRect(0, 0, 320, 180);
+        options.software = true;
+        const WorkerProgram program {QCoreApplication::applicationFilePath(), {u"--test-stall-worker"_s}, 200};
+        Control control;
+        QElapsedTimer elapsed;
+        elapsed.start();
+        const auto failure = recordIsolated(program, options, control, {}, 400);
+        QVERIFY(!failure.error.isEmpty());
+        QVERIFY(elapsed.elapsed() < 3000);
+        QVERIFY(!QFileInfo::exists(options.path));
+        std::jthread cancel([&] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); control.stop = true; });
+        const auto cancelled = recordIsolated(program, options, control, {}, 400);
+        QVERIFY(cancelled.error.isEmpty());
+        QVERIFY(cancelled.path.isEmpty());
+    }
+
     void pauseClock()
     {
         Timeline clock(100);
@@ -105,6 +186,34 @@ private slots:
         QCOMPARE(clock.elapsed(2000), 120);
         clock.resume(1520);
         QCOMPARE(clock.elapsed(1620), 220);
+    }
+
+    // GitHub #214: the CPU's NV12, for a driver without D3D11 video.
+    void cpuNv12()
+    {
+        const auto convert = [](std::array<std::array<unsigned char, 3>, 4> rgb) {
+            std::array<unsigned char, 16> bgra {};
+            for (int i = 0; i < 4; ++i) {
+                const int at = (i % 2) * 4 + (i / 2) * 8; // a 2×2 block, pitch 8
+                bgra[at] = rgb[i][2];
+                bgra[at + 1] = rgb[i][1];
+                bgra[at + 2] = rgb[i][0];
+                bgra[at + 3] = 255;
+            }
+            std::array<unsigned char, 6> out {};
+            bgraToNv12(bgra.data(), 8, 2, 2, out.data(), 2, out.data() + 4, 2);
+            return out;
+        };
+        const auto solid = [&](unsigned char r, unsigned char g, unsigned char b) {
+            return convert({{{r, g, b}, {r, g, b}, {r, g, b}, {r, g, b}}});
+        };
+        using Nv12 = std::array<unsigned char, 6>;
+        QCOMPARE(solid(255, 255, 255), (Nv12 {235, 235, 235, 235, 128, 128}));
+        QCOMPARE(solid(0, 0, 0), (Nv12 {16, 16, 16, 16, 128, 128}));
+        QCOMPARE(solid(128, 128, 128), (Nv12 {126, 126, 126, 126, 128, 128}));
+        QCOMPARE(solid(255, 0, 0), (Nv12 {63, 63, 63, 63, 102, 240})); // BT.709 red
+        const auto mixed = convert({{{255, 255, 255}, {0, 0, 0}, {0, 0, 0}, {255, 255, 255}}});
+        QCOMPARE(mixed, (Nv12 {235, 16, 16, 235, 128, 128}));
     }
 
     void neverOverwrite()
@@ -284,11 +393,15 @@ private slots:
         QTest::addColumn<bool>("audio");
         QTest::addColumn<int>("fps");
         QTest::addColumn<bool>("clickHighlights");
-        QTest::newRow("hardware") << false << QSize(640, 360) << false << 30 << false;
-        QTest::newRow("hardware-aac") << false << QSize(640, 360) << true << 30 << false;
-        QTest::newRow("software-odd-region") << true << QSize(641, 361) << false << 30 << false;
-        QTest::newRow("smaller-file") << false << QSize(640, 360) << false << 15 << false;
-        QTest::newRow("gpu-click-highlight") << false << QSize(640, 360) << false << 30 << true;
+        QTest::addColumn<bool>("noVideoDevice");
+        QTest::newRow("hardware") << false << QSize(640, 360) << false << 30 << false << false;
+        QTest::newRow("hardware-aac") << false << QSize(640, 360) << true << 30 << false << false;
+        QTest::newRow("software-odd-region") << true << QSize(641, 361) << false << 30 << false << false;
+        QTest::newRow("smaller-file") << false << QSize(640, 360) << false << 15 << false << false;
+        QTest::newRow("gpu-click-highlight") << false << QSize(640, 360) << false << 30 << true << false;
+        // GitHub #214: hardware asked for, but the driver has no D3D11 video.
+        QTest::newRow("no-video-device-odd-region") << false << QSize(641, 361) << false << 30 << false << true;
+        QTest::newRow("no-video-device-click-highlight") << false << QSize(640, 360) << false << 30 << true << true;
     }
 
     void encodedVideo()
@@ -298,12 +411,14 @@ private slots:
         QFETCH(bool, audio);
         QFETCH(int, fps);
         QFETCH(bool, clickHighlights);
+        QFETCH(bool, noVideoDevice);
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
         Options options;
         options.path = temporary.filePath(u"sample.mp4"_s);
         options.region = QRect(QPoint(), size);
         options.software = software;
+        options.noVideoDevice = noVideoDevice;
         options.fps = fps;
         if (fps == 15) options.quality = 70;
         options.systemAudio = audio; // sample() generates a tone, never opens an endpoint
@@ -441,6 +556,15 @@ private slots:
         const auto* rgb = reinterpret_cast<const unsigned char*>(pixels.constData()) + (actual.height() / 4 * actual.width() + 5) * 4;
         QVERIFY2(rgb[0] > 225 && rgb[1] > 225 && rgb[2] > 225,
             qPrintable(u"decoded BGR: %1 %2 %3, size %4"_s.arg(rgb[0]).arg(rgb[1]).arg(rgb[2]).arg(pixels.size())));
+        // The sample's moving block, rgb(40, 110, 200), starts near the left
+        // edge: colours come through each conversion, not just brightness.
+        const auto* block = reinterpret_cast<const unsigned char*>(pixels.constData()) + ((actual.height() / 2 + 17) * actual.width() + 45) * 4;
+        QVERIFY2(std::abs(block[0] - 200) < 24 && std::abs(block[1] - 110) < 24 && std::abs(block[2] - 40) < 24,
+            qPrintable(u"decoded block BGR: %1 %2 %3"_s.arg(block[0]).arg(block[1]).arg(block[2])));
+        if (noVideoDevice) {
+            QVERIFY(!result.hardware);
+            QVERIFY2(result.encoder.contains(u"NV12 on the CPU"_s), qPrintable(result.encoder));
+        }
         QVERIFY(result.bytes < 500'000);
         if (clickHighlights) {
             const auto orangePixels = [](const QByteArray& data) {
@@ -542,5 +666,28 @@ private slots:
     }
 };
 
-QTEST_MAIN(TestRecording)
+int main(int argc, char** argv)
+{
+    QGuiApplication app(argc, argv);
+    const auto args = app.arguments();
+    if (args.contains(u"--recording-worker"_s)) {
+        if (args.contains(u"--test-stall-worker"_s)) { ::Sleep(30'000); return 9; }
+        if (args.contains(u"--test-fail-hardware"_s)) {
+            QByteArray bytes(65536, '\0');
+            DWORD count = 0;
+            QElapsedTimer waiting;
+            waiting.start();
+            while (waiting.elapsed() < 3000) {
+                if (!::PeekNamedPipe(::GetStdHandle(STD_INPUT_HANDLE), bytes.data(), DWORD(bytes.size()), &count, nullptr, nullptr)) return 8;
+                if (QByteArrayView(bytes.constData(), count).contains('\n')) break;
+                ::Sleep(5);
+            }
+            const auto json = QJsonDocument::fromJson(bytes.first(qsizetype(count)).split('\n').first()).object();
+            if (!json.value(u"software"_s).toBool()) return 7;
+        }
+        return recordingWorkerMain();
+    }
+    TestRecording test;
+    return QTest::qExec(&test, argc, argv);
+}
 #include "tst_recording.moc"

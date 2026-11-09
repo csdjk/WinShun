@@ -10,14 +10,25 @@ SettingsSection {
     readonly property int keywordWidth: 115
     readonly property int actionsWidth: 108
     readonly property real extensionsWidth: Math.max(100, width - 36 - nameWidth - keywordWidth - actionsWidth - 18)
+    // The 文件类型 row, gone to from the launcher strip's + (SettingsWindow.showFileTypesPage).
+    readonly property SettingRow typesRow: fileTypesRow
+
+    // The settings window hidden (SettingsWindow.resetForReopen): nothing half typed kept.
+    function resetForReopen() {
+        problem = ""
+        newName.clear()
+        newExtensions.clear()
+    }
 
     SettingRow {
+        id: fileTypesRow
         title: qsTr("文件类型")
         keywords: qsTr("类型;扩展名;后缀;筛选;前缀;快捷键;folder;filter;type;extension").split(";")
         values: section.editor.fileTypes.map(t => t.name + " :" + t.keyword)
         description: qsTr("输入“:folder 报告”只找文件夹；类型前缀可自定义，不区分大小写。留空可停用，Ctrl+Tab 仍可切换。")
 
         FlatButton {
+            dpr: section.dpr
             visible: !section.editor.fileTypesDefault
             text: qsTr("恢复默认")
             onClicked: {
@@ -102,6 +113,7 @@ SettingsSection {
                             }
                         }
                         FlatButton {
+                            dpr: section.dpr
                             flat: true
                             glyph: "\uE70E"
                             enabled: typeRow.index > 0
@@ -109,6 +121,7 @@ SettingsSection {
                             onClicked: section.editor.moveFileType(typeRow.index, -1)
                         }
                         FlatButton {
+                            dpr: section.dpr
                             flat: true
                             glyph: "\uE70D"
                             enabled: typeRow.index < section.editor.fileTypes.length - 1
@@ -116,6 +129,7 @@ SettingsSection {
                             onClicked: section.editor.moveFileType(typeRow.index, 1)
                         }
                         FlatButton {
+                            dpr: section.dpr
                             flat: true
                             glyph: "\uE74D"
                             Accessible.name: qsTr("删除")
@@ -141,6 +155,7 @@ SettingsSection {
                     onAccepted: addType.clicked()
                 }
                 FlatButton {
+                    dpr: section.dpr
                     id: addType
                     width: section.actionsWidth
                     text: qsTr("添加")

@@ -45,6 +45,9 @@ constexpr int kStartDragTicks = 15;
 // millisecond or so of this one's, unless it is late.
 constexpr UINT_PTR kBackupTimer = 3;
 constexpr UINT kBackupMs = 120;
+// A key from a hook while the Raw Input is set aside (hookedKey): the key's
+// vk, scan code, flags and time in wParam, its extra information in lParam.
+constexpr UINT kHookedKey = WM_APP + 73;
 // GetLastInputInfo's time for the tap's own last release: the same tick, or the next.
 constexpr std::int32_t kSameInputMs = 32;
 
@@ -62,6 +65,13 @@ bool listsFiles(HWND window)
     const std::wstring_view cls(name);
     return cls == L"DirectUIHWND" || cls == L"SysListView32" || cls == L"SysTreeView32" || cls == L"LCLListBox"
         || cls == L"TMyListBox";
+}
+
+// Window classes identify the input boundary without keeping titles or file names.
+std::string windowClass(HWND window)
+{
+    char name[128] {};
+    return window && ::GetClassNameA(window, name, static_cast<int>(std::size(name))) ? name : "none";
 }
 
 using Key = DoubleTapDetector::Key;
@@ -317,6 +327,26 @@ LRESULT CALLBACK KeyListener::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         if (self)
             self->onInput(reinterpret_cast<HRAWINPUT>(lParam));
         return ::DefWindowProcW(hwnd, msg, wParam, lParam); // lets Windows free the input
+    case kHookedKey:
+        if (self) {
+            // As Raw Input names it: Shift, Ctrl and Alt without their side
+            // (sidedKey finds it again), an extended key by its E0 prefix.
+            const auto flags = static_cast<UINT>(wParam >> 24 & 0xFF);
+            UINT vk = static_cast<UINT>(wParam & 0xFF);
+            if (vk == VK_LSHIFT || vk == VK_RSHIFT)
+                vk = VK_SHIFT;
+            else if (vk == VK_LCONTROL || vk == VK_RCONTROL)
+                vk = VK_CONTROL;
+            else if (vk == VK_LMENU || vk == VK_RMENU)
+                vk = VK_MENU;
+            RAWKEYBOARD key {};
+            key.MakeCode = static_cast<USHORT>(wParam >> 8 & 0xFFFF);
+            key.Flags = static_cast<USHORT>(((flags & LLKHF_UP) ? RI_KEY_BREAK : 0) | ((flags & LLKHF_EXTENDED) ? RI_KEY_E0 : 0));
+            key.VKey = static_cast<USHORT>(vk);
+            key.ExtraInformation = static_cast<ULONG>(lParam);
+            self->onKeyboard(key, !(flags & LLKHF_INJECTED), static_cast<std::uint32_t>(wParam >> 32));
+        }
+        return 0;
     case WM_TIMER:
         if (wParam == kBackupTimer && self)
             self->onBackupTimer();
@@ -345,6 +375,7 @@ LRESULT CALLBACK KeyListener::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             self->removeKeyboard(hwnd);
         if (self) {
             self->m_callbacks.doubleClick = nullptr; // so the mouse goes too
+            self->m_callbacks.middleClick = nullptr;
             self->m_callbacks.dragMenu = nullptr;
             self->m_callbacks.leftButtonUp = nullptr;
             self->m_callbacks.mousePress = nullptr;
@@ -377,18 +408,21 @@ void KeyListener::onInput(HRAWINPUT input)
     }
     if (raw.header.dwType != RIM_TYPEKEYBOARD)
         return;
-    const RAWKEYBOARD& key = raw.data.keyboard;
+    // A program's has no device. When it was pressed, not when we got to it.
+    onKeyboard(raw.data.keyboard, raw.header.hDevice != nullptr, static_cast<std::uint32_t>(::GetMessageTime()));
+}
+
+void KeyListener::onKeyboard(const RAWKEYBOARD& key, bool device, std::uint32_t time)
+{
     if (m_callbacks.dragMenu)
         onDragKey(key);
     if (!m_callbacks.doubleCtrl)
         return;
     const bool up = key.Flags & RI_KEY_BREAK;
     const std::uint32_t vk = sidedKey(key);
-    // A program's has no device. Not Win顺's own: the Alt KeyRouter lets go
-    // after its mask was pressed by a finger.
-    const bool device = raw.header.hDevice != nullptr;
+    // Not Win顺's own: the Alt KeyRouter lets go after its mask was pressed
+    // by a finger.
     const bool sent = !device && !isOwnInput(key.ExtraInformation);
-    const auto time = static_cast<std::uint32_t>(::GetMessageTime()); // when it was pressed, not when we got to it
     // 0xFF: the extra part of an escaped key sequence, not a key. kOwnMask:
     // KeyRouter's mask just before it lets a Shift or Alt pressed alone go
     // on to the program: no key in between, the Alt was alone.
@@ -741,6 +775,12 @@ void KeyListener::onMouse(const RAWMOUSE& mouse)
     }
     for (DoubleTapDetector& d : m_detectors)
         d.mouseUsed();
+    if (m_callbacks.middleClick && (mouse.usButtonFlags & kAnyButtonDown) == RI_MOUSE_MIDDLE_BUTTON_DOWN
+        && !modifierHeld() && !held(VK_LBUTTON) && !held(VK_RBUTTON) && !held(VK_XBUTTON1) && !held(VK_XBUTTON2)) {
+        const DWORD at = ::GetMessagePos();
+        const POINT pt {static_cast<short>(LOWORD(at)), static_cast<short>(HIWORD(at))};
+        m_callbacks.middleClick(::WindowFromPoint(pt), pt);
+    }
     if (!m_callbacks.doubleClick)
         return;
     // The device's buttons: with them swapped (left-handed), its right one
@@ -795,6 +835,7 @@ void KeyListener::onDrag(const RAWMOUSE& mouse)
             m_pressedAt = pt;
             m_dragFound = false;
             m_dragLooked = time;
+            m_dragConflictLogged = false;
             // Held on a list of files, the key is the pie's from now on: it
             // may come before the hand moves (startDrag).
             if (listsFiles(::WindowFromPoint(pt)))
@@ -861,8 +902,17 @@ void KeyListener::onDragKeyPressed()
     if (!source.capture) {
         if (m_dragKeyGuarded)
             replayDragKey(); // not a drag after all: typed, as it would have been
-        if (m_keyLog)
+        const bool primaryHeld = held(::GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON);
+        if (m_pressed || primaryHeld) {
+            POINT pt {};
+            ::GetPhysicalCursorPos(&pt);
+            log(std::format("Drop pie input: its key with the primary button held, but no file drag; pressed {}, "
+                            "moved {}, under pointer {}, foreground {}",
+                yesNo(m_pressed), yesNo(m_dragging), windowClass(::WindowFromPoint(pt)),
+                windowClass(::GetForegroundWindow())));
+        } else if (m_keyLog) {
             log("Key log: the drop pie's key, but no OLE drag is under way");
+        }
         return;
     }
     POINT pt {};
@@ -925,13 +975,22 @@ void KeyListener::guardDragKey(bool on)
     const HKL layout = ::GetKeyboardLayout(::GetWindowThreadProcessId(::GetForegroundWindow(), nullptr));
     const UINT vk = ::MapVirtualKeyExW(kDragKeyScan, MAPVK_VSC_TO_VK, layout);
     std::string held;
+    DWORD plainError = vk ? 0 : ERROR_INVALID_PARAMETER;
     for (int i = 0; vk && i < static_cast<int>(kDragKeyMods.size()); ++i) {
         const UINT mods = kDragKeyMods[static_cast<std::size_t>(i)];
-        if (!::RegisterHotKey(window, kDragKeyHotkey + i, mods | MOD_NOREPEAT, vk))
+        if (!::RegisterHotKey(window, kDragKeyHotkey + i, mods | MOD_NOREPEAT, vk)) {
+            if (mods == 0) plainError = ::GetLastError();
             continue;
+        }
         m_dragKeyGuarded = true;
         held += std::format(" {}{}key", (mods & MOD_CONTROL) ? "Ctrl+" : "", (mods & MOD_SHIFT) ? "Shift+" : "");
     }
+    if (plainError && !std::exchange(m_dragConflictLogged, true))
+        log(std::format("Drop pie input: its plain key could not be registered (vk 0x{:02X}, error {}); "
+                        "another hotkey owner may receive it instead",
+            vk, plainError));
+    if (plainError && m_callbacks.dragKeyRefused && !std::exchange(m_dragKeyRefusedTold, true))
+        m_callbacks.dragKeyRefused(vk, plainError);
     if (m_keyLog)
         log(std::format("Key log: a file list pressed or a drag begun: the drop pie's key (vk 0x{:02X}) held back as:{}", vk,
             held.empty() ? " nothing" : held));
@@ -965,7 +1024,10 @@ void KeyListener::startDrag()
         moves[i].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         moves[i].mi.dwExtraInfo = kOwnInput;
     }
-    ::SendInput(static_cast<UINT>(moves.size()), moves.data(), sizeof(INPUT));
+    const UINT sent = ::SendInput(static_cast<UINT>(moves.size()), moves.data(), sizeof(INPUT));
+    if (sent != moves.size())
+        log(std::format("Drop pie input: only {} of {} drag-start moves sent (error {})", sent, moves.size(),
+            ::GetLastError()));
     ::SetTimer(m_window.load(), kStartDragTimer, kStartDragTickMs, nullptr);
 }
 
@@ -987,8 +1049,8 @@ void KeyListener::onStartDragTimer()
     m_starting = false;
     ::SetCursorPos(m_startFrom.x, m_startFrom.y);
     if (!source.capture) {
-        if (m_keyLog)
-            log("Key log: the drop pie's key on a file held, but no drag began");
+        log(std::format("Drop pie input: its key on a file list, but no drag began within {} ms; source {}",
+            m_startTicks * kStartDragTickMs, windowClass(::WindowFromPoint(m_pressedAt))));
         replayDragKey();
         return;
     }
@@ -1029,6 +1091,9 @@ void KeyListener::listenToMouse(bool on)
         on ? m_window.load() : nullptr};
     if (::RegisterRawInputDevices(&mouse, 1, sizeof mouse) || !on)
         m_mouseOn = on;
+    else
+        log(std::format("Key listener: mouse Raw Input not registered (error {}): no mouse callbacks or drop pie trigger",
+            ::GetLastError()));
 }
 
 // The keyboard's registration, this listener's; while a hook has it set
@@ -1075,6 +1140,21 @@ void KeyListener::removeKeyboard(HWND window)
     }
     if (!line.empty())
         log(line);
+}
+
+void KeyListener::hookedKey(const KBDLLHOOKSTRUCT& event)
+{
+    HWND window = nullptr;
+    {
+        const std::scoped_lock lock(g_asideMutex);
+        if (const std::optional<Registration> away = g_aside.away())
+            window = reinterpret_cast<HWND>(away->window);
+    }
+    if (!window)
+        return;
+    const WPARAM packed = (event.vkCode & 0xFF) | (WPARAM {event.scanCode & 0xFFFF} << 8)
+        | (WPARAM {event.flags & 0xFF} << 24) | (WPARAM {event.time} << 32);
+    ::PostMessageW(window, kHookedKey, packed, static_cast<LPARAM>(event.dwExtraInfo));
 }
 
 KeyboardRawInput keyboardRawInput()

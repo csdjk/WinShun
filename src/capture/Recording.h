@@ -31,6 +31,7 @@ private:
 struct Options {
     QRect region; // physical pixels, virtual desktop; wholly on one display
     QString path; // a new MP4 file; never overwrite an existing file
+    QString temporary; // supervisor-owned UUID staging path; empty for a direct call
     int fps = 30;
     int quality = 75;
     bool systemAudio = false;
@@ -47,6 +48,7 @@ struct Options {
     QFont keyFont; // Win顺's
     double outputScale = 1; // a GIF scaled down: its size against the region's
     bool software = false; // the probe's deterministic software-encoder path
+    bool noVideoDevice = false; // tests: as on a driver without D3D11 video (GitHub #214)
 };
 
 struct Control {
@@ -62,6 +64,7 @@ struct Progress {
     QString encoder;
     bool hardware = false;
     int percent = -1; // export progress; -1 while capturing or without a duration
+    QString stage; // last media operation, for timeout diagnostics
 };
 
 struct Result : Progress {
@@ -79,5 +82,11 @@ Result record(const Options& options, Control& control, const std::function<void
 // keycaps on, "Ctrl + S" (or a click) at 100 ms. `control` pauses it.
 Result sample(const Options& options, int milliseconds, const std::function<void(const Progress&)>& progress = {});
 Result sample(const Options& options, int milliseconds, Control& control, const std::function<void(const Progress&)>& progress = {});
+
+// Full-range BGRA to studio-range BT.709 NV12, as the GPU's video processor
+// makes it, for a device without D3D11 video (GitHub #214). Even width and
+// height; each 2×2 block shares the chroma of its average.
+void bgraToNv12(const unsigned char* bgra, int pitch, int width, int height, unsigned char* luma, int lumaStride,
+    unsigned char* chroma, int chromaStride);
 
 } // namespace ws::capture::recording

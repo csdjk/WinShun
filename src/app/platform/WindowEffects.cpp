@@ -32,69 +32,56 @@ constexpr int kCornerRound = 2; // DWMWCP_ROUND
 constexpr int kCornerSquare = 1; // DWMWCP_DONOTROUND
 constexpr int kCornerSmall = 3; // DWMWCP_ROUNDSMALL
 constexpr wchar_t kCornerStyle[] = L"WinShun.CornerStyle";
+bool g_compositedPreview = false;
 std::atomic<bool> g_round {true};
 std::mutex g_cornerMutex; // preview HWNDs are created on another thread
-constexpr COLORREF kColorNone = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+constexpr COLORREF kColorDefault = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
 constexpr int kBackdropMica = 2; // DWMSBT_MAINWINDOW
-constexpr UINT kUpdateCornerRegion = WM_APP + 0x3C4;
+constexpr int kBackdropAcrylic = 3; // DWMSBT_TRANSIENTWINDOW
+constexpr int kBackdropNone = 1; // DWMSBT_NONE
+constexpr wchar_t kBackdropWindow[] = L"WinShun.Backdrop";
+std::atomic<BackdropMaterial> g_backdropMaterial {BackdropMaterial::Mica};
 
-struct CornerRegion {
-    int width = 0;
-    int height = 0;
-    int radius = -1;
-};
-
-void updateCornerRegion(HWND window, CornerRegion& region)
+void applyBackdrop(HWND window)
 {
-    RECT rect {};
-    if (!::GetWindowRect(window, &rect))
-        return;
-    const int width = rect.right - rect.left, height = rect.bottom - rect.top;
-    const bool smallCorners = reinterpret_cast<INT_PTR>(::GetPropW(window, kCornerStyle)) == kCornerSmall;
-    const int radius = g_round.load() && !::IsZoomed(window)
-        ? ::MulDiv(smallCorners ? 4 : 8, static_cast<int>(::GetDpiForWindow(window)), 96)
-        : 0;
-    if (region.width == width && region.height == height && region.radius == radius)
-        return;
-    region = {width, height, radius}; // SetWindowRgn can reenter the window procedure.
-    const HRGN mask = radius ? ::CreateRoundRectRgn(0, 0, width + 1, height + 1, 2 * radius, 2 * radius) : nullptr;
-    if (!::SetWindowRgn(window, mask, TRUE) && mask)
-        ::DeleteObject(mask); // ownership transfers only on success
+    const int value = g_backdropMaterial.load() == BackdropMaterial::Acrylic ? kBackdropAcrylic : kBackdropMica;
+    ::DwmSetWindowAttribute(window, kSystemBackdropType, &value, sizeof value);
+    ::DefWindowProcW(window, WM_NCACTIVATE,
+        backdropFrameActive(window, ::GetForegroundWindow() == window
+            || (::GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE)), -1);
 }
 
-LRESULT CALLBACK cornerRegionProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR data)
+LRESULT CALLBACK nativeFrameProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR)
 {
-    auto* region = reinterpret_cast<CornerRegion*>(data);
-    if (message == WM_NCDESTROY) {
-        ::RemoveWindowSubclass(window, cornerRegionProc, id);
-        delete region;
-    } else if (message == WM_SIZE || message == WM_DPICHANGED || message == kUpdateCornerRegion) {
-        updateCornerRegion(window, *region);
+    switch (message) {
+    case WM_NCCALCSIZE:
+        if (!::IsZoomed(window))
+            return 0; // Keep the native frame entirely in the client area.
+        break;
+    case WM_STYLECHANGING:
+        if (static_cast<int>(wParam) == GWL_STYLE) {
+            auto* styles = reinterpret_cast<STYLESTRUCT*>(lParam);
+            if (!(styles->styleNew & WS_CHILD))
+                styles->styleNew |= WS_CAPTION;
+        }
+        break;
+    case WM_NCDESTROY:
+        ::RemoveWindowSubclass(window, nativeFrameProc, id);
+        break;
     }
     return ::DefSubclassProc(window, message, wParam, lParam);
 }
 
+// Windows 10 has no DWM corner preference, and drawn corners conflict with
+// DWM's frame there: a window region turns its shadow off, and its border
+// shows through the corners' transparent pixels (GitHub #165; QWindowKit and
+// Telegram Desktop came to the same). Square there, with DWM's frame and
+// shadow, as VS Code and Windows Terminal; the setting still rounds the
+// controls inside (Theme.qml).
 void applyWindowCorners(HWND window, int style)
 {
-    const int value = g_round.load() ? style : kCornerSquare;
-    if (SUCCEEDED(::DwmSetWindowAttribute(window, kCornerPreference, &value, sizeof value)))
-        return;
-    if (::GetWindowThreadProcessId(window, nullptr) != ::GetCurrentThreadId()) {
-        ::PostMessageW(window, kUpdateCornerRegion, 0, 0);
-        return;
-    }
-    // Windows 10 has no DWM corner preference. Keep the same setting useful
-    // there, including after resizing or moving to a monitor with another DPI.
-    DWORD_PTR data = 0;
-    if (!::GetWindowSubclass(window, cornerRegionProc, 0, &data)) {
-        auto* region = new CornerRegion;
-        if (!::SetWindowSubclass(window, cornerRegionProc, 0, reinterpret_cast<DWORD_PTR>(region))) {
-            delete region;
-            return;
-        }
-        data = reinterpret_cast<DWORD_PTR>(region);
-    }
-    updateCornerRegion(window, *reinterpret_cast<CornerRegion*>(data));
+    const int value = g_round.load() && nativeWindowCorners() ? style : kCornerSquare;
+    ::DwmSetWindowAttribute(window, kCornerPreference, &value, sizeof value);
 }
 
 HWND handleOf(QWindow* window)
@@ -146,26 +133,123 @@ HWND closeShellFlyout(HWND foreground)
 
 bool isShellFlyout(HWND window)
 {
-    static const QStringList flyouts {
-        u"SearchHost.exe"_s, u"StartMenuExperienceHost.exe"_s, u"ShellExperienceHost.exe"_s, u"ShellHost.exe"_s};
-    return window && flyouts.contains(programOf(window), Qt::CaseInsensitive);
+    return window && foreground::isShellFlyout(programOf(window));
 }
+
+QRect shellFlyoutBounds(HWND window)
+{
+    if (!isShellFlyout(window))
+        return {};
+    const auto visibleBounds = [](HWND candidate) -> QRect {
+        RECT rect {}, region {};
+        if (!::GetWindowRect(candidate, &rect))
+            return {};
+        // Immersive hosts can cover a monitor while their window region
+        // contains just Start and its sidebar. Region coordinates are local
+        // to the window; DWM frame/client bounds still describe the full host.
+        const int kind = ::GetWindowRgnBox(candidate, &region);
+        if (kind == NULLREGION)
+            return {};
+        if (kind == SIMPLEREGION || kind == COMPLEXREGION)
+            return {rect.left + region.left, rect.top + region.top,
+                region.right - region.left, region.bottom - region.top};
+        MONITORINFO monitor {sizeof monitor};
+        if (::GetMonitorInfoW(::MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST), &monitor)
+            && ::EqualRect(&rect, &monitor.rcWork))
+            return {}; // an unbounded transparent companion is not its content
+        return {rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top};
+    };
+    DWORD host = 0;
+    QRect bounds = visibleBounds(window);
+    RECT primary {};
+    if (!::GetWindowRect(window, &primary))
+        return {};
+    ::GetWindowThreadProcessId(window, &host);
+    // Start from the flyout's own Z-order list: desktop enumeration can omit
+    // immersive Shell windows in other display bands.
+    for (HWND candidate = ::GetWindow(window, GW_HWNDFIRST); candidate; candidate = ::GetWindow(candidate, GW_HWNDNEXT)) {
+        DWORD pid = 0, cloaked = 0;
+        ::GetWindowThreadProcessId(candidate, &pid);
+        if (pid != host || !::IsWindowVisible(candidate) || ::IsIconic(candidate))
+            continue;
+        if (SUCCEEDED(::DwmGetWindowAttribute(candidate, DWMWA_CLOAKED, &cloaked, sizeof cloaked)) && cloaked)
+            continue;
+        bounds = bounds.united(visibleBounds(candidate));
+    }
+    // Search can own the foreground while a Start-hosted sidebar is visible
+    // next to it. Its native root may span the whole screen, so using that
+    // root's full rectangle would incorrectly leave nowhere for our panel.
+    // Hit-test adjacent strips, then use the companion's actual window region.
+    const int gap = std::max(1, int(::GetDpiForWindow(window)) / 8);
+    for (const bool right : {false, true}) {
+        for (int row : {1, 2, 3}) {
+            const POINT point {right ? primary.right + gap : primary.left - gap,
+                primary.top + (primary.bottom - primary.top) * row / 4};
+            const HWND hit = ::GetAncestor(::WindowFromPoint(point), GA_ROOT);
+            if (!isShellFlyout(hit))
+                continue;
+            bounds = bounds.united(visibleBounds(hit));
+            break;
+        }
+    }
+    return bounds;
+}
+
+bool nativeWindowCorners()
+{
+    return !g_compositedPreview && QOperatingSystemVersion::current() >= QOperatingSystemVersion::Windows11;
+}
+
+void useCompositedFramesForPreview() { g_compositedPreview = true; }
 
 void styleFramelessWindow(QWindow* window, bool backdrop)
 {
     const HWND hwnd = handleOf(window);
     if (!hwnd)
         return;
+    // Retain a fixed native frame for DWM's border and shadow, while
+    // Qt/WindowFrame still own hit testing and resizing.
+    if (::SetWindowSubclass(hwnd, nativeFrameProc, 0, 0)) {
+        ::SetWindowLongPtrW(hwnd, GWL_STYLE, ::GetWindowLongPtrW(hwnd, GWL_STYLE) | WS_CAPTION);
+        ::SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    }
     setWindowCorners(hwnd);
-    ::DwmSetWindowAttribute(hwnd, kBorderColor, &kColorNone, sizeof kColorNone);
-    // A one-pixel frame extension makes DWM draw its shadow around a
-    // borderless window (and keeps working on Windows 10).
+    // Windows 10 draws no border here; the preview of it on Windows 11 neither.
+    constexpr COLORREF noBorder = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+    ::DwmSetWindowAttribute(hwnd, kBorderColor, g_compositedPreview ? &noBorder : &kColorDefault, sizeof kColorDefault);
+    // Extend a single pixel for DWM's shadow when the native frame/corner
+    // style supports it, without exposing the system's caption buttons.
     const MARGINS margins {0, 0, 1, 0};
     ::DwmExtendFrameIntoClientArea(hwnd, &margins);
     // The backdrop fills the whole window, frame extended or not; extended,
     // DWM would also draw its caption buttons on it, next to ours.
-    if (backdrop && backdropSupported())
-        ::DwmSetWindowAttribute(hwnd, kSystemBackdropType, &kBackdropMica, sizeof kBackdropMica);
+    if (backdrop && backdropSupported()) {
+        ::SetPropW(hwnd, kBackdropWindow, reinterpret_cast<HANDLE>(INT_PTR(1)));
+        applyBackdrop(hwnd);
+    } else {
+        ::RemovePropW(hwnd, kBackdropWindow);
+        ::DwmSetWindowAttribute(hwnd, kSystemBackdropType, &kBackdropNone, sizeof kBackdropNone);
+    }
+}
+
+void setBackdropMaterial(BackdropMaterial material)
+{
+    if (g_backdropMaterial.exchange(material) == material || !backdropSupported())
+        return;
+    ::EnumWindows([](HWND window, LPARAM) -> BOOL {
+        DWORD process = 0;
+        ::GetWindowThreadProcessId(window, &process);
+        if (process == ::GetCurrentProcessId() && ::GetPropW(window, kBackdropWindow))
+            applyBackdrop(window);
+        return TRUE;
+    }, 0);
+}
+
+bool backdropFrameActive(HWND window, bool active)
+{
+    return active || (g_backdropMaterial.load() == BackdropMaterial::Acrylic
+        && ::GetPropW(window, kBackdropWindow) && materialsEnabled());
 }
 
 void setDarkFrame(QWindow* window, bool dark)
@@ -237,7 +321,7 @@ bool setRoundedCorners(bool on)
 bool backdropSupported()
 {
     static const bool supported = QOperatingSystemVersion::current() >= QOperatingSystemVersion::Windows11_22H2;
-    return supported;
+    return nativeWindowCorners() && supported;
 }
 
 bool materialsEnabled()
@@ -261,7 +345,15 @@ void setCloaked(QWindow* window, bool cloaked)
     }
 }
 
-Front bringToFront(QWindow* window)
+void disableTransitions(QWindow* window)
+{
+    if (const HWND hwnd = handleOf(window)) {
+        const BOOL value = TRUE;
+        ::DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &value, sizeof value);
+    }
+}
+
+Front bringToFront(QWindow* window, ShellFlyout flyout)
 {
     const HWND hwnd = handleOf(window);
     if (!hwnd)
@@ -275,7 +367,8 @@ Front bringToFront(QWindow* window)
         ::ShowWindow(hwnd, SW_SHOW);
     if (::GetForegroundWindow() == hwnd)
         return Front::Already;
-    closeShellFlyout(::GetForegroundWindow());
+    if (flyout == ShellFlyout::Dismiss)
+        closeShellFlyout(::GetForegroundWindow());
     // Directly: Windows allows it to the process that got the latest input
     // (a hotkey, a click on its window or its tray icon) or that one let
     // (the UIAccess listener's AllowSetForegroundWindow, a command line's).

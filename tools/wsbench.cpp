@@ -1,6 +1,6 @@
 // Loads the saved index and reports memory use and search timings.
 //
-//   wsbench [snapshot] [--stats] [--check] [--top] [--prefer exe,bat] [query ...]
+//   wsbench [snapshot] [--stats] [--check] [--top] [--limit N] [--runs N] [--cancel-after MS] [--prefer exe,bat] [query ...]
 //                      --prefer: those file types first among comparable
 //                      matches (the launcher's 优先显示的文件类型);
 //                      --stats: how the entries and names are made up;
@@ -30,6 +30,24 @@
 //                      kind, tier, age and folder, within and over the size
 //                      limits (2/1/2/50 MB, and version 3's 16/2/4/100), and
 //                      what rules that defer some of them would take off
+//   wsbench [snapshot] --content-gather [--changes N,N...] [--runs N]
+//                      with a copy of the app's content index next to the
+//                      snapshot: what a content pass goes through to find its
+//                      work, every file or only what changed (Lookout), after
+//                      0, 1000 and 50000 changes made up in memory; time and
+//                      private working set brought back after emptying it,
+//                      both ways in turn, and whether both found the same
+//   wsbench [snapshot] --document-memory [--from MB] [--below N]
+//                      the documents a content search reads, by size; then
+//                      one of each size from MB (8) up and N (60) smaller
+//                      ones, each read in a WinShunExtract.exe of its own:
+//                      time, the most private memory it took, what it kept
+//   wsbench [snapshot] --document-pass
+//                      the content indexer's first pass, documents only, into
+//                      a content index of its own: how long it took, and the
+//                      extractors' private memory (summed, and the most one
+//                      took). WINSHUN_LARGE_DOCUMENT_MB=0: large documents
+//                      read with the others, to compare (WINSHUN_USER fixed)
 //   wsbench [snapshot] --content-index [--all] [--threads N] [--sample N] [--seed N] [--background]
 //                      [--read-only] [--no-add] [--merge-threads N] [--merge-times] [--dir D] [--keep] [--verify]
 //                      builds the content index of those files (without system
@@ -88,12 +106,19 @@
 //                      reads every document (through WinShunExtract.exe; copies
 //                      of one are not read again), then a content search for
 //                      each query, with places and snippets
-//   wsbench --service --content [--from D]
+//   wsbench --service --content [--from D] [--only P: ...] [--save-unsure D | --unsure]
 //                      (as administrator) as a first run: the index built, then
 //                      the content indexer reading every file a content search
 //                      looks in (the settings in WinShun.ini); how long it took;
 //                      --from: starting from a copy of an index folder D (the
-//                      first run after an upgrade); --box: the search box
+//                      first run after an upgrade); --only: those drives alone
+//                      (the others as excluded); --save-unsure D: then every
+//                      file to check, as after a lost journal, saved to D (a
+//                      --from D run starts with checking them); --unsure: then every file
+//                      checked again, as after a lost journal, and how long
+//                      that took (WINSHUN_BULK_CHECK=0: checked by path, not
+//                      from the MFT, to compare; WINSHUN_CHECK_SPINNING and
+//                      WINSHUN_CHECK_USER: as below, for that pass); --box: the search box
 //                      open from 20 s to 40 s into reading (nothing is read
 //                      then, nor 5 s after). WINSHUN_SPINNING=C:,D: counts
 //                      volumes as hard disks, WINSHUN_USER=present|away fixes
@@ -134,17 +159,35 @@
 //                      that name no app here, and the shortcuts that run
 //                      something else through a host program (cmd /k ...);
 //                      --all lists every app with its arguments and program
-//   wsbench --mcp-host [--pipe NAME] [--index FOLDER] [--plugins DIR]
+//   wsbench --mcp-host [--pipe NAME] [--index FOLDER] [--plugins DIR] [--history FILE] [--frozen]
 //                      serves Win顺's MCP tools (src/mcp) on a named pipe as
 //                      the app does, over a copy of the index files (made in
 //                      the temporary folder unless --index names a folder
 //                      with index.bin), for testing with real AI clients
-//                      (WinShunMcp.exe --pipe NAME) while the app runs; the
-//                      pipe's name defaults to the app's with ".bench" added.
+//                      (WinShunMcp.exe --pipe NAME) or ws while the app runs;
+//                      the pipe's name defaults to the app's with ".bench"
+//                      added. The ranking uses the app's history.txt (read
+//                      only), or FILE. --frozen: the index as the snapshot
+//                      has it, no disk read or walked (without administrator
+//                      rights the volumes cannot be opened, and walking every
+//                      disk instead takes minutes): for measuring searches.
 //                      With --plugins, the plugins of DIR (every one enabled,
 //                      actions allowed) are tools too, as the AI 助手 page's
 //                      switches would make them (plugin::AiBridge)
-//   wsbench --plugin FOLDER --query "TEXT" [--runs N] [--setting KEY=VALUE ...] [--action ID]
+//   wsbench --mcp-search [--index FOLDER] [--history FILE] [--runs N] [--limit A,B] [--sort S,T]
+//                      [--kind K] [--size] [QUERY ...]
+//                      what ws's name searches cost Win顺: search_files as
+//                      ws asks for it (ToolHost in this process, no pipe)
+//                      over a frozen copy of the index (or the one in
+//                      FOLDER), ranked with the app's history.txt (read
+//                      only) or FILE. For each query (report and a unless
+//                      given), sort (relevance) and limit (100,50000), N
+//                      runs (3): the time to the answer, the engine's part,
+//                      the access checks, the rest, the items, the answer's
+//                      MB and the process's peak commit so far (one query
+//                      at --limit 100,50000: the large limit should not
+//                      move it)
+//   wsbench --plugin FOLDER --query "TEXT" [--runs N] [--setting KEY=VALUE ...] [--action ID] [--app-dir DIR]
 //                      a plugin (src/plugin) as the app runs it: checks its
 //                      plugin.json, starts it through WinShunPluginHost.exe
 //                      (next to wsbench), prints the items of the first
@@ -155,7 +198,11 @@
 //                      gives the plugin a declared setting's value (what the
 //                      settings page would); --action runs that action on
 //                      the first item of the first answer and prints the
-//                      effects
+//                      effects. A plugin with `elevated`: what its start
+//                      comes to is printed (wsbench run as administrator
+//                      plays an elevated Win顺); --confirm-elevated first
+//                      confirms its files as the card's 确认 does
+//                      (%ProgramData%\WinShun\elevated-plugins)
 //   wsbench --plugin-index [URL-OR-FILE]
 //                      the 插件库's list (src/plugin/Gallery.h), from the
 //                      address or file given, else WINSHUN_PLUGIN_INDEX,
@@ -282,6 +329,7 @@
 #include <aclapi.h>
 #include <objbase.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <winioctl.h>
 
 #include <algorithm>
@@ -291,6 +339,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -507,7 +556,7 @@ std::map<std::u16string, std::uint8_t> subtree(const ws::FileIndex& index, ws::E
     while (!stack.empty()) {
         const ws::EntryId id = stack.back();
         stack.pop_back();
-        for (ws::EntryId c = index.entry(id).firstChild; c != ws::kNoEntry; c = index.entry(c).nextSibling) {
+        for (ws::EntryId c = index.entry(id).firstChild(); c != ws::kNoEntry; c = index.entry(c).nextSibling) {
             out.emplace(index.path16(c).substr(base.size()),
                 static_cast<std::uint8_t>(index.entry(c).flags & (ws::EntryFlag::Directory | ws::EntryFlag::Hidden)));
             stack.push_back(c);
@@ -1056,6 +1105,16 @@ int runServiceContent(const QStringList& args)
     settings.load();
     ws::IndexService::Options options;
     options.rules = settings.crawlRules();
+    // --only P: Q: ...: the other drives excluded whole (a test volume alone).
+    if (const qsizetype at = args.indexOf(u"--only"_s); at >= 0) {
+        QStringList only;
+        for (qsizetype i = at + 1; i < args.size() && !args[i].startsWith(u"--"_s); ++i)
+            only.append(args[i].left(2).toUpper());
+        for (const ws::VolumeInfo& v : ws::listLocalVolumes(true)) {
+            if (!only.contains(QString::fromStdWString(v.root).toUpper()))
+                options.rules.excludedPaths.push_back(v.root);
+        }
+    }
     options.content.enabled = true;
     options.content.extensions = settings.contentExtensions;
     options.content.documents = settings.contentDocuments;
@@ -1093,13 +1152,14 @@ int runServiceContent(const QStringList& args)
         double documentsMs = 0, othersMs = 0, bulkMs = 0; // when each last rose
     } phases;
     QTimer poll;
-    poll.setInterval(500);
+    poll.setInterval(100);
     QObject::connect(&poll, &QTimer::timeout, [&] {
         if (readyMs == 0 && service.state() == ws::IndexService::State::Ready && !service.isRefreshing()) {
             readyMs = msSince(t);
             std::printf("  %6.1f s  file index ready: %zu items\n", readyMs / 1000, service.itemCount());
         }
-        const bool reading = service.readingContent();
+        // A pass over before a poll saw it reading (files checked from the MFT, say) still counts.
+        const bool reading = service.readingContent() || (startedMs == 0 && service.contentIndexer()->progress().total > 0);
         if (reading && startedMs == 0) {
             startedMs = msSince(t);
             cpuAtStart = cpuTimes();
@@ -1159,7 +1219,7 @@ int runServiceContent(const QStringList& args)
     poll.start();
     QCoreApplication::exec();
     poll.stop();
-    const double doneMs = msSince(t) - 1000; // two polls ago
+    const double doneMs = msSince(t) - 2 * poll.interval(); // two polls ago
     const CpuTimes cpuAtEnd = cpuTimes();
     const ws::ContentIndex::Stats stats = service.contentIndex()->stats();
     const double contentS = (doneMs - startedMs) / 1000;
@@ -1178,13 +1238,72 @@ int runServiceContent(const QStringList& args)
     // The bulk way (ContentIndexer.h): how many files came off the volumes by
     // their records, and how many went the usual way and why.
     const ws::ContentIndexer::BulkStats bulk = service.contentIndexer()->bulkStats();
-    std::printf("bulk %zu sessions (%zu failed): %zu files, %.1f MB read by their records; %zu too large from the record; "
+    std::printf("bulk %zu sessions (%zu failed): %zu files, %.1f MB read by their records (at most %.1f MB waiting for a "
+                "reader); %zu too large from the record; "
                 "the usual way: %zu written lately, %zu without a folder record, %zu not found, %zu denied, %zu fallback "
                 "(compressed, encrypted, reparse points...)%s\n",
-        bulk.sessions, bulk.sessionsFailed, bulk.files, static_cast<double>(bulk.bytes) / 1048576.0, bulk.tooLarge, bulk.recent,
-        bulk.noRecord, bulk.notFound, bulk.denied, bulk.fallback,
+        bulk.sessions, bulk.sessionsFailed, bulk.files, static_cast<double>(bulk.bytes) / 1048576.0,
+        static_cast<double>(bulk.mostQueued) / 1048576.0, bulk.tooLarge, bulk.recent, bulk.noRecord, bulk.notFound, bulk.denied,
+        bulk.fallback,
         bulk.verified > 0 ? qPrintable(u"; WINSHUN_BULK_VERIFY: %1 read both ways, %2 DIFFER"_s.arg(bulk.verified).arg(bulk.verifyMismatches))
                           : "");
+    std::printf("checks: %zu files unchanged by their MFT records\n", bulk.confirmed);
+    const auto content = std::const_pointer_cast<ws::ContentIndex>(service.contentIndex());
+    const auto markUnsure = [&] {
+        const auto index = service.index();
+        const auto lock = index->readLock();
+        content->markUnsure([](ws::EntryId) { return true; });
+    };
+    // --save-unsure D: every document to check, saved to D for a --from run
+    // (the check pass after a restart, the disk's cache cold if it is attached again).
+    if (const qsizetype at = args.indexOf(u"--save-unsure"_s); at >= 0 && at + 1 < args.size()) {
+        markUnsure();
+        service.shutdown();
+        const QDir to(args[at + 1]);
+        to.mkpath(u"content"_s);
+        QFile::copy(QDir(dir.path()).filePath(u"index.bin"_s), to.filePath(u"index.bin"_s));
+        for (const QFileInfo& f : QDir(QDir(dir.path()).filePath(u"content"_s)).entryInfoList(QDir::Files))
+            QFile::copy(f.absoluteFilePath(), to.filePath(u"content/"_s + f.fileName()));
+        std::printf("saved to %s with %zu files to check\n", qPrintable(to.path()), content->stats().pending);
+        return 0;
+    }
+    if (args.contains(u"--unsure"_s)) {
+        // As after a lost journal (IndexService::contentUnsureOf): every
+        // document to check, a pass at once. WINSHUN_CHECK_SPINNING and
+        // WINSHUN_CHECK_USER: WINSHUN_SPINNING and WINSHUN_USER for that pass
+        // alone (the build before it can go at full speed).
+        for (const auto& [from, to] : {std::pair {"WINSHUN_CHECK_SPINNING", L"WINSHUN_SPINNING"},
+                 std::pair {"WINSHUN_CHECK_USER", L"WINSHUN_USER"}}) {
+            if (qEnvironmentVariableIsSet(from)) // read with GetEnvironmentVariableW
+                ::SetEnvironmentVariableW(to, qEnvironmentVariable(from).toStdWString().c_str());
+        }
+        markUnsure();
+        const std::size_t unsure = content->stats().pending;
+        const ws::ContentIndexer::BulkStats before = service.contentIndexer()->bulkStats();
+        QElapsedTimer check;
+        check.start();
+        service.contentIndexer()->volumesChanged();
+        bool began = false;
+        while (check.elapsed() < 600000) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            const bool reading = service.readingContent();
+            began = began || reading;
+            if (!reading && (began || content->stats().pending == 0))
+                break;
+        }
+        const ws::ContentIndexer::Progress p = service.contentIndexer()->progress();
+        const ws::ContentIndexer::BulkStats after = service.contentIndexer()->bulkStats();
+        const std::size_t confirmed = after.confirmed - before.confirmed;
+        std::printf("check pass (%s): %zu files to check, %zu done in %.1f s; %zu unchanged by their MFT records, %zu "
+                    "checked by path; %zu still to check%s\n",
+            ws::win32::userAway() ? "nobody at the computer" : "someone at the computer", unsure, p.done,
+            static_cast<double>(check.elapsed()) / 1000, confirmed, p.done - std::min(p.done, confirmed),
+            content->stats().pending,
+            after.verified > before.verified
+                ? qPrintable(u"; WINSHUN_BULK_VERIFY: %1 checked by path too, %2 DIFFER"_s.arg(after.verified - before.verified)
+                                 .arg(after.verifyMismatches - before.verifyMismatches))
+                : "");
+    }
     service.shutdown(); // saves the snapshot
     qint64 snapshot = 0;
     for (const QFileInfo& f : QDir(dir.path()).entryInfoList({u"*.bin"_s}, QDir::Files))
@@ -2434,6 +2553,401 @@ int runContentIndexBench(const ws::FileIndex& index, QStringList args)
     }
     if (!args.contains(u"--keep"_s))
         QDir(directory).removeRecursively();
+    return 0;
+}
+
+// ---- what a content pass looks at (--content-gather) -------------------------
+
+std::size_t privateWorkingSetBytes()
+{
+    PROCESS_MEMORY_COUNTERS_EX2 counters {};
+    counters.cb = sizeof(counters);
+    ::GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+    return counters.PrivateWorkingSetSize;
+}
+
+// From the snapshot and a copy of the app's content index next to it: what a
+// content pass goes through to find its work, every file (as passes did) or
+// what ContentIndexer::Lookout lists, after 0, 1000 and 50000 changes made up
+// on the index in memory (files added, renamed, removed, written to). For
+// each: the time and how much private working set the look brings back
+// after the process was emptied (IdleTrim), both ways in turn, and whether
+// both found the same. Default extensions and documents.
+int runContentGather(std::shared_ptr<ws::FileIndex> index, const std::vector<char>& attachment,
+    const QString& contentDir, const std::vector<ws::VolumeInfo>& volumeInfos,
+    const std::vector<ws::JournalPosition>& journals, const QStringList& args)
+{
+    using Indexer = ws::ContentIndexer;
+    constexpr double kMiB = 1024.0 * 1024.0;
+    int runs = 5;
+    if (const qsizetype at = args.indexOf(u"--runs"_s); at >= 0 && at + 1 < args.size())
+        runs = std::max(1, args[at + 1].toInt());
+    std::vector<std::size_t> scenarios {0, 1000, 50000};
+    if (const qsizetype at = args.indexOf(u"--changes"_s); at >= 0 && at + 1 < args.size()) {
+        scenarios.clear();
+        for (const QString& n : args[at + 1].split(u','))
+            scenarios.push_back(n.toULongLong());
+    }
+    ws::ContentIndex content(contentDir);
+    if (!content.restore(attachment, index->slotCount())) {
+        std::printf("no content index to restore from %s\n", qPrintable(contentDir));
+        return 1;
+    }
+    std::vector<Indexer::Volume> volumes;
+    for (std::size_t i = 0; i < volumeInfos.size() && i < journals.size(); ++i) {
+        if (journals[i].journalId != 0)
+            volumes.push_back({QString::fromStdWString(volumeInfos[i].root).toStdString(), false, volumeInfos[i].serial});
+    }
+    const ws::Settings defaults = ws::Settings::defaults();
+    Indexer::Options options;
+    options.extensions = defaults.contentExtensions;
+    options.documents = defaults.contentDocuments;
+    options.includeLowPriority = defaults.contentInLowPriority;
+    options.sizeLimits = defaults.contentSizeLimits();
+    const ws::ContentFilter filter {
+        ws::ExtensionFilter(options.documents ? options.extensions + ws::documentExtensions() : options.extensions),
+        options.includeLowPriority};
+    std::printf("content gather: %zu entries, %zu documents (%zu due), %zu volumes followed\n", index->liveCount(),
+        content.stats().documents, content.stats().pending, volumes.size());
+
+    Indexer::Lookout lookout;
+    const auto readLately = [](ws::EntryId) { return false; };
+    const auto planOf = [&](const std::vector<ws::EntryId>* only) {
+        const auto lock = index->longReadLock();
+        return Indexer::plan(*index, content, options, volumes, readLately, only);
+    };
+    // As a pass goes on: its documents retired, and its files read (empty
+    // documents: no file is opened, nothing written).
+    const auto passDone = [&](const Indexer::Plan& p) {
+        lookout.planned(p.work);
+        content.retire(p.retired);
+        for (const Indexer::Work& w : p.work)
+            content.add(w.entry, {}, true, 1, content.changeSequence());
+    };
+    {
+        QElapsedTimer t;
+        t.start();
+        const auto lock = index->longReadLock();
+        const Indexer::Lookout::Look look = lookout.next(index, content, options, volumes, std::chrono::steady_clock::now());
+        const Indexer::Plan first = Indexer::plan(*index, content, options, volumes, readLately);
+        std::printf("first pass (%s): %zu files to read or check, %zu documents retired, %.0f ms\n",
+            qPrintable(look.why), first.work.size(), first.retired.size(), msSince(t));
+        passDone(first);
+    }
+
+    struct Measured {
+        double ms;
+        double workingSetMB; // private, brought back
+        Indexer::Plan plan;
+    };
+    const auto measure = [&](const std::vector<ws::EntryId>* only) {
+        ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1), 0);
+        const std::size_t before = privateWorkingSetBytes();
+        QElapsedTimer t;
+        t.start();
+        Measured m {0, 0, planOf(only)};
+        m.ms = msSince(t);
+        m.workingSetMB = static_cast<double>(privateWorkingSetBytes()) / kMiB - static_cast<double>(before) / kMiB;
+        return m;
+    };
+    const auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    std::mt19937_64 random(20261105);
+    std::size_t named = 0;
+    const auto anyFile = [&](bool candidate) -> ws::EntryId {
+        for (int tries = 0; tries < 100000; ++tries) {
+            const auto id = static_cast<ws::EntryId>(random() % index->slotCount());
+            const ws::Entry& e = index->entry(id);
+            if (e.isDeleted() || e.isDir() || (e.flags & ws::EntryFlag::Remote))
+                continue;
+            if (!candidate || filter.accepts(*index, e))
+                return id;
+        }
+        return ws::kNoEntry;
+    };
+    int failures = 0;
+    std::printf("\n%8s %9s %9s | %-24s | %-24s | %s\n", "changes", "looked at", "list ms", "every file: ms, +MB",
+        "what changed: ms, +MB", "same");
+    for (const std::size_t changes : scenarios) {
+        std::vector<ws::EntryId> written;
+        {
+            auto lock = index->writeLock();
+            for (std::size_t c = 0; c < changes; ++c) {
+                const std::uint64_t what = random() % 100;
+                if (what < 50) { // saved, downloaded, unpacked: next to files a search looks in
+                    const ws::EntryId beside = anyFile(what < 40);
+                    static const char* const kinds[] = {"txt", "md", "docx", "pdf", "json", "png", "tmp"};
+                    if (beside != ws::kNoEntry) {
+                        const ws::EntryId folder = index->entry(beside).parent;
+                        index->add(folder,
+                            "wsbench-gather-" + std::to_string(++named) + "." + kinds[random() % std::size(kinds)],
+                            static_cast<std::uint8_t>(index->entry(folder).flags & ws::EntryFlag::Inherited));
+                    }
+                } else if (what < 65) { // renamed
+                    if (const ws::EntryId f = anyFile(false); f != ws::kNoEntry)
+                        index->move(f, index->entry(f).parent, "renamed-" + std::to_string(++named) + "-" + std::string(index->name(f)));
+                } else if (what < 80) { // removed
+                    if (const ws::EntryId f = anyFile(false); f != ws::kNoEntry)
+                        index->remove(f);
+                } else { // written to: its document is due
+                    if (const ws::EntryId f = anyFile(true); f != ws::kNoEntry)
+                        written.push_back(f);
+                }
+            }
+        }
+        content.markChanged(written);
+        QElapsedTimer t;
+        t.start();
+        Indexer::Lookout::Look look;
+        {
+            const auto lock = index->longReadLock();
+            look = lookout.next(index, content, options, volumes, std::chrono::steady_clock::now());
+        }
+        const double listMs = msSince(t);
+        std::vector<double> allMs, allMB, onlyMs, onlyMB;
+        Indexer::Plan all;
+        Indexer::Plan only;
+        for (int run = 0; run < runs; ++run) {
+            for (int way = 0; way < 2; ++way) {
+                const bool everyFile = (way == 0) == (run % 2 == 0); // in turn: which goes first
+                if (look.everyFile && !everyFile)
+                    continue;
+                Measured m = measure(everyFile ? nullptr : &look.files);
+                (everyFile ? allMs : onlyMs).push_back(m.ms);
+                (everyFile ? allMB : onlyMB).push_back(m.workingSetMB);
+                (everyFile ? all : only) = std::move(m.plan);
+            }
+        }
+        const bool same = look.everyFile || (only.work == all.work && only.retired == all.retired);
+        failures += same ? 0 : 1;
+        std::printf("%8zu %9zu %9.1f | %8.1f ms %+8.1f MB    | %8.1f ms %+8.1f MB    | %s (%zu files, %zu retired)%s\n",
+            changes, look.everyFile ? index->liveCount() : look.files.size(), listMs, median(allMs), median(allMB),
+            onlyMs.empty() ? 0.0 : median(onlyMs), onlyMB.empty() ? 0.0 : median(onlyMB),
+            look.everyFile ? "every file" : same ? "yes" : "NO", all.work.size(), all.retired.size(),
+            look.everyFile ? qPrintable(u" why: "_s + look.why) : "");
+        passDone(all);
+    }
+    return failures;
+}
+
+// ---- documents' memory by size (--document-memory) -----------------------------
+
+// The extractor processes this one started (WinShunExtract.exe): private
+// bytes now, summed, and the highest any of them reached.
+struct ExtractorMemory {
+    double nowMB = 0; // summed
+    double peakMB = 0; // the largest peak of one
+    int processes = 0;
+};
+ExtractorMemory extractorMemory()
+{
+    ExtractorMemory out;
+    const ws::win32::UniqueHandle snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot.valid())
+        return out;
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof entry;
+    for (BOOL more = ::Process32FirstW(snapshot.get(), &entry); more; more = ::Process32NextW(snapshot.get(), &entry)) {
+        if (entry.th32ParentProcessID != ::GetCurrentProcessId() || ::_wcsicmp(entry.szExeFile, L"WinShunExtract.exe") != 0)
+            continue;
+        const ws::win32::UniqueHandle process(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID));
+        PROCESS_MEMORY_COUNTERS_EX counters {};
+        counters.cb = sizeof counters;
+        if (!process.valid()
+            || !::GetProcessMemoryInfo(process.get(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof counters))
+            continue;
+        out.nowMB += static_cast<double>(counters.PrivateUsage) / (1024.0 * 1024.0);
+        out.peakMB = std::max(out.peakMB, static_cast<double>(counters.PeakPagefileUsage) / (1024.0 * 1024.0));
+        ++out.processes;
+    }
+    return out;
+}
+
+// The documents a content search reads (within the default size limit), by
+// size: how many, how many MB, of how many sizes (copies, which have the
+// same, are read once). Then those of at least --from MB (8) and --below N
+// (60) smaller ones, one size each, read one at a time, each in a
+// WinShunExtract.exe of its own: how long, the most private memory the
+// process took, and what it kept once done (an idle process is used again).
+int runDocumentMemory(const ws::FileIndex& index, const QStringList& args)
+{
+    constexpr double kMiB = 1024.0 * 1024.0;
+    double fromMB = 8;
+    int below = 60;
+    if (const qsizetype at = args.indexOf(u"--from"_s); at >= 0 && at + 1 < args.size())
+        fromMB = args[at + 1].toDouble();
+    if (const qsizetype at = args.indexOf(u"--below"_s); at >= 0 && at + 1 < args.size())
+        below = args[at + 1].toInt();
+    const ws::Settings defaults = ws::Settings::defaults();
+    const ws::ContentFilter filter {ws::ExtensionFilter(defaults.contentExtensions + ws::documentExtensions()), false};
+    const ws::ExtensionFilter documents(ws::documentExtensions());
+    const std::int64_t limit = defaults.contentSizeLimits().bytes[ws::ContentSizeLimits::Document];
+    struct Doc {
+        ws::EntryId id;
+        std::uint64_t bytes;
+    };
+    std::vector<Doc> docs;
+    for (std::size_t i = 0; i < index.slotCount(); ++i) {
+        const auto id = static_cast<ws::EntryId>(i);
+        const ws::Entry& e = index.entry(id);
+        if (!filter.accepts(index, e) || !documents.matches(index.name(e), index.extLength(e)))
+            continue;
+        const std::uint64_t bytes = ws::unpackSize(index.size(id));
+        if (bytes > 0 && static_cast<std::int64_t>(bytes) <= limit)
+            docs.push_back({id, bytes});
+    }
+    const std::vector<double> edges {0, 1, 4, 8, 12, 16, 24, 32, 50.01};
+    const auto bucketOf = [&](std::uint64_t bytes) {
+        const double mb = static_cast<double>(bytes) / kMiB;
+        std::size_t b = 0;
+        while (b + 2 < edges.size() && mb >= edges[b + 1])
+            ++b;
+        return b;
+    };
+    std::printf("%zu documents within %.0f MB\n%10s %8s %10s %8s\n", docs.size(), static_cast<double>(limit) / kMiB,
+        "MB", "files", "MB", "sizes");
+    std::vector<std::set<std::uint64_t>> sizes(edges.size() - 1);
+    std::vector<std::size_t> counts(edges.size() - 1);
+    std::vector<double> mbs(edges.size() - 1);
+    for (const Doc& d : docs) {
+        const std::size_t b = bucketOf(d.bytes);
+        ++counts[b];
+        mbs[b] += static_cast<double>(d.bytes) / kMiB;
+        sizes[b].insert(d.bytes);
+    }
+    for (std::size_t b = 0; b + 1 < edges.size(); ++b)
+        std::printf("%4.0f-%-5.0f %8zu %10.0f %8zu\n", edges[b], edges[b + 1], counts[b], mbs[b], sizes[b].size());
+
+    // One file of each size: those from fromMB up, and `below` smaller ones at random.
+    std::vector<Doc> sample;
+    std::set<std::uint64_t> taken;
+    std::vector<Doc> smaller;
+    for (const Doc& d : docs) {
+        if (!taken.insert(d.bytes).second)
+            continue;
+        (static_cast<double>(d.bytes) / kMiB >= fromMB ? sample : smaller).push_back(d);
+    }
+    std::shuffle(smaller.begin(), smaller.end(), std::mt19937_64(20261105));
+    smaller.resize(std::min(smaller.size(), static_cast<std::size_t>(std::max(0, below))));
+    sample.insert(sample.end(), smaller.begin(), smaller.end());
+    std::sort(sample.begin(), sample.end(), [](const Doc& a, const Doc& b) { return a.bytes < b.bytes; });
+
+    struct Read {
+        std::uint64_t bytes;
+        double ms;
+        double peakMB;
+        double keptMB;
+        bool ok;
+        ws::EntryId id;
+    };
+    std::vector<Read> reads;
+    ws::DocExtractor extractor(1, ws::DocExtractor::Priority::Normal);
+    for (const Doc& d : sample) {
+        const std::wstring path = index.wpath(d.id);
+        QElapsedTimer t;
+        t.start();
+        const ws::DocExtractor::Result result = extractor.extractFile(path, limit, {});
+        const double ms = msSince(t);
+        const ExtractorMemory memory = extractorMemory(); // the process is idle now, not ended
+        extractor.closeIdle(); // the next in a fresh one
+        if (result.retry || memory.processes == 0)
+            continue; // not read (gone, a cloud file, no process)
+        reads.push_back({d.bytes, ms, memory.peakMB, memory.nowMB, result.status == ws::extractproto::Status::Ok, d.id});
+    }
+    std::printf("\nread one at a time, each in a process of its own: %zu files\n", reads.size());
+    std::printf("%10s %6s %5s %10s %9s %9s %9s %9s %9s\n", "MB", "files", "ok", "time s", "ms med", "peak med",
+        "peak max", "kept med", "kept max");
+    for (std::size_t b = 0; b + 1 < edges.size(); ++b) {
+        std::vector<double> ms, peak, kept;
+        int ok = 0;
+        for (const Read& r : reads) {
+            if (bucketOf(r.bytes) != b)
+                continue;
+            ms.push_back(r.ms);
+            peak.push_back(r.peakMB);
+            kept.push_back(r.keptMB);
+            ok += r.ok;
+        }
+        if (ms.empty())
+            continue;
+        const auto med = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+        std::printf("%4.0f-%-5.0f %6zu %5d %10.1f %9.0f %9.0f %9.0f %9.0f %9.0f\n", edges[b], edges[b + 1], ms.size(), ok,
+            std::accumulate(ms.begin(), ms.end(), 0.0) / 1000, med(ms), med(peak),
+            *std::max_element(peak.begin(), peak.end()), med(kept), *std::max_element(kept.begin(), kept.end()));
+    }
+    std::sort(reads.begin(), reads.end(), [](const Read& a, const Read& b) { return a.peakMB > b.peakMB; });
+    std::printf("\nthe most memory:\n");
+    for (std::size_t i = 0; i < std::min<std::size_t>(12, reads.size()); ++i) {
+        std::printf("  %7.0f MB peak, %6.0f MB kept, %7.1f MB file, %7.0f ms  %s\n", reads[i].peakMB, reads[i].keptMB,
+            static_cast<double>(reads[i].bytes) / kMiB, reads[i].ms,
+            QFileInfo(index.path(reads[i].id)).suffix().toUtf8().constData());
+    }
+    return 0;
+}
+
+// As a first run of the content index, documents only (the snapshot's
+// volumes followed; a content index of its own, in a temporary folder next to
+// the snapshot): how long the pass took, and the extractor processes' private
+// memory, summed (every 100 ms) and the most one of them took.
+// WINSHUN_LARGE_DOCUMENT_MB=0 reads large documents with the others, to
+// compare; WINSHUN_USER=away|present fixes how many are read at once.
+int runDocumentPass(std::shared_ptr<ws::FileIndex> index, const std::vector<ws::VolumeInfo>& volumeInfos,
+    const std::vector<ws::JournalPosition>& journals, const QString& folder)
+{
+    using namespace std::chrono_literals;
+    QTemporaryDir dir(folder + u"/document-pass-XXXXXX"_s);
+    if (!dir.isValid())
+        return 1;
+    std::vector<ws::ContentIndexer::Volume> volumes;
+    for (std::size_t i = 0; i < volumeInfos.size() && i < journals.size(); ++i) {
+        if (journals[i].journalId != 0)
+            volumes.push_back({QString::fromStdWString(volumeInfos[i].root).toStdString(), false, volumeInfos[i].serial});
+    }
+    ws::ContentIndexer::Source source;
+    source.index = [&] { return index; };
+    source.volumes = [&] { return volumes; };
+    source.ready = [] { return true; };
+    ws::ContentIndexer::Options options;
+    options.extensions = {}; // documents only
+    options.documents = true;
+    options.sizeLimits = ws::Settings::defaults().contentSizeLimits();
+    auto content = std::make_shared<ws::ContentIndex>(dir.filePath(u"content"_s));
+    QElapsedTimer t;
+    t.start();
+    double sumMB = 0;
+    double oneMB = 0;
+    int most = 0;
+    std::size_t total = 0;
+    std::size_t copies = 0;
+    {
+        ws::ContentIndexer indexer(content, source, options, {0ms, 0ms, 1h, 0ms, 30s});
+        bool begun = false;
+        while (t.elapsed() < 3'600'000) {
+            std::this_thread::sleep_for(100ms);
+            const ExtractorMemory m = extractorMemory();
+            sumMB = std::max(sumMB, m.nowMB);
+            oneMB = std::max(oneMB, m.peakMB);
+            most = std::max(most, m.processes);
+            if (indexer.reading()) {
+                begun = true;
+                total = std::max(total, indexer.progress().total);
+            } else if (begun) {
+                break;
+            }
+        }
+        copies = indexer.copies();
+    }
+    const QString large = qEnvironmentVariable("WINSHUN_LARGE_DOCUMENT_MB", u"16"_s);
+    const QString user = qEnvironmentVariable("WINSHUN_USER", u"-"_s);
+    std::printf("documents %zu (%zu copies), large from %s MB, user %s: %.1f s; extractors at most %d at once, "
+                "%.0f MB together at most, %.0f MB the most one took\n",
+        total, copies, qPrintable(large), qPrintable(user), static_cast<double>(t.elapsed()) / 1000, most, sumMB, oneMB);
     return 0;
 }
 
@@ -4390,8 +4904,19 @@ int runPlugin(QStringList args)
         actionId = args[at + 1];
         args.remove(at, 2);
     }
+    QString appDir; // --app-dir DIR: WS_APP_DIR, a deployed Win顺 whose Qt the plugin may use (winshun.capture)
+    if (const qsizetype at = args.indexOf(u"--app-dir"_s); at >= 0 && at + 1 < args.size()) {
+        appDir = QDir(args[at + 1]).absolutePath();
+        args.remove(at, 2);
+    }
+    const bool confirmElevated = args.removeAll(u"--confirm-elevated"_s) > 0;
+    int lingerMs = 0; // --linger MS: keep the plugin running that long after the action (what a resident one shows)
+    if (const qsizetype at = args.indexOf(u"--linger"_s); at >= 0 && at + 1 < args.size()) {
+        lingerMs = std::max(0, args[at + 1].toInt());
+        args.remove(at, 2);
+    }
     if (folder.isEmpty() || query.isEmpty()) {
-        std::printf("usage: wsbench --plugin FOLDER --query \"TEXT\" [--runs N] [--setting KEY=VALUE ...] [--action ID]\n");
+        std::printf("usage: wsbench --plugin FOLDER --query \"TEXT\" [--runs N] [--setting KEY=VALUE ...] [--action ID [--linger MS]] [--app-dir DIR]\n");
         return 1;
     }
     const QFileInfo info(folder);
@@ -4421,12 +4946,25 @@ int runPlugin(QStringList args)
     options.bundledPluginDir = info.absolutePath();
     options.dataRoot = temp.path() + u"/data"_s;
     options.runnerExe = QCoreApplication::applicationDirPath() + u"/WinShunPluginHost.exe"_s;
+    options.appDir = appDir;
     options.version = QStringLiteral(WINSHUN_VERSION "-bench");
     ws::plugin::Host host(options);
     host.setEnabled(manifest->id, true);
     if (!pluginSettings.isEmpty())
         host.setPluginSettings(manifest->id, pluginSettings);
     QObject::connect(&host, &ws::plugin::Host::logged, [](const QString& line) { std::printf("  log: %s\n", qUtf8Printable(line)); });
+    if (manifest->permissions.has(ws::plugin::Permission::Elevated)) {
+        std::printf("elevated: Win顺 here %s\n", host.hostElevated() ? "is elevated" : "is not elevated");
+        if (confirmElevated) {
+            QString why;
+            const bool confirmed = host.confirmElevation(manifest->id, &why);
+            std::printf("elevated: confirm %s %s\n", confirmed ? "ok" : "failed:", qUtf8Printable(why));
+        }
+        const ws::plugin::Host::ElevationState state = host.elevationState(manifest->id);
+        const QString verdict = ws::plugin::elevation::verdictName(state.verdict);
+        std::printf("elevated: verdict %s%s%s\n", verdict.isEmpty() ? "not-elevated-host" : qUtf8Printable(verdict),
+            state.detail.isEmpty() ? "" : " - ", qUtf8Printable(state.detail));
+    }
     QObject::connect(&host, &ws::plugin::Host::queryFailed, [](std::uint64_t id, const QString&, const QString& why) {
         std::printf("  query %llu failed: %s\n", static_cast<unsigned long long>(id), qUtf8Printable(why));
     });
@@ -4561,6 +5099,9 @@ int runPlugin(QStringList args)
                 std::printf("action: no answer in 15 s\n");
                 actionOk = false;
             }
+            const QDeadlineTimer linger(lingerMs);
+            while (!linger.hasExpired())
+                QCoreApplication::processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents, 50);
         }
     }
     host.shutdown();
@@ -4633,6 +5174,24 @@ int runLauncherSim(QStringList args)
         keyMs = std::max(0, args[at + 1].toInt());
         args.remove(at, 2);
     }
+    // HARNESS (ocr-in-search investigation): --ocr-data DIR = a copy of a plugin data folder
+    // (put in as winshun.ocr-search.data), --walk DIR = index only this folder (repeatable),
+    // --content on|off = filters.contentEnabled as the launcher sends it (default on).
+    QString ocrData;
+    QStringList walk;
+    bool contentFilter = true;
+    if (const qsizetype at = args.indexOf(u"--ocr-data"_s); at >= 0 && at + 1 < args.size()) {
+        ocrData = args[at + 1];
+        args.remove(at, 2);
+    }
+    for (qsizetype at = args.indexOf(u"--walk"_s); at >= 0 && at + 1 < args.size(); at = args.indexOf(u"--walk"_s)) {
+        walk.append(QDir::toNativeSeparators(args[at + 1]));
+        args.remove(at, 2);
+    }
+    if (const qsizetype at = args.indexOf(u"--content"_s); at >= 0 && at + 1 < args.size()) {
+        contentFilter = args[at + 1] == u"on"_s;
+        args.remove(at, 2);
+    }
     ws::Settings settings;
     settings.load();
     // --web KEYWORD: a [WebSearch] entry for this run (the user's file is not
@@ -4694,6 +5253,12 @@ int runLauncherSim(QStringList args)
     options.logPath = temp.path() + u"/plugins.log"_s;
     options.runnerExe = QCoreApplication::applicationDirPath() + u"/WinShunPluginHost.exe"_s;
     options.version = QStringLiteral(WINSHUN_VERSION "-bench");
+    if (!ocrData.isEmpty()) {
+        const QString to = options.dataRoot + u"/winshun.ocr-search.data"_s;
+        QDir().mkpath(to);
+        for (const QFileInfo& file : QDir(ocrData).entryInfoList(QDir::Files))
+            QFile::copy(file.filePath(), to + u'/' + file.fileName());
+    }
     ws::plugin::Host host(options);
     for (const QString& id : ids)
         host.setEnabled(id, true);
@@ -4711,8 +5276,18 @@ int runLauncherSim(QStringList args)
     // The index and the catalogs, as the app has them.
     ws::IndexService::Options indexOptions;
     indexOptions.rules = settings.crawlRules();
-    indexOptions.rescanOnStartup = false;
+    indexOptions.rescanOnStartup = !walk.isEmpty();
     indexOptions.content.enabled = false;
+    if (!walk.isEmpty()) {
+        std::vector<std::wstring> folders;
+        for (const QString& w : walk)
+            folders.push_back(w.toStdWString());
+        indexOptions.folders = folders;
+        indexOptions.volumeAccess = std::make_shared<ws::ntfs::NoVolumeAccess>();
+        indexOptions.rules = {}; // the user's rules skip AppData, where the fixtures are
+        indexOptions.rescanDelayMs = 0;
+        indexOptions.folderVerifyCheckMs = 200;
+    }
     ws::IndexService service(indexFolder, indexOptions);
     ws::AppCatalog apps;
     ws::SystemCatalog places;
@@ -4726,7 +5301,8 @@ int runLauncherSim(QStringList args)
     bool placesIn = false;
     QObject::connect(&apps, &ws::AppCatalog::changed, [&] { appsIn = true; });
     QObject::connect(&places, &ws::SystemCatalog::changed, [&] { placesIn = true; });
-    while ((service.state() != ws::IndexService::State::Ready || !appsIn || !placesIn) && ready.elapsed() < 60'000)
+    while ((service.state() != ws::IndexService::State::Ready || !appsIn || !placesIn || (!walk.isEmpty() && service.itemCount() < 40))
+        && ready.elapsed() < 60'000)
         QCoreApplication::processEvents(QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents, 50);
     std::printf("index %s (%zu items), apps %s, places %s, after %.0f ms\n\n",
         service.state() == ws::IndexService::State::Ready ? "ready" : "NOT READY", service.itemCount(), appsIn ? "in" : "NOT IN",
@@ -4815,9 +5391,14 @@ int runLauncherSim(QStringList args)
             requestId = 0;
             namesIn = true;
         }
-        if (withPlugins)
-            host.query(text, ws::Scope::All, queryId);
-        else
+        if (withPlugins) {
+            QJsonObject filters;
+            if (contentFilter) { // what Launcher::pluginFilters sends in 全部 with the content switch on
+                filters.insert(u"contentEnabled"_s, !trimmed.isEmpty());
+                filters.insert(u"contentWords"_s, text);
+            }
+            host.query(text, ws::Scope::All, queryId, filters);
+        } else
             host.cancelAll();
         return !keywordPlugin.isEmpty();
     };
@@ -5099,6 +5680,12 @@ int runMcpHost(QStringList args)
         pluginsDir = QDir(args[at + 1]).absolutePath();
         args.remove(at, 2);
     }
+    QString historyFile;
+    if (const qsizetype at = args.indexOf(u"--history"_s); at >= 0 && at + 1 < args.size()) {
+        historyFile = args[at + 1];
+        args.remove(at, 2);
+    }
+    const bool frozen = args.removeAll(u"--frozen"_s) > 0;
     ws::Settings settings;
     settings.load();
     QTemporaryDir temp;
@@ -5126,11 +5713,25 @@ int runMcpHost(QStringList args)
     options.content.extensions = settings.contentExtensions;
     options.content.documents = settings.contentDocuments;
     options.content.sizeLimits = settings.contentSizeLimits();
+    if (frozen) {
+        // No way to the volumes, and waited for all the while: the passes
+        // neither catch up nor walk (IndexService::awaitAccess).
+        options.volumeAccess = std::make_shared<ws::ntfs::NoVolumeAccess>();
+        options.accessWaitMs = std::numeric_limits<int>::max();
+    }
     ws::IndexService service(indexFolder, options);
+    // Two engines, as the app's host has: content searches on their own.
     ws::SearchEngine engine(&service);
+    ws::SearchEngine contentEngine(&service);
+    // The ranking with the app's history, as the app's host ranks (read
+    // only: never recorded or saved here).
+    ws::History history(historyFile.isEmpty() ? ws::Settings::dataDir() + u"\\history.txt"_s : historyFile);
+    history.load();
     ws::mcp::Services services;
     services.index = &service;
     services.engine = &engine;
+    services.contentEngine = &contentEngine;
+    services.history = [&history] { return history.items(); };
     services.version = QStringLiteral(WINSHUN_VERSION "-bench");
     services.log = [](const QString& line) {
         std::printf("%s\n", qUtf8Printable(line));
@@ -5214,6 +5815,148 @@ int runMcpHost(QStringList args)
     return 0;
 }
 
+// ---- search_files as ws asks for it (--mcp-search) -------------------------------
+
+// What ws's name searches cost Win顺, in this process and without a pipe:
+// ToolHost's search_files with ws's options (CallOptions cli and encode, the
+// default token) over a frozen copy of the index, ranked with the app's
+// history as the app's host ranks. For each query, sort and limit, N runs:
+// the time from the call to its answer, the engine's part (elapsed_ms), the
+// access checks (how many, and how long the call waited for them, as its
+// log line says), the rest (the items made, the JSON), the items returned,
+// the bytes of the answer and the process's peak commit so far (a run after
+// a larger one shows the larger one's). The first run of a query meets the
+// folders' security descriptors as they are; repeat it for the warm ones.
+int runMcpSearch(QStringList args)
+{
+    const auto take = [&](const QString& flag) {
+        QString value;
+        if (const qsizetype at = args.indexOf(flag); at >= 0 && at + 1 < args.size()) {
+            value = args[at + 1];
+            args.remove(at, 2);
+        }
+        return value;
+    };
+    QString indexFolder = take(u"--index"_s);
+    const QString historyFile = take(u"--history"_s);
+    const QString runsArg = take(u"--runs"_s);
+    const int runs = runsArg.isEmpty() ? 3 : std::max(1, runsArg.toInt());
+    QList<int> limits {100, 50'000};
+    if (const QString list = take(u"--limit"_s); !list.isEmpty()) {
+        limits.clear();
+        for (const QString& n : list.split(u',', Qt::SkipEmptyParts))
+            limits.push_back(n.toInt());
+    }
+    QStringList sorts {u"relevance"_s};
+    if (const QString list = take(u"--sort"_s); !list.isEmpty())
+        sorts = list.split(u',', Qt::SkipEmptyParts);
+    QString kind = take(u"--kind"_s);
+    if (kind.isEmpty())
+        kind = u"all"_s;
+    const bool sizes = args.removeAll(u"--size"_s) > 0;
+    QStringList queries = args;
+    if (queries.isEmpty())
+        queries = {u"report"_s, u"a"_s};
+
+    ws::Settings settings;
+    settings.load();
+    QTemporaryDir temp;
+    if (indexFolder.isEmpty()) {
+        const QString from = QDir::fromNativeSeparators(settings.indexDir());
+        indexFolder = temp.path();
+        if (!QFile::copy(from + u"/index.bin"_s, indexFolder + u"/index.bin"_s)) {
+            std::printf("no index at %s\n", qUtf8Printable(QDir::toNativeSeparators(from)));
+            return 1;
+        }
+    }
+    ws::IndexService::Options options;
+    options.rules = settings.crawlRules();
+    options.rescanOnStartup = false;
+    options.content.enabled = false;
+    // The index as the snapshot has it: no volume read, no walk (--frozen).
+    options.volumeAccess = std::make_shared<ws::ntfs::NoVolumeAccess>();
+    options.accessWaitMs = std::numeric_limits<int>::max();
+    ws::IndexService service(indexFolder, options);
+    ws::SearchEngine engine(&service);
+    ws::History history(historyFile.isEmpty() ? ws::Settings::dataDir() + u"\\history.txt"_s : historyFile);
+    history.load();
+    QStringList logged;
+    ws::mcp::Services services;
+    services.index = &service;
+    services.engine = &engine;
+    services.history = [&history] { return history.items(); };
+    services.version = QStringLiteral(WINSHUN_VERSION "-bench");
+    services.log = [&logged](const QString& line) { logged.push_back(line); };
+    ws::mcp::ToolHost host(std::move(services));
+    ws::mcp::Policy policy;
+    policy.kindOrder = settings.foldersFirst ? ws::KindOrder::FoldersFirst : ws::KindOrder::FilesFirst;
+    policy.excludedPaths = settings.mcpExcludedPaths;
+    policy.excludedTypes = settings.excludedTypes;
+    host.setPolicy(policy);
+
+    QElapsedTimer loadTimer;
+    loadTimer.start();
+    service.start();
+    while (service.state() != ws::IndexService::State::Ready && loadTimer.elapsed() < 120'000) {
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+    if (service.state() != ws::IndexService::State::Ready) {
+        std::printf("the index did not load\n");
+        return 1;
+    }
+    std::printf("index: %zu items, loaded in %.0f ms; history: %lld items; size: %s\n", service.itemCount(),
+        msSince(loadTimer), static_cast<long long>(history.items().size()), sizes ? "read" : "not read");
+    std::printf("%-12s %-9s %6s %3s %9s %9s %16s %9s %7s %8s %9s\n", "query", "sort", "limit", "run", "total ms",
+        "engine", "checks (ms)", "rest ms", "items", "MB", "commit MB");
+    std::fflush(stdout);
+
+    std::uint64_t id = 0;
+    for (const QString& query : std::as_const(queries)) {
+        for (const QString& sort : std::as_const(sorts)) {
+            for (const int limit : std::as_const(limits)) {
+                for (int run = 1; run <= runs; ++run) {
+                    const QJsonObject arguments {{u"query"_s, query}, {u"limit"_s, limit}, {u"size"_s, sizes},
+                        {u"kind"_s, kind}, {u"sort"_s, sort}};
+                    std::optional<ws::mcp::ToolResult> answer;
+                    QEventLoop loop;
+                    QElapsedTimer timer;
+                    timer.start();
+                    host.call(++id, u"ws"_s, u"search_files"_s, arguments,
+                        [&](ws::mcp::ToolResult result) {
+                            answer = std::move(result);
+                            loop.quit();
+                        },
+                        {nullptr, true, true});
+                    if (!answer)
+                        loop.exec();
+                    const double total = msSince(timer);
+                    const QJsonObject structured
+                        = QJsonDocument::fromJson(answer->encoded).object().value(u"structuredContent"_s).toObject();
+                    // "... (N access checks, X ms)" at the end of the call's line
+                    QString checks = u"-"_s;
+                    double checkMs = 0;
+                    static const QRegularExpression counted(u"\\((\\d+) access checks, ([0-9.]+) ms\\)"_s);
+                    if (const QRegularExpressionMatch m = counted.match(logged.isEmpty() ? QString() : logged.last());
+                        m.hasMatch()) {
+                        checkMs = m.captured(2).toDouble();
+                        checks = u"%1 (%2)"_s.arg(m.captured(1), m.captured(2));
+                    }
+                    const double engineMs = structured.value(u"elapsed_ms"_s).toDouble();
+                    std::printf("%-12s %-9s %6d %3d %9.1f %9.1f %16s %9.1f %7d %8.2f %9.0f\n", qUtf8Printable(query),
+                        qUtf8Printable(sort), limit, run, total, engineMs, qUtf8Printable(checks),
+                        total - engineMs - checkMs, structured.value(u"returned"_s).toInt(),
+                        static_cast<double>(answer->encoded.size()) / (1 << 20), peakCommitMB());
+                    std::fflush(stdout);
+                }
+            }
+        }
+    }
+    service.shutdown();
+    return 0;
+}
+
 // ---- winshun.semantic end to end (--semantic) ------------------------------------
 
 // The 按意思找 plugin as the app runs it, over a copy of the index (and the
@@ -5230,7 +5973,8 @@ int runSemantic(QStringList args)
             pluginSettings.insert(pair.left(eq), pair.mid(eq + 1));
         args.remove(at, 2);
     }
-    QString pluginsDir = QCoreApplication::applicationDirPath() + u"/plugins"_s;
+    // From the plugin library, not with Win顺 (GitHub #138): the build stages it there.
+    QString pluginsDir = QCoreApplication::applicationDirPath() + u"/library-plugins"_s;
     if (const qsizetype at = args.indexOf(u"--plugins"_s); at >= 0 && at + 1 < args.size()) {
         pluginsDir = QDir(args[at + 1]).absolutePath();
         args.remove(at, 2);
@@ -5470,7 +6214,8 @@ std::optional<gallery::Index> loadGallery(const QString& source)
 {
     QElapsedTimer t;
     t.start();
-    const gallery::Fetched f = gallery::fetch(source, gallery::kMaxIndexBytes + 1, webFetch);
+    const gallery::Fetched f = gallery::fetch(source, gallery::kMaxIndexBytes + 1, webFetch, {},
+        [&](const QByteArray& bytes) { return bytes.size() <= gallery::kMaxIndexBytes && gallery::parse(bytes, source, nullptr).has_value(); });
     std::printf("list: %s\n  HTTP %d (error %lu), %lld bytes, %.0f ms\n", qUtf8Printable(source), f.status, f.error,
         static_cast<long long>(f.body.size()), msSince(t));
     if (f.status != 200)
@@ -5584,7 +6329,8 @@ int runPluginInstallFromIndex(QStringList args)
         ++reports;
         return stopAfter < 0 || received < stopAfter;
     };
-    const gallery::Fetched f = gallery::fetch(item->url, item->size + 1, webFetch, progress);
+    const gallery::Fetched f = gallery::fetch(item->url, item->size + 1, webFetch, progress,
+        [&](const QByteArray& bytes) { return gallery::check(*item, bytes) == gallery::Problem::None; });
     std::printf("package: %s\n  HTTP %d (error %lu%s), %lld bytes, %.0f ms, %d progress report(s)\n", qUtf8Printable(item->url), f.status, f.error,
         f.error == ERROR_CANCELLED ? ": stopped" : "", static_cast<long long>(f.body.size()), msSince(t), reports);
     if (f.status != 200)
@@ -5926,6 +6672,10 @@ int main(int argc, char* argv[])
         args.removeAll(u"--mcp-host"_s);
         return runMcpHost(args);
     }
+    if (args.contains(u"--mcp-search"_s)) {
+        args.removeAll(u"--mcp-search"_s);
+        return runMcpSearch(args);
+    }
     if (args.contains(u"--launcher-sim"_s)) {
         args.removeAll(u"--launcher-sim"_s);
         return runLauncherSim(args);
@@ -6124,6 +6874,16 @@ int main(int argc, char* argv[])
 
     if (args.contains(u"--content-plan"_s))
         return runContentPlan(*index);
+    if (args.contains(u"--document-memory"_s))
+        return runDocumentMemory(*index, args);
+    if (args.contains(u"--document-pass"_s)) {
+        return runDocumentPass(std::shared_ptr<ws::FileIndex>(std::move(contents->index)), contents->volumes,
+            contents->journals, QFileInfo(path).absolutePath());
+    }
+    if (args.contains(u"--content-gather"_s)) {
+        return runContentGather(std::shared_ptr<ws::FileIndex>(std::move(contents->index)), contents->attachment,
+            QFileInfo(path).absolutePath() + u"/content"_s, contents->volumes, contents->journals, args);
+    }
     if (args.contains(u"--content"_s))
         return runContentBench(*index, args);
     if (args.contains(u"--content-index"_s))
@@ -6210,6 +6970,34 @@ int main(int argc, char* argv[])
     const bool trim = args.removeAll(u"--trim"_s) > 0;
     // ... with FileIndex::warm() in between, as the launcher does when shown.
     const bool warm = args.removeAll(u"--warm"_s) > 0;
+    std::size_t limit = 100;
+    int runs = 5;
+    for (const QString& flag : {u"--limit"_s, u"--runs"_s}) {
+        const qsizetype at = args.indexOf(flag);
+        if (at < 0)
+            continue;
+        bool valid = false;
+        const qulonglong value = at + 1 < args.size() ? args[at + 1].toULongLong(&valid) : 0;
+        if (!valid || value == 0 || value > (flag == u"--runs" ? 1000ULL : 50'000'000ULL)) {
+            std::fprintf(stderr, "invalid %s\n", qPrintable(flag));
+            return 1;
+        }
+        if (flag == u"--limit")
+            limit = static_cast<std::size_t>(value);
+        else
+            runs = static_cast<int>(value);
+        args.remove(at, 2);
+    }
+    int cancelAfterMs = -1;
+    if (const qsizetype at = args.indexOf(u"--cancel-after"_s); at >= 0) {
+        bool valid = false;
+        cancelAfterMs = at + 1 < args.size() ? args[at + 1].toInt(&valid) : -1;
+        if (!valid || cancelAfterMs < 0 || cancelAfterMs > 60'000) {
+            std::fprintf(stderr, "invalid --cancel-after\n");
+            return 1;
+        }
+        args.remove(at, 2);
+    }
     // --order name|path|size|modified, a - after it for descending: the search
     // panel's column orders (SortKey) in place of the rank.
     ws::SortOrder order;
@@ -6246,9 +7034,12 @@ int main(int argc, char* argv[])
         const ws::ParsedQuery parsed = ws::parseQuery(q);
         const ws::NameMatcher matcher(parsed);
         const ws::NameSearchOptions options {
-            .limit = 100, .filter = parsed.filter, .order = order, .preferred = ws::PreferredTypes(preferred)};
+            .limit = limit, .filter = parsed.filter, .order = order, .preferred = ws::PreferredTypes(preferred)};
         double best = 1e9;
+        std::vector<double> timings;
         ws::NameSearchOutput out;
+        const std::function<bool()> isCancelled = cancelAfterMs < 0 ? std::function<bool()>()
+            : [&] { return timer.nsecsElapsed() >= static_cast<qint64>(cancelAfterMs) * 1'000'000; };
         if (trim) {
             timer.restart();
             ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1), 0);
@@ -6263,17 +7054,27 @@ int main(int argc, char* argv[])
                 warmMs = static_cast<double>(timer.nsecsElapsed()) / 1e6;
             }
             timer.restart();
-            out = ws::searchNames(*index, matcher, options, pool, {});
+            out = ws::searchNames(*index, matcher, options, pool, isCancelled);
             std::printf("%-16s trim %.1f ms (working set %.1f MB), warm %.1f ms, search after: %6.1f ms\n",
                 qPrintable(q), trimMs, trimmedMB, warmMs, static_cast<double>(timer.nsecsElapsed()) / 1e6);
         }
-        for (int run = 0; run < 5; ++run) {
+        for (int run = 0; run < runs; ++run) {
             timer.restart();
-            out = ws::searchNames(*index, matcher, options, pool, {});
-            best = std::min(best, static_cast<double>(timer.nsecsElapsed()) / 1e6);
+            out = ws::searchNames(*index, matcher, options, pool, isCancelled);
+            timings.push_back(static_cast<double>(timer.nsecsElapsed()) / 1e6);
+            best = std::min(best, timings.back());
         }
+        std::sort(timings.begin(), timings.end());
         std::printf("%-16s %9zu matches  %6.1f ms   top: %s\n", qPrintable(q), out.totalMatches, best,
             out.hits.empty() ? "-" : qPrintable(index->path(out.hits.front().id)));
+        std::uint64_t fingerprint = 14695981039346656037ull;
+        for (const ws::NameHit& hit : out.hits)
+            fingerprint = (fingerprint ^ hit.id) * 1099511628211ull;
+        std::printf("  median %.3f ms, returned %zu, capacity %zu, ids %016llx, private %.1f MB, peak %.1f MB\n",
+            timings[timings.size() / 2], out.hits.size(), out.hits.capacity(),
+            static_cast<unsigned long long>(fingerprint), privateMB(), peakCommitMB());
+        if (cancelAfterMs >= 0)
+            std::printf("  cancellation after %d ms: %s\n", cancelAfterMs, out.cancelled ? "observed" : "search completed first");
         if (!inside.isEmpty()) {
             const ws::EntryId folder = index->findPath(inside.toStdWString());
             const auto timed = [&](const ws::NameMatcher& m, const ws::NameSearchOptions& o, ws::NameSearchOutput& result) {
@@ -6303,7 +7104,7 @@ int main(int argc, char* argv[])
                 qPrintable(inside), firstMs, static_cast<long long>(std::ranges::count_if(firstOut.hits, &ws::NameHit::inside)),
                 firstOut.hits.size(), onlyMs, onlyOut.totalMatches, typedMs, typedOut.totalMatches);
         }
-        if (check) {
+        if (check && !out.cancelled) {
             // Every entry through the matcher, as before names were tested first: the same matches?
             std::size_t brute = 0;
             ws::NameMatcher::Folders seen;

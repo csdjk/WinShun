@@ -1,12 +1,16 @@
 #include "PluginSettings.h"
+#include "PluginReadme.h"
+#include "WebSearchConfig.h"
 
 #include "AiBridge.h"
 #include "Catalog.h"
 #include "FileIconProvider.h"
 #include "Host.h"
+#include "PluginUpdates.h"
 #include "Secrets.h"
 #include "Settings.h"
 #include "SettingsEditor.h"
+#include "Updates.h"
 #include "platform/Shell.h"
 
 #include <QCoreApplication>
@@ -21,21 +25,23 @@
 #include <QJsonDocument>
 #include <QLocale>
 #include <QRegularExpression>
+#include <QScopeGuard>
+#include <QPointer>
 #include <QStyleHints>
+#include <QThreadPool>
 #include <QUrl>
 
 #include <windows.h>
 #include <psapi.h>
 
 #include <algorithm>
+#include <utility>
 
 using namespace Qt::StringLiterals;
 
 namespace ws {
 
 namespace {
-
-constexpr auto kConfirmedNone = u"none"; // Confirmed= of a plugin that asks for no permission
 
 bool darkMode()
 {
@@ -123,10 +129,15 @@ QVariant PluginListModel::data(const QModelIndex& index, int role) const
     case PermissionsRole: return c.permissions;
     case SettingsRole: return c.settings;
     case HasReadmeRole: return c.hasReadme;
+    case SettingsWindowRole: return c.settingsWindow;
+    case WebSearchRole: return c.webSearch;
     case HasDataRole: return c.hasData;
     case AiExposeRole: return c.aiExpose;
     case AiEnabledRole: return c.aiEnabled;
     case AiNoteRole: return c.aiNote;
+    case ElevationRole: return c.elevation;
+    case ElevationNoteRole: return c.elevationNote;
+    case ElevationProblemRole: return c.elevationProblem;
     }
     return {};
 }
@@ -136,8 +147,9 @@ QHash<int, QByteArray> PluginListModel::roleNames() const
     return {{IdRole, "pluginId"}, {NameRole, "name"}, {VersionRole, "version"}, {AuthorRole, "author"}, {HomepageRole, "homepage"},
         {DescriptionRole, "description"}, {BundledRole, "bundled"}, {IconRole, "icon"}, {EnabledRole, "pluginEnabled"}, {UsableRole, "usable"},
         {StatusRole, "status"}, {ToneRole, "tone"}, {ErrorRole, "error"}, {ResidentRole, "resident"}, {KeywordsRole, "keywords"},
-        {PermissionsRole, "permissions"}, {SettingsRole, "settings"}, {HasReadmeRole, "hasReadme"}, {HasDataRole, "hasData"},
-        {AiExposeRole, "aiExpose"}, {AiEnabledRole, "aiEnabled"}, {AiNoteRole, "aiNote"}};
+        {PermissionsRole, "permissions"}, {SettingsRole, "settings"}, {HasReadmeRole, "hasReadme"}, {SettingsWindowRole, "settingsWindow"}, {HasDataRole, "hasData"},
+        {AiExposeRole, "aiExpose"}, {AiEnabledRole, "aiEnabled"}, {AiNoteRole, "aiNote"}, {WebSearchRole, "webSearch"},
+        {ElevationRole, "elevation"}, {ElevationNoteRole, "elevationNote"}, {ElevationProblemRole, "elevationProblem"}};
 }
 
 bool PluginListModel::setCards(std::vector<Card> cards)
@@ -295,6 +307,20 @@ PluginSettings::~PluginSettings()
 {
     if (m_pendingInstall)
         plugin::install::discard(*m_pendingInstall);
+    releaseClaim();
+}
+
+void PluginSettings::setUpdates(PluginUpdates* updates)
+{
+    m_updates = updates;
+    m_gallery.setUpdates(updates);
+}
+
+void PluginSettings::releaseClaim()
+{
+    if (!m_installClaim.isEmpty() && m_updates)
+        m_updates->release(m_installClaim);
+    m_installClaim.clear();
 }
 
 void PluginSettings::setHost(plugin::Host* host)
@@ -410,6 +436,21 @@ void PluginSettings::clearMessage()
     setMessage({});
 }
 
+void PluginSettings::setRecoveryState(const QString& message, bool busy)
+{
+    if (m_recoveryMessage == message && m_recovering == busy)
+        return;
+    m_recoveryMessage = message;
+    m_recovering = busy;
+    emit recoveryChanged();
+}
+
+void PluginSettings::retryRecovery()
+{
+    if (!m_recovering && !m_recoveryMessage.isEmpty())
+        emit recoveryRequested();
+}
+
 QString PluginSettings::permissionsNote() const
 {
     return tr("这些由 Windows 强制：不是管理员、内存上限、子进程、剪贴板、窗口。这些只是插件自己的说明，Win顺 挡不住：联网、开端口、读哪些文件、写哪些文件（严格沙箱的插件除外）。只安装你信得过来源的插件。");
@@ -419,14 +460,16 @@ QString PluginSettings::permissionsNote() const
 // (the plugin design, §3.3). The first row is what every plugin gets.
 QVariantList PluginSettings::permissionRows(const QString& id) const
 {
+    const plugin::Entry* e = m_host ? m_host->catalog().find(id) : nullptr;
+    return e && e->manifest ? permissionRows(*e->manifest) : QVariantList();
+}
+
+QVariantList PluginSettings::permissionRows(const plugin::Manifest& m) const
+{
     QVariantList rows;
     const auto row = [&](const QString& name, const QString& text, bool enforced, const QString& note = {}) {
         rows.push_back(QVariantMap {{u"name"_s, name}, {u"text"_s, text}, {u"enforced"_s, enforced}, {u"note"_s, note}});
     };
-    const plugin::Entry* e = m_host ? m_host->catalog().find(id) : nullptr;
-    if (!e || !e->manifest)
-        return rows;
-    const plugin::Manifest& m = *e->manifest;
     const bool strict = m.runtime && m.runtime->sandbox == plugin::SandboxLevel::Strict;
     // What every plugin gets, as it is: a zero-code one runs no program of
     // its own (Win顺 does what its manifest says, as the user); a strict
@@ -436,9 +479,16 @@ QVariantList PluginSettings::permissionRows(const QString& id) const
         row(QString(), tr("不运行自己的程序：Win顺 按它的清单打开网址、程序或文件夹，用你的普通权限，不是管理员"), true);
     else if (strict)
         row(QString(), tr("在严格沙箱里运行：低完整性，不是管理员，写不了你的文件（只能写它自己的数据文件夹）；内存上限 %1 MB").arg(m.runtime->memoryMB), true);
+    else if (m.permissions.has(plugin::Permission::Elevated))
+        row(QString(), tr("以普通用户权限运行；Win顺 以管理员身份运行时例外（见下）；内存上限 %1 MB").arg(m.runtime->memoryMB), true);
     else
         row(QString(), tr("以普通用户权限运行，不是管理员；内存上限 %1 MB").arg(m.runtime->memoryMB), true);
     using P = plugin::Permission;
+    // First: what matters most. Only from the copy the user confirmed while
+    // Win顺 was elevated (plugin::elevation), never with a UAC prompt.
+    if (m.permissions.has(P::Elevated))
+        row(u"elevated"_s, permissionText(P::Elevated), true,
+            tr("Win顺 以管理员身份运行时，这个插件也以管理员身份运行，能操作以管理员身份打开的窗口"));
     if (m.permissions.has(P::Processes))
         row(u"processes"_s, permissionText(P::Processes), true);
     if (m.permissions.has(P::ClipboardRead))
@@ -467,6 +517,8 @@ QVariantList PluginSettings::permissionRows(const QString& id) const
             tr("Win顺 不能阻止它开端口"));
     if (m.permissions.has(P::Notifications))
         row(u"notifications"_s, permissionText(P::Notifications), true, tr("经 Win顺 弹出，每 2 秒最多一条"));
+    if (m.permissions.has(P::SystemSettings))
+        row(u"system:settings"_s, permissionText(P::SystemSettings), false, tr("以普通用户权限更改；Win顺 不能阻止它直接改系统设置"));
     return rows;
 }
 
@@ -487,6 +539,8 @@ QString PluginSettings::permissionText(plugin::Permission p)
     case P::Network: return tr("联网");
     case P::NetworkListen: return tr("在局域网上开端口，让别的设备连进来");
     case P::Notifications: return tr("弹出系统通知");
+    case P::SystemSettings: return tr("更改 Windows 系统设置（主题、无线电、音量、资源管理器、保持唤醒）");
+    case P::Elevated: return tr("跟随 Win顺 的管理员权限");
     }
     return plugin::permissionName(p);
 }
@@ -504,7 +558,7 @@ PluginListModel::Card PluginSettings::cardFor(const QString& id) const
     const plugin::Host::State state = m_host->state(id);
     const bool dark = darkMode();
     c.bundled = e->source == plugin::Entry::Source::Bundled;
-    c.hasReadme = QFileInfo::exists(e->dir + u"\\README.md"_s) || QFileInfo::exists(e->dir + u"\\README.txt"_s);
+    c.hasReadme = readme::exists(e->dir);
     c.hasData = QFileInfo::exists(QDir(m_dataRoot).filePath(id + u".data"_s));
     c.enabled = config && config->enabled;
     if (!e->manifest) {
@@ -534,7 +588,7 @@ PluginListModel::Card PluginSettings::cardFor(const QString& id) const
     if (c.aiExpose) {
         const QStringList tools = plugin::AiBridge::toolNamesOf(m, settings.mcpPluginActions);
         if (!settings.mcp)
-            c.aiNote = tr("AI 助手页的“允许 AI 连接”关着");
+            c.aiNote = tr("AI 助手页的“允许 AI 助手和命令行连接”关着");
         else if (!settings.mcpPlugins)
             c.aiNote = tr("AI 助手页的“AI 可以使用插件”关着，打开后才成为工具");
         else if (!c.aiEnabled)
@@ -546,12 +600,14 @@ PluginListModel::Card PluginSettings::cardFor(const QString& id) const
     }
     c.description = m.description.pick(m_locale);
     c.resident = m.resident();
+    c.settingsWindow = m.settingsWindow || m.webSearch;
+    c.webSearch = m.webSearch;
     // The manifest's icon, else its first command's (as the rows and the
     // chip in the scope tabs fall back), else the puzzle piece.
     QString icon = m.icon;
     if (icon.isEmpty() && !m.commands.isEmpty())
         icon = m.commands.first().icon;
-    c.icon = FileIconProvider::pluginIconUrl(id, icon.isEmpty() ? u"glyph:U+EA86"_s : icon, dark);
+    c.icon = FileIconProvider::pluginIconUrl(id, icon.isEmpty() ? (m.webSearch ? u"glyph:U+E774"_s : u"glyph:U+EA86"_s) : icon, dark);
 
     using Status = plugin::Host::State::Status;
     QString memory;
@@ -652,6 +708,39 @@ PluginListModel::Card PluginSettings::cardFor(const QString& id) const
     }
     c.permissions = permissionRows(id);
 
+    // `elevated`, while Win顺 runs as administrator and the plugin is on:
+    // whether it runs so, or why not and what one click does about it.
+    if (m.permissions.has(plugin::Permission::Elevated) && c.enabled && c.usable && m_host->hostElevated()) {
+        using V = plugin::elevation::Verdict;
+        const plugin::Host::ElevationState elevation = m_host->elevationState(id);
+        c.elevation = plugin::elevation::verdictName(elevation.verdict);
+        switch (elevation.verdict) {
+        case V::Elevated:
+            c.elevationNote = tr("以管理员身份运行");
+            break;
+        case V::Unconfirmed:
+            c.elevationNote = tr("要以管理员身份运行，需要你确认一次。确认前用普通权限运行");
+            break;
+        case V::Changed:
+            // Plain words, nothing taken from the files (their version is
+            // anyone's to write): who changed them is not known.
+            c.elevationNote = tr("插件的文件被改过，和你确认时不一样，现在用普通权限运行。不确定是谁改的就别确认");
+            break;
+        case V::Unavailable:
+            c.elevationNote = tr("不能以管理员身份运行：%1").arg(elevation.detail);
+            break;
+        case V::NotAsked:
+        case V::HostNotElevated:
+            break;
+        }
+        if (m_confirming.contains(id)) {
+            c.elevation = u"confirming"_s;
+            c.elevationNote = tr("正在确认，复制插件的文件……");
+        } else if (elevation.verdict != V::Elevated) {
+            c.elevationProblem = confirmProblem(id, m.version);
+        }
+    }
+
     // The declared settings and their values (a password's: whether one is kept).
     const QJsonObject values = m_host->pluginSettings(id);
     for (const plugin::Setting& s : m.settings) {
@@ -682,7 +771,11 @@ PluginListModel::Card PluginSettings::cardFor(const QString& id) const
 void PluginSettings::rebuild()
 {
     if (m_preview) {
-        if (m_list.setCards(m_preview->cards))
+        std::vector<PluginListModel::Card> cards = m_preview->cards;
+        for (PluginListModel::Card& c : cards)
+            if (c.elevation != u"elevated")
+                c.elevationProblem = m_confirmProblems.value(c.id).text;
+        if (m_list.setCards(std::move(cards)))
             emit listChanged();
         return;
     }
@@ -723,6 +816,31 @@ void PluginSettings::readMemory()
         running = running || m_host->state(e.id).status == plugin::Host::State::Status::Running;
     if (running)
         rebuild();
+}
+
+QStringList PluginSettings::searchTerms(int row) const
+{
+    const auto* card = m_list.card(m_list.data(m_list.index(row, 0), PluginListModel::IdRole).toString());
+    if (!card)
+        return {};
+    QStringList terms {card->name};
+    for (const auto& value : card->keywords) {
+        const auto keyword = value.toMap();
+        terms << keyword.value(u"title"_s).toString() << keyword.value(u"keyword"_s).toString();
+    }
+    for (const auto& value : card->settings)
+        terms << value.toMap().value(u"title"_s).toString();
+    if (card->aiExpose)
+        terms << tr("给 AI 用");
+    if (card->webSearch && m_editor) {
+        terms << QCoreApplication::translate("SettingsWindow", "关键词")
+              << QCoreApplication::translate("SettingsWindow", "网页搜索建议");
+        for (const auto& shortcut : m_editor->m_settings.webShortcuts)
+            terms << shortcut.name << shortcut.keyword << displayWebUrl(shortcut.url);
+    }
+    terms.removeAll(QString());
+    terms.removeDuplicates();
+    return terms;
 }
 
 // ---- the switch, keywords, settings ----------------------------------------------
@@ -780,12 +898,86 @@ void PluginSettings::confirmEnable(const QString& id)
     const plugin::Entry* e = m_host->catalog().find(id);
     if (!e || !e->manifest)
         return;
+    const bool elevated = e->manifest->permissions.has(plugin::Permission::Elevated) && m_host->hostElevated();
     PluginConfig& config = m_editor->m_settings.pluginConfig(id);
     config.enabled = true;
-    config.confirmed = e->manifest->permissions.names();
-    if (config.confirmed.isEmpty())
-        config.confirmed = {QString(kConfirmedNone)};
+    config.confirmed = plugin::updates::confirmedFor(*e->manifest);
     m_editor->commit();
+    // Said yes to in an elevated Win顺, `elevated` among what was asked: the
+    // copy to run as administrator is made now (meanwhile it runs with
+    // normal rights).
+    if (elevated)
+        confirmElevation(id);
+}
+
+void PluginSettings::confirmElevation(const QString& id)
+{
+    if (m_preview) { // the sample's 确认 is refused, as a folder that is a link is (GitHub #230)
+        finishConfirm(id, false, u"插件文件夹是一个链接（%1），不能以管理员身份运行"_s.arg(m_userDir + u'\\' + id));
+        return;
+    }
+    if (!m_host || m_confirming.contains(id))
+        return;
+    const plugin::Entry* e = m_host->catalog().find(id);
+    if (!e || !e->manifest || !e->manifest->permissions.has(plugin::Permission::Elevated) || !m_host->hostElevated())
+        return;
+    // A plugin of the library (the signed list has it): confirmed from its
+    // package, whose files must be the ones installed; never from a folder
+    // that may have been changed since. Others (installed by hand, in
+    // development): their folder as it is now.
+    const std::optional<plugin::gallery::Item> item = m_updates ? m_updates->signedItem(id) : std::nullopt;
+    if (item && item->version != e->manifest->version) {
+        setConfirmProblem(id, tr("插件库里现在是 %1 版，先把它更新到这一版，再确认").arg(item->version));
+        rebuild();
+        return;
+    }
+    m_confirmProblems.remove(id);
+    m_confirming.insert(id);
+    rebuild();
+    const plugin::elevation::Store store = m_host->elevationStore();
+    const QString dir = e->dir;
+    const plugin::gallery::Fetcher web = m_updates ? m_updates->web() : plugin::gallery::Fetcher {};
+    QThreadPool::globalInstance()->start([self = QPointer(this), id, store, dir, item, web] {
+        QString error;
+        bool ok = false;
+        if (item) {
+            const plugin::gallery::Fetched f = plugin::gallery::fetch(item->url, item->size + 1, web, {},
+                [&](const QByteArray& b) { return plugin::gallery::check(*item, b) == plugin::gallery::Problem::None; });
+            if (f.status != 200 || f.error != 0 || plugin::gallery::check(*item, f.body) != plugin::gallery::Problem::None)
+                error = tr("从插件库下载没成功，联网后再试");
+            else
+                ok = plugin::elevation::confirmPackage(store, id, dir, f.body, &error);
+        } else
+            ok = plugin::elevation::confirmFolder(store, id, dir, &error);
+        QMetaObject::invokeMethod(qApp, [self, id, ok, error] {
+            if (self)
+                self->finishConfirm(id, ok, error);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void PluginSettings::finishConfirm(const QString& id, bool ok, const QString& error)
+{
+    m_confirming.remove(id);
+    // Said on the card that was clicked (its shield, or why not and the
+    // button again), not over the cards, out of sight and pushing them down.
+    if (ok && m_host)
+        m_host->elevationConfirmed(id);
+    else
+        setConfirmProblem(id, error.isEmpty() ? tr("没能确认，再试一次") : tr("没能确认：%1").arg(error));
+    rebuild();
+}
+
+void PluginSettings::setConfirmProblem(const QString& id, const QString& text)
+{
+    const plugin::Entry* e = m_host ? m_host->catalog().find(id) : nullptr;
+    m_confirmProblems.insert(id, {e && e->manifest ? e->manifest->version : QString(), text});
+}
+
+QString PluginSettings::confirmProblem(const QString& id, const QString& version) const
+{
+    const auto it = m_confirmProblems.constFind(id);
+    return it != m_confirmProblems.cend() && it->version == version ? it->text : QString();
 }
 
 void PluginSettings::setAiEnabled(const QString& id, bool on)
@@ -895,7 +1087,7 @@ void PluginSettings::install(const QString& given)
     installFrom(given, {}, {});
 }
 
-void PluginSettings::installFrom(const QString& given, const QString& expectedId, const QString& name)
+void PluginSettings::installFrom(const QString& given, const QString& expectedId, const QString& name, bool enableAfterInstall, bool unreviewed)
 {
     if (!m_host)
         return;
@@ -918,15 +1110,51 @@ void PluginSettings::installFrom(const QString& given, const QString& expectedId
         setMessage(tr("没有安装 %1：下载来的是另一个插件（%2）").arg(name.isEmpty() ? expectedId : name, id));
         return;
     }
+    if (m_updates) { // not while the background is changing it
+        if (!m_updates->claim(id)) {
+            plugin::install::discard(*candidate);
+            setMessage(tr("正在后台更新这个插件，稍后再试"));
+            return;
+        }
+        m_installClaim = id;
+    }
     if (const plugin::Entry* e = m_host->catalog().find(id); e && e->source == plugin::Entry::Source::User && e->manifest) {
         const int compared = plugin::compareVersions(candidate->manifest->version, e->manifest->version);
         QVariantMap info {{u"id"_s, id}, {u"name"_s, candidate->manifest->name.pick(m_locale)}, {u"installedVersion"_s, e->manifest->version},
             {u"newVersion"_s, candidate->manifest->version}, {u"downgrade"_s, compared < 0}, {u"same"_s, compared == 0}};
+        info.insert(u"unreviewed"_s, unreviewed);
+        info.insert(u"homepage"_s, candidate->manifest->homepage);
+        info.insert(u"sourceAvailable"_s, readme::webLink(candidate->manifest->homepage));
+        // On, and the new version wants a yes to more: one question, 更新并允许 (the old version runs on if it is declined).
+        const PluginConfig* config = m_editor->m_settings.plugin(id);
+        const QStringList more = compared > 0
+            ? plugin::updates::permissionsToAllow(*candidate->manifest, config && config->enabled, config ? config->confirmed : QStringList())
+            : QStringList();
+        if (!more.isEmpty()) {
+            info.insert(u"allow"_s, true);
+            info.insert(u"more"_s, true);
+            info.insert(u"newNames"_s, more);
+            info.insert(u"permissions"_s, permissionRows(*candidate->manifest));
+        }
+        m_pendingAllow = !more.isEmpty();
+        m_pendingFromLibrary = !expectedId.isEmpty();
         m_pendingInstall = std::move(candidate);
+        m_pendingEnable = enableAfterInstall;
         emit installQuestion(info);
         return;
     }
-    finishInstall(std::move(*candidate));
+    if (unreviewed) {
+        const auto& manifest = *candidate->manifest;
+        const QVariantMap info {{u"id"_s, id}, {u"name"_s, manifest.name.pick(m_locale)}, {u"newVersion"_s, manifest.version},
+            {u"newInstall"_s, true}, {u"unreviewed"_s, true}, {u"homepage"_s, manifest.homepage},
+            {u"sourceAvailable"_s, readme::webLink(manifest.homepage)}};
+        m_pendingFromLibrary = !expectedId.isEmpty();
+        m_pendingInstall = std::move(candidate);
+        m_pendingEnable = enableAfterInstall;
+        emit installQuestion(info);
+        return;
+    }
+    finishInstall(std::move(*candidate), enableAfterInstall);
 }
 
 void PluginSettings::confirmInstall()
@@ -935,40 +1163,50 @@ void PluginSettings::confirmInstall()
         return;
     plugin::install::Candidate candidate = std::move(*m_pendingInstall);
     m_pendingInstall.reset();
-    finishInstall(std::move(candidate));
+    finishInstall(std::move(candidate), std::exchange(m_pendingEnable, false), std::exchange(m_pendingAllow, false));
+}
+
+void PluginSettings::declineInstall()
+{
+    // The dialog's no to 更新并允许: the old version was never stopped; this version stops being counted and told of.
+    if (m_pendingInstall && m_pendingAllow && m_pendingFromLibrary && m_updates)
+        m_updates->dismiss(m_pendingInstall->manifest->id, m_pendingInstall->manifest->version);
+    cancelInstall();
 }
 
 void PluginSettings::cancelInstall()
 {
+    releaseClaim();
     if (!m_pendingInstall)
         return;
     plugin::install::discard(*m_pendingInstall);
     m_pendingInstall.reset();
+    m_pendingEnable = false;
+    m_pendingAllow = false;
+    m_pendingFromLibrary = false;
 }
 
-void PluginSettings::finishInstall(plugin::install::Candidate candidate)
+void PluginSettings::finishInstall(plugin::install::Candidate candidate, bool enableAfterInstall, bool allow)
 {
+    const auto releaseIt = qScopeGuard([this] { releaseClaim(); });
     if (!m_host)
         return;
     const QString id = candidate.manifest->id;
     const QString name = candidate.manifest->name.pick(m_locale);
-    m_host->stop(id); // its program, if running, lets go of its folder
-    // A moment for the process to leave (shutdown is asked for, then the job ends it).
-    const QDeadlineTimer deadline(2500);
-    while (!deadline.hasExpired()) {
-        const plugin::Host::State::Status s = m_host->state(id).status;
-        if (s != plugin::Host::State::Status::Running && s != plugin::Host::State::Status::Starting)
-            break;
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-    }
-    QString error;
-    const QString placed = plugin::install::place(candidate, m_userDir, &error);
-    plugin::install::discard(candidate);
-    if (placed.isEmpty()) {
+    const QString error = plugin::updates::replace(*m_host, candidate, m_userDir);
+    if (!error.isEmpty()) {
         setMessage(tr("没有安装 %1：%2").arg(name, error));
         return;
     }
     m_host->catalog().scan();
+    if (m_updates)
+        m_updates->forget(id); // what was kept for the old version (after the scan: the new one is what is judged)
+    if (allow) { // the yes was given with the question: on as before, and allowed what the new version names
+        confirmEnable(id);
+        setMessage(tr("已安装 %1 %2").arg(name, candidate.manifest->version));
+        rebuild();
+        return;
+    }
     // Installed, and off until the user turns it on (the permissions are
     // shown then); a version put over one that is on and asking for more
     // waits for the user's OK (Catalog::setConfirmed), its switch asking.
@@ -979,6 +1217,54 @@ void PluginSettings::finishInstall(plugin::install::Candidate candidate)
     else
         setMessage(config && config->enabled ? tr("已安装 %1 %2").arg(name, version) : tr("已安装 %1 %2，打开它的开关就能用").arg(name, version));
     rebuild();
+    if (enableAfterInstall)
+        setEnabled(id, true); // the normal permission dialog still applies
+}
+
+QString PluginSettings::installUpdate(const QString& path, const QString& id, const QString& version)
+{
+    if (!m_host)
+        return tr("这个插件已经不在了");
+    std::optional<plugin::install::Candidate> candidate = plugin::install::inspect(path);
+    if (!candidate)
+        return tr("找不到下载的文件");
+    if (!candidate->manifest) {
+        const QString why = candidate->error;
+        plugin::install::discard(*candidate);
+        return why;
+    }
+    const plugin::Entry* e = m_host->catalog().find(id);
+    if (!e || e->source != plugin::Entry::Source::User || !e->manifest) {
+        plugin::install::discard(*candidate);
+        return tr("这个插件已经不在了");
+    }
+    if (m_updates && !m_updates->claim(id)) {
+        plugin::install::discard(*candidate);
+        return tr("正在后台更新这个插件，稍后再试");
+    }
+    const auto releaseIt = qScopeGuard([this, id] {
+        if (m_updates)
+            m_updates->release(id);
+    });
+    // Nothing is asked here: what asks for more than the user agreed to is not put in place.
+    const PluginConfig* config = m_editor->m_settings.plugin(id);
+    const QStringList confirmed = config ? config->confirmed : QStringList();
+    const bool enabled = config && config->enabled;
+    QString error = plugin::updates::review(*e->manifest, *candidate->manifest, id, version, QStringLiteral(WINSHUN_VERSION), confirmed, enabled);
+    if (!error.isEmpty()) { // the reason is for the log; the user is told in words
+        qWarning().noquote() << "Plugin updates: not put over" << id << "-" << error;
+        const bool wider = !plugin::updates::widening(*e->manifest, *candidate->manifest, confirmed, enabled).isEmpty();
+        plugin::install::discard(*candidate);
+        return wider ? tr("新版本要更多权限，请单独更新") : tr("这个版本现在装不了");
+    }
+    error = plugin::updates::replace(*m_host, *candidate, m_userDir);
+    if (!error.isEmpty())
+        return error;
+    m_host->catalog().scan();
+    if (m_updates)
+        m_updates->forget(id);
+    rebuild();
+    return {};
 }
 
 void PluginSettings::uninstall(const QString& id)
@@ -989,6 +1275,7 @@ void PluginSettings::uninstall(const QString& id)
     if (!e || e->source == plugin::Entry::Source::Bundled)
         return;
     emit uninstallQuestion(QVariantMap {{u"id"_s, id}, {u"name"_s, pluginName(id)},
+        {u"keepSettings"_s, id == webplugin::kId},
         {u"hasData"_s, QFileInfo::exists(QDir(m_dataRoot).filePath(id + u".data"_s))}});
 }
 
@@ -999,7 +1286,16 @@ void PluginSettings::confirmUninstall(const QString& id, bool withData)
     const plugin::Entry* e = m_host->catalog().find(id);
     if (!e || e->source == plugin::Entry::Source::Bundled)
         return;
+    const QString pluginDir = e->dir;
     const QString name = pluginName(id);
+    if (m_updates && !m_updates->claim(id)) {
+        setMessage(tr("正在后台更新这个插件，稍后再试"));
+        return;
+    }
+    const auto releaseIt = qScopeGuard([this, id] {
+        if (m_updates)
+            m_updates->release(id);
+    });
     m_host->stop(id);
     const QDeadlineTimer deadline(2500);
     while (!deadline.hasExpired()) {
@@ -1009,13 +1305,20 @@ void PluginSettings::confirmUninstall(const QString& id, bool withData)
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     }
     const QString error = plugin::install::remove(m_userDir, m_dataRoot, id, withData);
+    if (m_updates && error.isEmpty())
+        m_updates->forget(id);
+    if (error.isEmpty()) // its confirmed copy goes too (when Win顺 may: elevated)
+        plugin::elevation::forget(m_host->elevationStore(), id, pluginDir);
     // Its section and its passwords go with it, whatever became of the folder.
     plugin::secrets::removeAll(id);
     Settings& settings = m_editor->m_settings;
     const qsizetype had = settings.plugins.size();
-    settings.plugins.removeIf([&](const PluginConfig& c) { return c.id == id; });
+    if (id == webplugin::kId)
+        settings.pluginConfig(id).enabled = false; // Retain websites/icons when the package is removed.
+    else
+        settings.plugins.removeIf([&](const PluginConfig& c) { return c.id == id; });
     m_host->catalog().scan();
-    if (settings.plugins.size() != had)
+    if (settings.plugins.size() != had || id == webplugin::kId)
         m_editor->commit();
     setMessage(error.isEmpty() ? tr("已卸载 %1").arg(name) : tr("卸载 %1：%2").arg(name, error));
     rebuild();
@@ -1035,6 +1338,20 @@ void PluginSettings::openFolder(const QString& id)
         shell::open(e->dir);
 }
 
+// The plugin opens the window itself, in front (it may, AllowSetForegroundWindow).
+void PluginSettings::showSettings(const QString& id)
+{
+    if (!m_host)
+        return;
+    const auto* entry = m_host->catalog().find(id);
+    if (entry && entry->manifest && entry->manifest->webSearch) {
+        emit webSettingsRequested();
+        return;
+    }
+    if (!m_host->request(id, u"showSettings"_s, {}, {}, true))
+        setMessage(tr("插件还没准备好，请稍后再试"));
+}
+
 void PluginSettings::openReadme(const QString& id)
 {
     if (!m_host)
@@ -1042,13 +1359,20 @@ void PluginSettings::openReadme(const QString& id)
     const plugin::Entry* e = m_host->catalog().find(id);
     if (!e)
         return;
-    for (const QString& name : {u"README.md"_s, u"README.txt"_s}) {
-        if (QFileInfo::exists(e->dir + u'\\' + name)) {
-            shell::open(e->dir + u'\\' + name);
-            return;
-        }
-    }
-    shell::open(e->dir);
+    const auto document = readme::load(e->dir);
+    if (!document.error.isEmpty()) { setMessage(document.error); return; }
+    emit readmeRequested(pluginName(id), document.html);
+}
+
+void PluginSettings::openReadmeLink(const QString& link)
+{
+    if (readme::webLink(link)) shell::openUrl(link);
+}
+
+void PluginSettings::openInstallSource()
+{
+    if (m_pendingInstall && m_pendingInstall->manifest && readme::webLink(m_pendingInstall->manifest->homepage))
+        shell::openUrl(m_pendingInstall->manifest->homepage);
 }
 
 void PluginSettings::openHomepage(const QString& id)
@@ -1292,7 +1616,7 @@ QString PluginSettings::createFromTemplate(const QString& kind, const QString& g
 
 // ---- the preview (no host) ---------------------------------------------------------
 
-void PluginSettings::loadPreview()
+void PluginSettings::loadPreview(bool elevated)
 {
     m_preview = std::make_unique<Preview>();
     m_userDir = u"C:\\Users\\me\\AppData\\Local\\WinShun\\plugins"_s;
@@ -1361,17 +1685,17 @@ void PluginSettings::loadPreview()
     }
     {
         PluginListModel::Card c;
-        c.id = u"someone.web"_s;
-        c.name = tr("网页快捷方式");
+        c.id = u"winshun.web"_s;
+        c.name = QCoreApplication::translate("SettingsWindow", "网页搜索");
         c.version = u"2.0.0"_s;
         c.author = u"someone"_s;
-        c.description = tr("零代码：gh 搜 GitHub，bd 搜百度");
+        c.description = QCoreApplication::translate("SettingsWindow", "输入名称或拼音也能找到");
+        c.webSearch = true;
+        c.settingsWindow = true;
         c.icon = glyph(u"U+E774"_s);
         c.enabled = true;
         c.status = tr("就绪");
         c.tone = u"ok"_s;
-        c.keywords = {keyword(u"gh"_s, u"GitHub"_s, u"gh"_s, u"gh"_s, tr("关键字 %1 已被%2占用，改一个").arg(u"gh"_s, tr("网页搜索“%1”").arg(u"GitHub"_s)), false),
-            keyword(u"bd"_s, tr("百度"), u"baidu"_s, u"bd"_s, {}, true)};
         c.permissions = {zeroCode};
         cards.push_back(c);
     }
@@ -1423,6 +1747,18 @@ void PluginSettings::loadPreview()
         c.tone = u"error"_s;
         c.icon = glyph(u"U+EA86"_s);
         cards.push_back(c);
+    }
+    if (elevated) { // `elevated` while Win顺 runs as administrator: one confirmed (the shield), one not yet
+        const QVariantMap elevatedAdmin = permission({}, tr("以普通用户权限运行；Win顺 以管理员身份运行时例外（见下）；内存上限 %1 MB").arg(256), true);
+        const QVariantMap elevatedRow = permission(u"elevated"_s, tr("跟随 Win顺 的管理员权限"), true,
+            tr("Win顺 以管理员身份运行时，这个插件也以管理员身份运行，能操作以管理员身份打开的窗口"));
+        for (std::size_t i = 0; i < 2 && i < cards.size(); ++i) {
+            PluginListModel::Card& c = cards[i];
+            c.permissions[0] = elevatedAdmin;
+            c.permissions.insert(1, elevatedRow);
+            c.elevation = i == 0 ? u"elevated"_s : u"unconfirmed"_s;
+            c.elevationNote = i == 0 ? tr("以管理员身份运行") : tr("要以管理员身份运行，需要你确认一次。确认前用普通权限运行");
+        }
     }
     m_preview->cards = std::move(cards);
     m_editor->m_settings.pluginDeveloperMode = true; // the log pane and the templates on show

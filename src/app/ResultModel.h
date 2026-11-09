@@ -10,10 +10,14 @@
 #include <QSet>
 #include <QStringList>
 #include <QtQml/qqmlregistration.h>
+#include <functional>
+#include <memory>
 
 namespace ws {
 
 class Switches;
+class FileIndex;
+class FolderSizes;
 
 // The visible result list. Holds at most a few hundred rows; HTML for match
 // highlighting is generated lazily for the rows QML actually draws.
@@ -31,6 +35,8 @@ class ResultModel : public QAbstractListModel {
     QML_UNCREATABLE("Provided by Launcher")
     Q_PROPERTY(int count READ count NOTIFY countChanged FINAL)
     Q_PROPERTY(QColor highlightColor READ highlightColor WRITE setHighlightColor NOTIFY highlightColorChanged FINAL)
+    // The style's match weight (Theme.matchWeight): bold from DemiBold up.
+    Q_PROPERTY(int highlightWeight READ highlightWeight WRITE setHighlightWeight NOTIFY highlightColorChanged FINAL)
     Q_PROPERTY(int selectedCount READ selectedCount NOTIFY selectionChanged FINAL)
     // Typed in a folder's window (GitHub #110): the first row that is not in
     // that folder (ElsewhereRole), where the list's caption goes; -1: none.
@@ -63,7 +69,7 @@ public:
         ModifiedRole, // when a file or folder was last written, briefly: "昨天 14:32"; empty when not known
         ModifiedFullRole, // the same in full, for its tip
         ModifiedDateRole, // the panel's column: "2026-10-14 14:32"; empty when not known
-        SizeRole, // a file's size, briefly: "1.2 MB"; empty for a folder, an app, or when not known
+        SizeRole, // a file's size, or an asynchronous index estimate for a folder in the panel
         CreatedDateRole,
         TypeNameRole,
         FolderNameRole,
@@ -95,9 +101,14 @@ public:
         // A plugin's row: its second line while the keyboard is on another
         // row (PluginRow::subtitleAway); empty: the folder line as ever.
         FolderAwayRole,
+        SettingsActionRole, // WinShun's own settings; no file or command to copy
+        WindowResultRole,
     };
 
     explicit ResultModel(QObject* parent = nullptr);
+    ~ResultModel() override;
+    void setFolderIndex(std::function<std::shared_ptr<FileIndex>()> index);
+    void setFolderSizesEnabled(bool on);
 
     int rowCount(const QModelIndex& parent = {}) const override;
     QVariant data(const QModelIndex& index, int role) const override;
@@ -121,8 +132,8 @@ public:
     // but around them: they stay in sight, with the start and the end of the
     // text. Without matches, in its middle: a name keeps its extension and
     // what is just before it (elide::shortenedHtml).
-    Q_INVOKABLE static QString elidedHtml(
-        const QString& text, const QVariantList& matches, qreal width, const QFont& font, const QColor& color);
+    Q_INVOKABLE static QString elidedHtml(const QString& text, const QVariantList& matches, qreal width, const QFont& font,
+        const QColor& color, int weight = QFont::Bold);
 
     void assign(SearchResults items, QStringList highlights); // changes only the rows that differ
     void update(int row, const SearchResult& item);
@@ -141,6 +152,8 @@ public:
 
     QColor highlightColor() const { return m_highlightColor; }
     void setHighlightColor(const QColor& color);
+    int highlightWeight() const { return m_highlightWeight; }
+    void setHighlightWeight(int weight);
     void setThumbnails(bool on); // ThumbnailRole: Settings::thumbnails
     // The rows of system switches take their state from it, and follow it.
     void setSwitches(Switches* switches);
@@ -173,10 +186,13 @@ private:
     SearchResults m_items;
     QStringList m_highlights;
     QColor m_highlightColor {0x00, 0x5F, 0xB8};
+    int m_highlightWeight = QFont::Bold;
     bool m_thumbnails = true;
     bool m_showModifiedTime = false;
     QSet<QString> m_selected; // paths
     QPointer<Switches> m_switches;
+    bool m_folderSizesEnabled = false;
+    std::unique_ptr<FolderSizes> m_folderSizes;
 };
 
 } // namespace ws

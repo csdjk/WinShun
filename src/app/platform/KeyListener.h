@@ -80,6 +80,7 @@ public:
         // under the pointer and where (physical pixels). None: the mouse only
         // around a press of the key.
         std::function<void(HWND window, POINT pt)> doubleClick;
+        std::function<void(HWND window, POINT pt)> middleClick; // opt-in blank-space menu; observed, never swallowed
         // Recording's optional click feedback. It observes presses on this
         // same Raw Input registration, including a touchpad's short taps.
         std::function<void(POINT pt, bool secondary, std::uint32_t time)> mousePress;
@@ -94,6 +95,11 @@ public:
         std::function<void(POINT pt, HWND captureWindow, DWORD sourcePid)> dragMenu;
         // The primary button let go (with dragMenu): the drag is over.
         std::function<void()> leftButtonUp;
+        // With dragMenu: the key's plain hotkey refused (its virtual key and
+        // Windows' error; ERROR_HOTKEY_ALREADY_REGISTERED: another program
+        // has it, and it alone hears the key then). Once per listener, on
+        // the listener thread (GitHub #150).
+        std::function<void(unsigned vk, unsigned long error)> dragKeyRefused;
         // Lines for the log (on the listener thread): that double Alt over
         // administrator windows needs the service updated, once; with
         // WINSHUN_KEYLOG=1 also every key event and what came of it, the
@@ -119,6 +125,9 @@ public:
     HWND window() const noexcept { return m_window.load(); }
     void setServiceProcess(DWORD pid) noexcept { m_servicePid = pid; }
     bool serviceActive() const noexcept;
+    // The service's UIAccess listener tells of the double taps of the key
+    // set, so they are heard over administrator windows too; from any thread.
+    bool serviceTells() const noexcept;
 
     // Whether the folder menu is up (from any thread): a double click whose
     // first press closed it is not reported (DoubleClickDetector).
@@ -137,11 +146,19 @@ public:
     // PointerWatch: whether Windows hid the pointer for typing (GameGuard).
     std::optional<std::uint32_t> keyDownAtOrBefore(std::uint32_t time) const;
 
+    // A key a low-level hook of this process let go on, while the keyboard's
+    // Raw Input is set aside for it (KeyboardRawInputAside): handed to the
+    // listener whose registration that is, as its Raw Input would have heard
+    // it (numberkeys::Hook, which lives as long as a window of Win顺's is in
+    // front). Nothing otherwise. On the hook's thread, at once.
+    static void hookedKey(const KBDLLHOOKSTRUCT& event);
+
 private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static void CALLBACK onForeground(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG object, LONG child,
         DWORD thread, DWORD time);
     void onInput(HRAWINPUT input);
+    void onKeyboard(const RAWKEYBOARD& key, bool device, std::uint32_t time);
     void onServiceTap(std::uint32_t key, std::uint32_t time, std::uint32_t span, bool sent);
     void holdBackup(Tap tap);
     void onBackupTimer();
@@ -166,9 +183,8 @@ private:
     void listenToMouse(bool on);
     bool registerKeyboard(HWND window);
     void removeKeyboard(HWND window);
-    bool mouseWanted() const noexcept { return m_callbacks.doubleClick || m_callbacks.dragMenu || m_callbacks.mousePress; }
+    bool mouseWanted() const noexcept { return m_callbacks.doubleClick || m_callbacks.middleClick || m_callbacks.dragMenu || m_callbacks.mousePress; }
     bool keyboardWanted() const noexcept { return m_callbacks.doubleCtrl || m_callbacks.dragMenu; }
-    bool serviceTells() const noexcept;
     void followService();
     bool keyHeld() const;
     bool wanted(std::uint32_t key) const noexcept;
@@ -198,6 +214,8 @@ private:
     bool m_dragFound = false; // an OLE drag seen while the button is held; listener thread only
     std::uint32_t m_dragLooked = 0; // when it was last looked for (message time)
     bool m_dragKeyGuarded = false; // the drop pie's key held back from the drag's source
+    bool m_dragConflictLogged = false; // at most one hotkey-conflict note per primary-button press
+    bool m_dragKeyRefusedTold = false; // dragKeyRefused, once
     // The key pressed on a file still held, not dragged yet: the drag being
     // started for it (startDrag). Listener thread only.
     bool m_starting = false;

@@ -16,6 +16,7 @@
 #include <QAbstractListModel>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
@@ -28,6 +29,7 @@
 namespace ws {
 
 class SettingsEditor;
+class PluginUpdates;
 
 namespace plugin {
 class Host;
@@ -58,10 +60,21 @@ public:
         QVariantList permissions; // [{name, text, enforced, note}]
         QVariantList settings; // [{key, type, title, hint, value, options, optionIndex}]
         bool hasReadme = false;
+        bool settingsWindow = false; // the plugin draws its own settings window (manifest settingsWindow): 设置 on the card
+        bool webSearch = false;
         bool hasData = false;
         bool aiExpose = false; // the manifest offers its commands to the AI (ai.expose): the card shows the switch
         bool aiEnabled = true; // the switch: [Plugin.<id>] Ai=
         QString aiNote; // under the switch: the tool names, or why they are not on offer yet
+        // The `elevated` permission while Win顺 runs as administrator
+        // (plugin::elevation::verdictName): "elevated" (a shield by the name,
+        // the note its tooltip), "unconfirmed" or "changed" (the note and
+        // 确认), "unavailable" (the note); empty otherwise.
+        QString elevation;
+        QString elevationNote;
+        // Why the last 确认 did not work, on the card that was clicked
+        // (GitHub #230: said only over the cards, it went unseen).
+        QString elevationProblem;
         friend bool operator==(const Card&, const Card&) = default;
     };
     enum Role {
@@ -83,10 +96,15 @@ public:
         PermissionsRole,
         SettingsRole,
         HasReadmeRole,
+        SettingsWindowRole,
         HasDataRole,
         AiExposeRole,
         AiEnabledRole,
         AiNoteRole,
+        WebSearchRole,
+        ElevationRole,
+        ElevationNoteRole,
+        ElevationProblemRole,
     };
 
     using QAbstractListModel::QAbstractListModel;
@@ -157,6 +175,8 @@ class PluginSettings : public QObject {
     // File Explorer (Runner::TokenSource::Restricted); empty when they do.
     Q_PROPERTY(QString restrictedNote READ restrictedNote NOTIFY stateChanged FINAL)
     Q_PROPERTY(QString message READ message NOTIFY messageChanged FINAL) // how the last install or removal went
+    Q_PROPERTY(QString recoveryMessage READ recoveryMessage NOTIFY recoveryChanged FINAL)
+    Q_PROPERTY(bool recovering READ recovering NOTIFY recoveryChanged FINAL)
     Q_PROPERTY(QString userDir READ userDir NOTIFY stateChanged FINAL)
     Q_PROPERTY(bool active READ active WRITE setActive NOTIFY activeChanged FINAL) // the page is on show: memory figures are read
     // A card's hotkey recorder has the keyboard (SettingsWindow suspends the global hotkeys).
@@ -171,13 +191,16 @@ public:
     ~PluginSettings() override;
 
     void setHost(plugin::Host* host); // the app's; null for none
+    void setUpdates(PluginUpdates* updates); // the background updates: told what is changed here, asked before a plugin is
     void setLocale(const QString& locale);
     // Without a host: five made-up plugins in every state, for the
-    // offscreen preview of the page (main.cpp --preview-plugins).
-    void loadPreview();
+    // offscreen preview of the page (main.cpp --preview-plugins). `elevated`:
+    // as if Win顺 ran as administrator, the first two asking for `elevated`.
+    void loadPreview(bool elevated = false);
 
     PluginListModel* list() { return &m_list; }
     int count() const { return m_list.rowCount(); }
+    Q_INVOKABLE QStringList searchTerms(int row) const;
     PluginLogModel* log() { return &m_log; }
     QVariantList logPlugins() const;
     QString logFilter() const { return m_log.filter(); }
@@ -186,6 +209,10 @@ public:
     void setDeveloperMode(bool on);
     QString restrictedNote() const { return m_restrictedNote; }
     QString message() const { return m_message; }
+    QString recoveryMessage() const { return m_recoveryMessage; }
+    bool recovering() const { return m_recovering; }
+    void setRecoveryState(const QString& message, bool busy = false);
+    Q_INVOKABLE void retryRecovery();
     QString userDir() const { return m_userDir; }
     bool active() const { return m_active; }
     bool preview() const { return m_preview != nullptr; }
@@ -198,7 +225,10 @@ public:
     static QString permissionText(plugin::Permission p);
     // install(), for a package downloaded from the 插件库: it must be
     // `expectedId`, and is called `name` in what is said of it.
-    void installFrom(const QString& path, const QString& expectedId, const QString& name);
+    void installFrom(const QString& path, const QString& expectedId, const QString& name, bool enableAfterInstall = false, bool unreviewed = false);
+    // 全部更新's: the package at `path` put over the installed `id` without a question, when the list's `version` is not
+    // wider than what the user allowed (plugin::updates::review). Empty on success, else why not.
+    QString installUpdate(const QString& path, const QString& id, const QString& version);
 
     // The switch: turning on asks first (confirmationNeeded) when the plugin
     // was never confirmed or asks for more permissions than it did.
@@ -206,6 +236,12 @@ public:
     Q_INVOKABLE void confirmEnable(const QString& id); // the dialog's yes
     Q_INVOKABLE void declineEnable(const QString& id); // its no: one waiting for the OK goes off
     Q_INVOKABLE void setAiEnabled(const QString& id, bool on); // the card's "给 AI 用" switch
+    // The card's 确认 (an elevated Win顺, a plugin with `elevated`): the copy
+    // to run as administrator, made off the GUI thread (the card says so
+    // meanwhile): a plugin of the library from its package checked against
+    // the signed list, which must be what is installed; any other from its
+    // folder as it is now.
+    Q_INVOKABLE void confirmElevation(const QString& id);
     Q_INVOKABLE void setKeyword(const QString& id, const QString& command, const QString& keyword); // the user's; empty: none
     Q_INVOKABLE void resetKeyword(const QString& id, const QString& command); // back to the manifest's
     Q_INVOKABLE void setSettingValue(const QString& id, const QString& key, const QVariant& value);
@@ -217,13 +253,17 @@ public:
     Q_INVOKABLE void install(const QString& path); // installQuestion() when the id is installed already
     Q_INVOKABLE void confirmInstall();
     Q_INVOKABLE void cancelInstall();
+    Q_INVOKABLE void declineInstall(); // the answer no to 更新并允许: the installed version stays, and this one stops being counted
     // Removing: uninstallQuestion() first (whether to take its data too).
     Q_INVOKABLE void uninstall(const QString& id);
     Q_INVOKABLE void confirmUninstall(const QString& id, bool withData);
     Q_INVOKABLE void reload(const QString& id);
     Q_INVOKABLE void openFolder(const QString& id);
     Q_INVOKABLE void openReadme(const QString& id);
+    Q_INVOKABLE void openReadmeLink(const QString& link);
+    Q_INVOKABLE void showSettings(const QString& id); // the plugin's own settings window (settingsWindow)
     Q_INVOKABLE void openHomepage(const QString& id);
+    Q_INVOKABLE void openInstallSource();
     Q_INVOKABLE void openLog();
     Q_INVOKABLE void openUserDir();
     Q_INVOKABLE void clearLog();
@@ -242,12 +282,16 @@ public:
     Q_INVOKABLE QString permissionsNote() const;
 
 signals:
+    void readmeRequested(const QString& title, const QString& html);
+    void webSettingsRequested();
     void listChanged();
     void logPluginsChanged();
     void logFilterChanged();
     void developerModeChanged();
     void stateChanged();
     void messageChanged();
+    void recoveryChanged();
+    void recoveryRequested();
     void activeChanged();
     void recordingHotkeyChanged();
     // The dialogs: {id, name, version, author, homepage, source, permissions: [{name, text, enforced, note}], more: bool (asked again for new ones)}.
@@ -264,25 +308,45 @@ private:
     PluginListModel::Card cardFor(const QString& id) const;
     void setMessage(const QString& message);
     void readMemory(); // the resident processes' working sets, into the status lines
-    void finishInstall(plugin::install::Candidate candidate);
+    void finishInstall(plugin::install::Candidate candidate, bool enableAfterInstall = false, bool allow = false);
+    void releaseClaim(); // the plugin an install here has been changing
     QString pluginName(const QString& id) const;
     QVariantList permissionRows(const QString& id) const; // [{name, text, enforced, note}]
+    QVariantList permissionRows(const plugin::Manifest& manifest) const;
     void applyPluginSettings(const QString& id); // the host hears the values (secrets included)
 
     SettingsEditor* m_editor;
     QPointer<plugin::Host> m_host;
+    QPointer<PluginUpdates> m_updates;
+    QSet<QString> m_confirming; // confirmElevation's copies being made
+    // By plugin: why its last 确认 failed (Card::elevationProblem), said
+    // while it is still the version that was clicked (an update since: gone).
+    struct ConfirmProblem {
+        QString version;
+        QString text;
+    };
+    QHash<QString, ConfirmProblem> m_confirmProblems;
+    void setConfirmProblem(const QString& id, const QString& text);
+    QString confirmProblem(const QString& id, const QString& version) const;
+    void finishConfirm(const QString& id, bool ok, const QString& error);
+    QString m_installClaim; // the plugin of m_pendingInstall, or being installed
     QString m_locale = QStringLiteral("zh");
     QString m_userDir;
     QString m_dataRoot;
     QString m_logPath;
     QString m_restrictedNote;
     QString m_message;
+    QString m_recoveryMessage;
+    bool m_recovering = false;
     PluginListModel m_list;
     PluginLogModel m_log;
     QTimer m_memoryTimer;
     bool m_active = false;
     bool m_recordingHotkey = false;
     std::optional<plugin::install::Candidate> m_pendingInstall; // waiting for the user's answer
+    bool m_pendingEnable = false;
+    bool m_pendingAllow = false; // ... and the question is 更新并允许 (a yes also confirms the new permissions)
+    bool m_pendingFromLibrary = false; // ... for a package the 插件库 downloaded: a no also stops that version being counted
     std::unique_ptr<Preview> m_preview; // loadPreview(): no host
     PluginGallery m_gallery {this};
 };

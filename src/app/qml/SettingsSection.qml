@@ -12,6 +12,7 @@ Column {
     id: section
 
     property string title
+    property string glyph: ""
     property string note
     property int page: -1 // the index into the window's pages
     property int tab: 0 // the index into its page's tabs, on a page that has them
@@ -22,10 +23,13 @@ Column {
     readonly property SettingsSearch search: column && column.search !== undefined ? column.search : null
     readonly property bool searching: search !== null && search.active
     readonly property var pageInfo: column && column.pages !== undefined ? column.pages[page] ?? null : null
-    // Other words people look for the page by.
-    readonly property var pageKeywords: column && column.pageKeywords !== undefined
+    // Other words people look for the page by (only while searching, the one time they are read).
+    readonly property var pageKeywords: searching && column && column.pageKeywords !== undefined
                                         ? (column.pageKeywords[page] ?? "").split(";").filter(word => word.length > 0)
                                         : []
+    // The window's device pixel ratio, for this section and its rows: one
+    // Screen attached object for all of them (GitHub #111; docs/pitfalls.md).
+    readonly property real dpr: column && column.dpr !== undefined ? column.dpr : Screen.devicePixelRatio
     // Its rows on show while searching.
     readonly property int found: searching && search.total >= 0 ? search.sectionCount(section) : 0
     // While searching: the first section of its page on show, which carries the page's name.
@@ -60,6 +64,7 @@ Column {
 
         Glyph {
             id: pageGlyph
+            x: Theme.snap(-inkLeft, section.dpr) // the icon's ink, not its box, on the edge the card below starts at
             anchors.verticalCenter: parent.verticalCenter
             glyph: section.pageInfo?.glyph ?? ""
             size: 16
@@ -74,7 +79,7 @@ Column {
             text: section.pageInfo?.title ?? ""
             color: Theme.text
             font.pixelSize: Theme.fontTitle
-            font.weight: Font.DemiBold
+            font.weight: Theme.fontStrong
             elide: Text.ElideRight
         }
         Text { // leaves the search for the whole page
@@ -98,12 +103,33 @@ Column {
         }
     }
 
-    Text {
+    Item {
         visible: section.title.length > 0
-        text: section.title
-        color: Theme.text
-        font.pixelSize: Theme.fontTitle
-        font.weight: Font.DemiBold
+        width: parent.width
+        height: 26
+
+        Row {
+            x: sectionGlyph.visible ? Theme.snap(-sectionGlyph.inkLeft, section.dpr) : 0 // the icon's ink on the card's edge
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 8
+
+            Glyph {
+                id: sectionGlyph
+                visible: section.glyph.length > 0
+                anchors.verticalCenter: parent.verticalCenter
+                glyph: section.glyph
+                size: 15
+                color: Theme.accent
+            }
+
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: section.title
+                color: Theme.text
+                font.pixelSize: Theme.fontBody
+                font.weight: Theme.fontStrong
+            }
+        }
     }
 
     Text {
@@ -115,13 +141,15 @@ Column {
         wrapMode: Text.Wrap
     }
 
-    Rectangle {
+    Item {
         width: parent.width
-        height: Theme.snap(card.implicitHeight, Screen.devicePixelRatio) // whole device pixels: the bottom edge as crisp as the top
-        radius: Theme.cardRadius
-        color: Theme.card
-        border.width: 1
-        border.color: Theme.cardBorder
+        height: Theme.snap(card.implicitHeight, section.dpr) // whole device pixels: the bottom edge as crisp as the top
+
+        Hook { // the style's card (Theme.cardPart): fill and 1 px edge
+            anchors.fill: parent
+            part: Theme.cardPart
+            dpr: section.dpr
+        }
 
         Column {
             id: card

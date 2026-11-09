@@ -1,12 +1,12 @@
 # 截图工具
 
-README 里的图（`docs/images/*.jpg`）和发帖用的图（小红书 3:4、1:1、X、GitHub 社交预览）都由这里生成：用演示数据启动 Win顺，用真实键鼠输入把窗口摆好，黑白两次背板抠出带真实透明度的窗口，再合成到生成的背景上。图里不会出现自己电脑上的文件。
+README 的封面、[docs/截图.md](../../docs/截图.md) 里的功能图（`docs/images/*.jpg`）和发帖用的图（小红书 3:4、1:1、X、GitHub 社交预览）都由这里生成：用演示数据启动 Win顺，用真实键鼠输入把窗口摆好，黑白两次背板抠出带真实透明度的窗口，再合成到生成的背景上。图里不会出现自己电脑上的文件。
 
-README 必须保持原有视觉格式：`square` 方形海报模板，保留 Win顺 Logo、LingCore 署名、彩色标题、副标题、背景及模板自带的底部文字；图片在 README 中以 `width="49%"` 排成两列。`readme` 预设只是工具中的纯窗口合成选项，不用于 README 这套海报。修复清晰度时只更换截图来源和导出质量，不删设计元素，不移动图内文案，不改变双列布局。
+README 和截图文档里的海报必须保持原有视觉格式：`square` 方形海报模板，保留 Win顺 Logo、LingCore 署名、彩色标题、副标题、背景及模板自带的底部文字；README 只放封面图，其余功能图在 `docs/截图.md` 里按功能分组，以 `width="49%"` 排成两列。`readme` 预设只是工具中的纯窗口合成选项，不用于 README 这套海报。修复清晰度时只更换截图来源和导出质量，不删设计元素，不移动图内文案，不改变双列布局。
 
 海报保持原来的 JPEG 文件格式和路径，使用模板原始的 1440 × 1440 分辨率，不再缩到 1080；导出质量为 96，关闭色度抽样，减少文字边缘的压缩损失，点击可查看原图。发帖的 `pages`、`square`、`covers` 保持各自的尺寸与排版；`F:\Win顺宣传图` 是之前导出的发帖成品目录。
 
-更新海报后，先提交图片，再把 README 对应引用指向该提交 SHA 的 `raw.githubusercontent.com/LingCore/WinShun/<提交>/docs/images/<名字>.jpg`。仓库里的文件仍沿用原 `.jpg` 路径，引用使用不可变地址避免旧图缓存。0.15.0 已观察到：相对引用加 `.jpg?v=0.15.0`、刷新页面后，GitHub 的 raw 跳转仍显示旧图，因此不要再把查询参数当成可靠修复。核对仓库 blob、固定提交的图片与实际页面三者一致。
+更新海报后，先提交图片，再把 README（封面）或 `docs/截图.md`（功能图）里对应的引用指向该提交 SHA 的 `raw.githubusercontent.com/LingCore/WinShun/<提交>/docs/images/<名字>.jpg`。仓库里的文件仍沿用原 `.jpg` 路径，引用使用不可变地址避免旧图缓存。0.15.0 已观察到：相对引用加 `.jpg?v=0.15.0`、刷新页面后，GitHub 的 raw 跳转仍显示旧图，因此不要再把查询参数当成可靠修复。核对仓库 blob、固定提交的图片与实际页面三者一致。
 
 ## 目录
 
@@ -25,6 +25,19 @@ README 必须保持原有视觉格式：`square` 方形海报模板，保留 Win
 需要 Python 3.10+、Pillow、numpy。
 
 ## 只重新出图
+
+0.17.0 的补拍入口是 `release017.py`，继续使用这套方形品牌模板。`--work` 必须是新目录；`--capture-only` 先保留原图，检查后用 `--export-only` 输出。新版增加左侧编号、五标签内容详情、两页首次设置及文件夹菜单分页，更新剪贴板大小、录屏控制条和受影响设置页。目录内保存程序及截图插件 SHA256、原图、无损海报和来源清单。结果页的原生尺寸检查用 150%，其余离屏渲染用 200%；不改系统缩放。
+
+```powershell
+python tools/screenshots/release017.py --exe <独立部署目录>/WinShun.exe --capture <构建目录>/library-plugins/winshun.capture/WinShunCapture.exe --work <新的原图目录> --capture-only
+python tools/screenshots/release017.py --exe <独立部署目录>/WinShun.exe --work <原图目录> --export-only --onboarding <首次设置原图.png> --foldermenu <favorites-light.png>
+```
+
+首次设置原图由独立程序的 `--probe-runtime <新目录> --onboarding-probe apply --scale 2 --renderer d3d11` 导出 `onboarding.png`；此探针隔离配置、HKCU 和快捷键。文件夹菜单来自生产组件的 `tst_foldermenu`，设置 `WINSHUN_MENU_EVIDENCE=<新目录>`、`QT_ENABLE_HIGHDPI_SCALING=0`、`QT_SCALE_FACTOR=2` 后运行该项测试，取 `favorites-light.png`。海报裁取前八个演示收藏夹；后面的长名称及滚动压力数据不进入海报。不要以隐藏首窗的方式启动这个原生测试，否则窗口曝光检查会失败。
+
+组合结果探针在替换模型／图片时会记录 `PanelRow` 的空模型和 `ClipRow` 的 `undefined` 图片警告。入口保留日志，仅在三份行为报告全部通过且没有其他警告时接受这些已知绘制警告；不将其描述为整个预览零警告。其他模式及实际发布验证见对应版本验证记录。
+
+0.17.0 补拍更正：最初把 200% 的两项尺寸断言失败归因于原生 DPI 差异，后续几何日志排除了这个判断。根因是探针直接调用窗口的 `setPosition`，没有同步 `Placement.room`；第一次宽度拖动结束时自动行数从受限状态恢复，窗口高度随之增长。探针现改用生产 `Placement.attach` 布置足够空间，150% 和 200% 的 22 项检查均通过。验证可自动调整尺寸的窗口时，必须通过真实定位接口布置场景，避免用不同步控制器状态的裸窗口移动。
 
 0.15.0 的补拍入口是 `release015.py`。它启动已构建的真实程序，使用现有的 `--preview-*` 模式和临时配置，导出新版搜索面板、可调宽的剪贴板、外观预览、截图工具条及 MP4 / GIF 控制窗口，再交给同一个 `art.compose(..., "square", ...)` 模板。录屏验证会短暂显示它自己的演示窗口，只录这个窗口的客户区；不退出正在运行的 Win顺，不监听或改写系统剪贴板，不改系统主题和缩放。
 
@@ -112,8 +125,42 @@ tools\screenshots\run.ps1 -Exe <要拍的 WinShun.exe，发布版，带拖放圆
 - 代理会丢掉参数开头的空格：要打“关键词 + 空格 + 文字”，先 `tap 23`（End）、`tap 20`（空格）再 `type`。
 - 开拍前系统剪贴板里要有东西（比如复制一段字）：场景开头按 Delete 删掉 Win顺 启动时记下的那一条，剪贴板是空的时它什么都没记，删掉的就是演示历史里最新的那张图片，剪贴板搜图里的字那张就没了。
 - Windows 11 的文本光标指示器（品红色）可能被抠进图里；演示配置只排除了各盘的文件夹，盘根目录下的文件仍能搜到，查询别碰上它们。
+- 截图 0.17 起是插件（GitHub #138）：`profile --capture` 把构建出的插件（`build\release\library-plugins\winshun.capture`，别处的用 `--capture-plugin <文件夹>`）复制进演示配置的 `plugins\`、打开它，快捷键写进它自己的 `capture.ini`；`release016.py` 拍截图工具条和录屏面板要 `--capture <WinShunCapture.exe>`，它用 `--exe` 那个文件夹里的 Qt。
 - `profile start` 现在会把 `demo/` 里新加的文件补进 `F:\Win顺演示`（只加不改不删）；新文件的修改时间写在 `stage.CHANGED` 里（要老，别让“最新的在前”那张图里冒出它们）。
 - 资源管理器里别连点同一行：第二下是改名，打进去的字就改了演示文件夹里的名字（`Esc` 取消）。用 `front` 把窗口放前面，只点一次没选过的行。
 - `profile stop` 现在用普通权限启动用户自己的那份（以前是提权的，要自己 `--quit` 再启动）；`QuitWs` 也会退掉 `dist` 里正在跑的那份，所以用 `-Exe` 拍别的构建时不用先退它。
 - 代理一次只能开一个：`exit` 批处理里第一行被守卫挡住时没有退出，再开一个就是两个都在抢 `work\cmd.txt`。
 - 坑和原因见 `docs/pitfalls.md` 的“README 和帖子的截图”一节：Mica 取壁纸颜色、提权后置顶失效、剪贴板窗口不在前台、演示配置混进自己的东西、去阴影时窗口和 logo 分开算。
+
+## 0.18.0 补拍
+
+`release018.py` 沿用 `release017.py` 的隔离预览与方形品牌模板，更新搜索面板、剪贴板、设置、截图及录屏，并接入真实网页插件和图片文字搜索窗口。先运行 `--capture-only`。网页图由 `tools/verify_web_plugin.py` 生成到同一工作目录的 `web/`，插件库图取新版设置预览的 `settings/p09-t1.png`，收藏夹为 `p05-t0.png`，备份位于高级页 `p07-t0.png`。图片文字搜索用插件的 `--preview-ocr-search` 和独立 `--data-dir` 导出到 `ocr/`，先在该目录的 `ocr-search.ini` 写入样例文件夹配置，再传 `--index --query 西南`。快捷键使用 `--preview-results <work>/shortcuts --shortcut-panel`，来源文件为 `shortcut-panel-launcher.png`。检查原图后再运行 `--export-only`。源码与产物校验见本版发布验证记录。
+
+## 0.19.0 补拍
+
+`release019.py` 沿用 `release017.py` 的导出和方形品牌模板，只换下面三张，其余海报保留 0.18 的文件。`--capture-only` 用独立预览按 200% 渲染到新的 `--work`：截图插件 `--preview-capture-tools --toolbar-drag`（两行工具条，`toolbar/toolbar-with-style.png` → `capture.jpg`，标题改为两行排开）、`--preview-capture-settings --groups`（新增 `capture-keys.jpg`，取按键页经预览自身按键检查后的 `capture-keys-states.png`：改过的保存键带“恢复默认”、被拒的键有说明，裁到“收起/展开”一行），以及新增的 `--preview-presenter`（`presenter.jpg`：生产 `Presenter`、`PresenterOverlay`、`PresenterToolbar` 离屏，假的单显示器钩子，不碰前台和磁盘；白板上的笔迹经墨迹窗口自己的鼠标路由画出，工具条按 `PresenterHost` 的初始位置叠上去）。演示预览日志里的 8 条 `requestActivate() … WindowDoesNotAcceptFocus` 是文字框和序号框请求键盘焦点、离屏窗口不接受焦点所致，入口只接受这一种警告。激光笔轨迹（`--laser`）没有进海报。设置预览也一并渲染：插件库页的演示数据与 0.18 相同，`plugin-library.jpg` 不换；资源管理器标签页不在这份演示数据里，不另加。检查原图后再运行 `--export-only`。
+
+```powershell
+python tools/screenshots/release019.py --exe <独立部署目录>/WinShun.exe --capture <构建目录>/library-plugins/winshun.capture/WinShunCapture.exe --work <新的原图目录> --capture-only
+python tools/screenshots/release019.py --exe <独立部署目录>/WinShun.exe --work <原图目录> --export-only
+```
+
+## 0.21.0 补拍
+
+`release021.py` 沿用 `release017.py` 的导出和方形品牌模板，只换两张：外观页（`settings/p01-t0.png`，最上面多了三种界面风格，标题改为“界面风格，三种任选”）和新增的运行状况页（`settings/p10-t0.png`，预览自带的演示读数：正在建内容索引）。两张都来自发布程序的 `--preview-settings`，200%、D3D11、独立配置，不动正在运行的 Win顺。`settings.jpg` 是设置搜索的图，左边列表少了“运行状况”一项，其余不变，沿用。
+
+```powershell
+python tools/screenshots/release021.py --exe <独立部署目录>/WinShun.exe --work <新的原图目录> --capture-only
+python tools/screenshots/release021.py --exe <独立部署目录>/WinShun.exe --work <原图目录> --export-only
+```
+
+## 0.22.0 补拍
+
+`release022.py` 使用独立配置和生产预览，补拍搜索范围、搜索历史、纯净搜索、已打开窗口、面板、剪贴板分组、插件说明与审核、字体和双击动作等界面。结果预览按当前桌面的 150% 渲染，其余按 200%、D3D11 渲染。16 张功能海报和封面沿用方形品牌模板，1440×1440、JPEG 质量 96、关闭色度抽样。外观、运行状况和插件库的长页只取顶部视口，封面使用新版合并搜索窗口并保留“关注我”。
+
+```powershell
+python tools/screenshots/release022.py --exe <独立部署目录>/WinShun.exe --capture <构建目录>/library-plugins/winshun.capture/WinShunCapture.exe --work <新的原图目录> --capture-only
+python tools/screenshots/release022.py --exe <独立部署目录>/WinShun.exe --work <原图目录> --export-only
+```
+
+本版原图、程序哈希、探针日志和无损海报保存在 `work/release022/`，发布证据摘要在 `docs/validation/release022/`。截图插件使用修复中文宿主路径的 1.1.7。先检查原图和探针结果，再导出和逐张检查海报。

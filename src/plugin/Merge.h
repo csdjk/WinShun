@@ -14,7 +14,8 @@
 // typed, nor above the row the keyboard is on (below it when it is not
 // the first; on the first row, a better one takes its place and the
 // launcher says so with betterFirstRow). Before the files and the content
-// matches.
+// matches. A content provider's rows are not pushed so: its first three go
+// after the first five name rows, the others last.
 // Answering again (a rerun, a refresh), rows with the same item id are
 // updated in place; rows that went are removed, new ones inserted.
 
@@ -68,6 +69,11 @@ class Merge {
 public:
     static constexpr int kPerPlugin = 3; // rows one plugin may push
     static constexpr int kTotal = 6; // ... all plugins together
+    // Content providers (commands[].contentSearch): this many of their rows
+    // go on the first screen, after this many name rows; the rest follow
+    // the native content matches.
+    static constexpr int kFirstScreenRows = 3;
+    static constexpr int kFirstScreenNames = 5;
 
     Merge(RowSink& sink, const Catalog& catalog);
 
@@ -83,7 +89,8 @@ public:
     // A query begins: earlier answers are dropped. With `keywordPlugin`
     // and `keywordCommand`, keyword mode for that command. `text` as typed
     // (a trailing space tells a keyword from a name, Catalog::match).
-    void begin(std::uint64_t queryId, const QString& text, const QString& keywordPlugin = {}, const QString& keywordCommand = {});
+    void begin(std::uint64_t queryId, const QString& text, const QString& keywordPlugin = {}, const QString& keywordCommand = {}, bool contentOnly = false,
+        bool hints = true);
     std::uint64_t queryId() const noexcept { return m_queryId; }
     bool keywordMode() const noexcept { return !m_keywordPlugin.isEmpty(); }
     // Push mode: the name search's rows are in the sink now; what was held
@@ -91,6 +98,18 @@ public:
     // keywords it begins among the rows (placeHint).
     void namesShown();
     bool namesReady() const noexcept { return m_namesReady; }
+    bool contentOnly() const noexcept { return m_contentOnly; }
+    // Content only (内容): no name search to wait for, only for the list to
+    // be this query's. True when a provider's answer with a file is held
+    // for that: the launcher clears the last query's rows (or, asked again,
+    // has its own) and calls namesShown at once, not when the native scan
+    // shows a row.
+    bool answerHeld() const;
+    // A content provider's row (commands[].contentSearch).
+    bool contentRow(const SearchResult& row) const;
+    // Where the native content matches end: the first of the content
+    // providers' rows after them, which stay last (count() with none).
+    int contentEnd() const;
 
     // What Host::results said (dropped unless for the current query).
     void results(std::uint64_t queryId, const QString& pluginId, const QString& commandId, const Items& items, bool partial,
@@ -110,9 +129,11 @@ private:
         Items items;
         bool complete = false;
     };
-    SearchResults rowsOf(const Entry& entry, const Command& command, const Items& items, bool sortByScore) const;
+    SearchResults rowsOf(const Entry& entry, const Command& command, const Items& items, bool sortByScore, int offset = 0) const;
     void apply(const Batch& batch);
     void placeHint();
+    int floorRow() const;
+    int firstScreenRow() const;
     int placeFor(int score) const;
 
     RowSink& m_sink;
@@ -126,7 +147,10 @@ private:
     QString m_keywordPlugin;
     QString m_keywordCommand;
     bool m_namesReady = false;
+    bool m_contentOnly = false;
+    bool m_hints = true;
     bool m_assigned = false; // keyword mode: an answer has replaced the rows
+    int m_keywordItemIndex = 0; // anonymous ids span every appended batch
     std::map<QString, Batch> m_held; // "<plugin>/<command>" -> its answer so far
     bool m_betterFirstRow = false;
 };

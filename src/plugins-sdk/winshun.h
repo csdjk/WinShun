@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -599,6 +600,7 @@ struct Item {
     Json open; // {"path": …} or {"url": …}
     std::vector<Action> actions;
     bool valid = true;
+    bool details = false; // no file to show: the content pane and the preview ask details() (GitHub #202)
     Json data;
     Json modified; // ISO 8601 with time zone or Unix seconds; optional
     Json created;
@@ -623,6 +625,7 @@ struct Item {
     Item& withSize(long long bytes) { size = bytes; return *this; }
     Item& withActions(std::vector<Action> a) { actions = std::move(a); return *this; }
     Item& invalid() { valid = false; return *this; }
+    Item& withDetails() { details = true; return *this; }
 
     Json toJson() const
     {
@@ -656,6 +659,8 @@ struct Item {
         }
         if (!valid)
             o["valid"] = false;
+        if (details)
+            o["details"] = true;
         if (!data.isNull())
             o["data"] = data;
         return Json(std::move(o));
@@ -721,6 +726,7 @@ namespace detail {
 class LineReader {
 public:
     explicit LineReader(HANDLE handle) : m_handle(handle) {}
+    void reset(HANDLE handle) { m_handle = handle; }
     bool next(std::string& line)
     {
         for (;;) {
@@ -752,12 +758,11 @@ private:
     bool m_eof = false;
 };
 
-inline bool writeLine(const std::string& text)
+inline bool writeLine(const std::string& text, HANDLE out = ::GetStdHandle(STD_OUTPUT_HANDLE))
 {
     const std::string line = text + "\n";
     const char* p = line.data();
     std::size_t n = line.size();
-    const HANDLE out = ::GetStdHandle(STD_OUTPUT_HANDLE);
     while (n > 0) {
         DWORD moved = 0;
         if (!::WriteFile(out, p, static_cast<DWORD>(n), &moved, nullptr) || moved == 0)
@@ -846,11 +851,23 @@ public:
                 return 0;
         }
     }
+    // The same over the given ends instead of stdin and stdout (a plugin
+    // that Win顺 runs inside its plugin host).
+    int serve(HANDLE in, HANDLE out)
+    {
+        m_reader.reset(in);
+        m_out = out;
+        return serve();
+    }
 
-    // What the plugin was told at initialize.
+    // What the plugin was told at initialize (the language and the theme
+    // follow Win顺's after it for a plugin with the "ui" permission).
     const Json& settings() const { return m_settings; }
     const std::string& locale() const { return m_locale; } // zh | en
     const std::string& theme() const { return m_theme; } // light | dark
+    // "ui": themeSetting, corners, uiStyle, uiSize, transparency, renderer, and
+    // nativeLook (the style's colours "#AARRGGBB" and radii; docs/plugins.md, 外观)
+    const Json& appearance() const { return m_appearance; }
     const std::string& pluginDir() const { return m_pluginDir; }
     const std::string& dataDir() const { return m_dataDir; }
     bool chinese() const { return m_locale != "en"; }
@@ -920,6 +937,19 @@ protected:
         return {effect::copy(text), effect::notify(chinese() ? "已复制" : "Copied"), effect::hide()};
     }
     virtual void settingsChanged(const Json& settings) { (void)settings; }
+    // An item made withDetails() shown in the content pane or the preview
+    // (GitHub #202): Json::Object {{"text", …}} or {{"file", a file in
+    // dataDir()}}. Without it (nullopt): "method not found", and the pane
+    // says the details could not be had.
+    virtual std::optional<Json> details(const Json& item, const std::string& text)
+    {
+        (void)item;
+        (void)text;
+        return std::nullopt;
+    }
+    // Win顺's language or look changed ("ui" permission): locale(), theme()
+    // and appearance() already say the new one.
+    virtual void appearanceChanged() {}
     // Once, right after initialize: settings(), dataDir() and the rest are
     // known. A plugin that works without being asked (start "eager": a
     // server, a watcher) starts that here, not at its first query.
@@ -934,6 +964,10 @@ protected:
     // A query's whole answer, when `rerun` (seconds) or `cache` (seconds)
     // are wanted too: override queryResult instead of query.
     virtual Json queryResult(const Query& q) { return Json::Object {{"items", itemsJson(query(q))}}; }
+    // Override for a slow query that must keep reading cancel and newer queries.
+    // Snapshot settings/locale on this thread. Reply once, from any thread, and
+    // join outstanding work in shuttingDown() and the derived destructor.
+    virtual void queryAsync(const Query& q, std::function<void(Json)> reply) { reply(queryResult(q)); }
 
 private:
     void send(const Json& message)
@@ -942,7 +976,7 @@ private:
         m.set("jsonrpc", "2.0");
         const std::string line = m.dump();
         const std::lock_guard lock(m_sendMutex); // a whole line at a time, whichever thread sends
-        detail::writeLine(line);
+        detail::writeLine(line, m_out);
     }
     void notify(const std::string& method, Json params) { send(Json::Object {{"method", method}, {"params", std::move(params)}}); }
     void respond(const Json& id, Json result) { send(Json::Object {{"id", id}, {"result", std::move(result)}}); }
@@ -999,6 +1033,7 @@ private:
             m_settings = params["settings"];
             m_locale = params["locale"].toString();
             m_theme = params["theme"].toString();
+            m_appearance = params["appearance"];
             m_pluginDir = params["pluginDir"].toString();
             m_dataDir = params["dataDir"].toString();
             answer(Json::Object {{"protocolVersion", "1"}, {"name", name()}});
@@ -1015,7 +1050,8 @@ private:
             q.limit = static_cast<int>(params["limit"].toInt(200));
             for (const Json& group : params["match"].toArray())
                 q.match.push_back(group.toString());
-            answer(queryResult(q));
+            queryAsync(q, [this, id](Json result) { respond(id, std::move(result)); });
+            answered = true;
         } else if (method == "action") {
             ActionRequest a;
             a.command = params["command"].toString();
@@ -1029,11 +1065,25 @@ private:
             for (const Json& e : action(a))
                 effects.push_back(e);
             answer(Json::Object {{"effects", Json(std::move(effects))}});
+        } else if (method == "details") {
+            if (std::optional<Json> result = details(params["item"], params["text"].toString())) {
+                answer(std::move(*result));
+            } else {
+                fail(id, -32601, "Method not found: details");
+                answered = true;
+            }
         } else if (method == "cancel") {
             cancel(params["queryId"].toInt());
         } else if (method == "settingsChanged") {
             m_settings = params["settings"];
             settingsChanged(m_settings);
+        } else if (method == "appearance") {
+            if (params["locale"].isString())
+                m_locale = params["locale"].toString();
+            if (params["theme"].isString())
+                m_theme = params["theme"].toString();
+            m_appearance = params;
+            appearanceChanged();
         } else if (method == "shutdown") {
             shuttingDown();
             answer(Json::Object {});
@@ -1046,12 +1096,14 @@ private:
     }
 
     detail::LineReader m_reader {::GetStdHandle(STD_INPUT_HANDLE)};
+    HANDLE m_out = ::GetStdHandle(STD_OUTPUT_HANDLE);
     std::mutex m_sendMutex;
     std::deque<std::string> m_queued; // lines that came while a tool call waited
     long long m_nextId = 1;
     Json m_settings;
     std::string m_locale = "zh";
     std::string m_theme = "light";
+    Json m_appearance;
     std::string m_pluginDir;
     std::string m_dataDir;
 };

@@ -20,6 +20,7 @@ Item {
     required property bool missing
     required property bool selected
     property NameTip nameTip: null
+    property real dpr: 1 // the window's, passed by the gallery (GitHub #111)
     readonly property bool current: GridView.isCurrentItem
     readonly property var results: GridView.view ? GridView.view.model : null
     readonly property int selectedCount: results ? results.selectedCount : 0
@@ -28,6 +29,8 @@ Item {
     signal doubleClicked(int index, int modifiers)
     signal menuRequested(int index, point globalPos, int modifiers)
     signal dragRequested(int index)
+    signal previewRequested(int index)
+    signal hoverMoved(int index, point globalPos)
 
     Accessible.role: Accessible.ListItem
     Accessible.name: name
@@ -60,7 +63,7 @@ Item {
         radius: Theme.controlRadius
         color: tile.selected || (tile.current && tile.selectedCount === 0)
             ? Theme.selection : area.containsMouse ? Theme.hover : "transparent"
-        border.width: tile.current ? Theme.edge(Screen.devicePixelRatio) : 0
+        border.width: tile.current ? Theme.edge(tile.dpr) : 0
         border.color: Theme.accent
     }
 
@@ -98,7 +101,7 @@ Item {
         y: picture.y + picture.height + 6
         width: parent.width - 24
         text: tile.results && tile.nameMatches.length > 0
-            ? tile.results.elidedHtml(tile.name, tile.nameMatches, width, font, tile.results.highlightColor) : tile.name
+            ? tile.results.elidedHtml(tile.name, tile.nameMatches, width, font, tile.results.highlightColor, tile.results.highlightWeight) : tile.name
         textFormat: tile.nameMatches.length > 0 ? Text.StyledText : Text.PlainText
         elide: Text.ElideMiddle
         horizontalAlignment: Text.AlignHCenter
@@ -120,7 +123,7 @@ Item {
         id: area
         anchors.fill: parent
         hoverEnabled: true
-        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
         property point pressedAt
         property bool draggedOut: false
         onPressed: mouse => {
@@ -133,6 +136,7 @@ Item {
         onPositionChanged: mouse => {
             if (!pressed) {
                 tile.offerTip()
+                tile.hoverMoved(tile.index, mapToGlobal(mouse.x, mouse.y))
             } else if (preventStealing && !draggedOut && (mouse.buttons & Qt.LeftButton)
                 && Math.hypot(mouse.x - pressedAt.x, mouse.y - pressedAt.y) >= Application.styleHints.startDragDistance) {
                 draggedOut = true
@@ -145,12 +149,16 @@ Item {
                 return
             if (mouse.button === Qt.RightButton)
                 tile.menuRequested(tile.index, mapToGlobal(mouse.x, mouse.y), mouse.modifiers)
+            else if (mouse.button === Qt.MiddleButton)
+                tile.previewRequested(tile.index)
             else
                 tile.clicked(tile.index, mouse.modifiers)
         }
         onDoubleClicked: mouse => {
             if (mouse.button === Qt.LeftButton && !draggedOut)
                 tile.doubleClicked(tile.index, mouse.modifiers)
+            else if (mouse.button === Qt.MiddleButton)
+                tile.previewRequested(tile.index)
         }
     }
 }

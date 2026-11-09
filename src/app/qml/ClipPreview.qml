@@ -9,6 +9,8 @@ import WinShun
 Item {
     id: preview
 
+    property UiScale metrics: Theme.metrics
+    readonly property real dpr: Screen.devicePixelRatio
     property var info: ({}) // Clipboard.preview(row)
     readonly property string entryId: info.id ?? ""
     property bool completed: false
@@ -22,6 +24,9 @@ Item {
         }
     }
     property real parentTop // where the parent's top is in the window: to draw on whole device pixels
+    property real resizeMargin: 0
+    property bool compact: false
+    readonly property real naturalHeight: content.implicitHeight + meta.implicitHeight + 34
     signal copyRequested(string text, bool remember) // one of a colour's notations, a picture's words
 
     // A picture's words: those selected with the mouse, or all of them, copied
@@ -40,6 +45,7 @@ Item {
 
     Flickable {
         id: flick
+        objectName: "clipboardPreviewContent"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
@@ -93,15 +99,21 @@ Item {
                 Repeater {
                     model: preview.info.colors ?? []
 
-                    delegate: Rectangle {
+                    delegate: Item {
                         id: notation
 
                         required property var modelData
 
                         width: parent.width
                         height: 32
-                        radius: Theme.largeControlRadius
-                        color: notationArea.containsMouse ? Theme.hover : "transparent"
+
+                        Hook { // the style's hover under an entry a click copies
+                            anchors.fill: parent
+                            part: Theme.rowHighlight
+                            hovered: notationArea.containsMouse
+                            role: "list"
+                            dpr: preview.dpr
+                        }
 
                         Text {
                             id: notationLabel
@@ -111,7 +123,7 @@ Item {
                             width: 48 // "ARGB" and a gap
                             text: notation.modelData.label
                             color: Theme.faint
-                            font.pixelSize: Theme.uiCaption
+                            font.pixelSize: preview.metrics.uiCaption
                         }
                         Text {
                             anchors.left: notationLabel.right
@@ -122,7 +134,7 @@ Item {
                             textFormat: Text.PlainText
                             elide: Text.ElideRight
                             color: Theme.text
-                            font.pixelSize: Theme.uiBody
+                            font.pixelSize: preview.metrics.uiBody
                         }
                         Glyph {
                             id: copyGlyph
@@ -152,7 +164,7 @@ Item {
                 textFormat: Text.PlainText
                 wrapMode: Text.WrapAnywhere
                 color: preview.kind === 1 ? Theme.accent : Theme.text
-                font.pixelSize: Theme.uiBody
+                font.pixelSize: preview.metrics.uiBody
                 lineHeight: 1.15
             }
 
@@ -160,14 +172,14 @@ Item {
                 visible: preview.kind <= 2 && (preview.info.more ?? 0) > 0
                 text: qsTr("…还有 %Ln 字", "", preview.info.more ?? 0)
                 color: Theme.faint
-                font.pixelSize: Theme.uiCaption
+                font.pixelSize: preview.metrics.uiCaption
             }
 
             Item { // only the selected preview decodes animation frames
                 id: picture
 
                 readonly property real fit: Math.min(1, parent.width / Math.max(1, preview.info.width ?? 1),
-                                                     (flick.height - 4) / Math.max(1, preview.info.height ?? 1))
+                                                     (preview.compact ? 280 : flick.height - 4) / Math.max(1, preview.info.height ?? 1))
                 readonly property bool animated: preview.info.animated ?? false
                 readonly property string imageSource: preview.info.image ?? ""
                 readonly property Image loadedImage: viewer.status === Loader.Ready ? viewer.item as Image : null
@@ -201,8 +213,7 @@ Item {
                         sourceSize.height: Math.max(1, Math.round(picture.height * Screen.devicePixelRatio))
                         fillMode: Image.PreserveAspectFit
                         autoTransform: true
-                        asynchronous: true
-                        cache: false
+                        asynchronous: true // kept decoded: hovering back to a picture shows it at once
                     }
                 }
 
@@ -230,7 +241,7 @@ Item {
                     horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.Wrap
                     color: picture.failed ? Theme.danger : Theme.faint
-                    font.pixelSize: Theme.uiCaption
+                    font.pixelSize: preview.metrics.uiCaption
                 }
 
                 Rectangle {
@@ -242,6 +253,7 @@ Item {
             }
 
             FlatButton {
+                dpr: preview.dpr
                 objectName: "clipboardAnimationToggle"
                 visible: preview.kind === 4 && picture.animated
                 enabled: picture.ready
@@ -269,15 +281,24 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("图中的文字")
                         color: Theme.faint
-                        font.pixelSize: Theme.uiCaption
+                        font.pixelSize: preview.metrics.uiCaption
                     }
-                    Rectangle { // copies the words selected, or all of them
+                    Item { // copies the words selected, or all of them
                         id: copyWordsButton
                         anchors.right: parent.right
                         width: copyWordsRow.implicitWidth + 16
                         height: 26
-                        radius: Theme.largeControlRadius
-                        color: copyWordsArea.containsMouse ? Theme.hover : "transparent"
+
+                        Hook { // the style's key, flat until hovered
+                            id: copyWordsKey
+                            anchors.fill: parent
+                            part: Theme.keySurface
+                            hovered: copyWordsArea.containsMouse
+                            pressed: copyWordsArea.pressed
+                            flat: true
+                            role: "toolbar"
+                            dpr: preview.dpr
+                        }
 
                         Row {
                             id: copyWordsRow
@@ -294,7 +315,7 @@ Item {
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: preview.selectedWords.length > 0 ? qsTr("复制选中") : qsTr("复制文字")
                                 color: Theme.accent
-                                font.pixelSize: Theme.uiCaption
+                                font.pixelSize: preview.metrics.uiCaption
                             }
                         }
                         MouseArea {
@@ -321,7 +342,7 @@ Item {
                     color: Theme.subtext
                     selectionColor: Theme.textSelection
                     selectedTextColor: Theme.text
-                    font.pixelSize: Theme.uiBody
+                    font.pixelSize: preview.metrics.uiBody
                 }
             }
 
@@ -368,7 +389,7 @@ Item {
                         required property var modelData
 
                         width: parent.width
-                        height: Theme.fileRowHeight
+                        height: preview.metrics.fileRowHeight
 
                         Image {
                             id: fileIcon
@@ -394,7 +415,7 @@ Item {
                                 textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
                                 color: file.modelData.missing ? Theme.faint : Theme.text
-                                font.pixelSize: Theme.uiBody
+                                font.pixelSize: preview.metrics.uiBody
                                 font.strikeout: file.modelData.missing
                             }
                             Text {
@@ -403,7 +424,7 @@ Item {
                                 textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
                                 color: Theme.faint
-                                font.pixelSize: Theme.uiCaption
+                                font.pixelSize: preview.metrics.uiCaption
                             }
                         }
                     }
@@ -413,7 +434,7 @@ Item {
                     visible: preview.kind === 3 && (preview.info.more ?? 0) > 0
                     text: qsTr("还有 %Ln 个", "", preview.info.more ?? 0)
                     color: Theme.faint
-                    font.pixelSize: Theme.uiCaption
+                    font.pixelSize: preview.metrics.uiCaption
                 }
             }
         }
@@ -424,12 +445,15 @@ Item {
         visible: preview.kind < 0
         text: qsTr("没有可预览的内容")
         color: Theme.faint
-        font.pixelSize: Theme.uiBody
+        font.pixelSize: preview.metrics.uiBody
     }
 
     ListScrollBar {
+        dpr: preview.dpr
+        objectName: "clipboardPreviewScrollBar"
         flickable: flick
         anchors.right: parent.right
+        anchors.rightMargin: preview.resizeMargin
         anchors.top: flick.top
         anchors.bottom: flick.bottom
     }
@@ -446,10 +470,11 @@ Item {
         spacing: 6
         visible: preview.kind >= 0
 
-        Rectangle {
+        Hook { // the style's seam
             width: parent.width
-            height: Theme.edge(Screen.devicePixelRatio)
-            color: Theme.divider
+            height: Theme.edge(preview.dpr)
+            part: Theme.separator
+            dpr: preview.dpr
         }
 
         Row {
@@ -473,7 +498,7 @@ Item {
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
                 color: Theme.subtext
-                font.pixelSize: Theme.uiCaption
+                font.pixelSize: preview.metrics.uiCaption
             }
         }
 
@@ -481,9 +506,10 @@ Item {
             width: parent.width
             text: [preview.info.time ?? "", preview.info.size ?? ""].filter(s => s.length > 0).join(" · ")
             textFormat: Text.PlainText
-            elide: Text.ElideRight
+            wrapMode: preview.compact ? Text.Wrap : Text.NoWrap
+            elide: preview.compact ? Text.ElideNone : Text.ElideRight
             color: Theme.faint
-            font.pixelSize: Theme.uiCaption
+            font.pixelSize: preview.metrics.uiCaption
         }
 
         Text {
@@ -495,7 +521,7 @@ Item {
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             color: Theme.faint
-            font.pixelSize: Theme.uiCaption
+            font.pixelSize: preview.metrics.uiCaption
         }
     }
 }

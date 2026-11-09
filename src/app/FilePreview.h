@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QDeadlineTimer>
 #include <QElapsedTimer>
 #include <QImage>
 #include <QMutex>
@@ -16,6 +17,9 @@
 #include <QVector>
 #include <QtQml/qqmlregistration.h>
 
+#include "PictureFile.h"
+#include "PreviewPlacement.h"
+
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -31,13 +35,6 @@ class PreviewHost;
 namespace extpreview {
 enum class Engine;
 }
-
-// A picture file's first frame (PNG, JPEG, BMP, GIF, WebP, … whatever
-// Windows Imaging Component reads), upright as the camera says, at most
-// `largest` pixels on its longer side (0: as stored); null if it cannot be
-// read. Any thread with COM initialised. For 贴到屏幕 (dist has no Qt image
-// plugins: QImage alone reads PNG and BMP only).
-QImage decodePictureFile(const QString& path, int largest, QSize* original = nullptr);
 
 // A look at a result's file without opening it (Alt+P on a row, 预览 in its
 // menu; the forum's #157, #162, #225): QuickLook (QL-Win) or Seer when one of
@@ -82,19 +79,35 @@ public:
     Q_ENUM(Kind)
 
     struct Item {
-        QString path;
+        QString path; // the file; a plugin's row with none of its own: that row's (winshun-plugin:…)
         QString name;
         bool isDir = false;
+        // A plugin's details in place of a file (GitHub #202): its text, or
+        // why there is none (yet).
+        std::shared_ptr<const QString> text;
+        QString message;
+        bool inPlace() const { return text || !message.isEmpty(); }
+        bool same(const Item& other) const
+        {
+            return path.compare(other.path, Qt::CaseInsensitive) == 0 && text == other.text && message == other.message;
+        }
     };
 
     explicit FilePreview(QObject* parent = nullptr);
     ~FilePreview() override;
 
+    // Shown inside another window's page (the search panel's 预览 tab,
+    // GitHub #224) rather than a window of its own: never QuickLook or
+    // Seer, no window made or placed; a document's handler goes over the
+    // area of the page it is given (setHandlerArea), in that page's window.
+    // Its pictures under "image://<scheme>/".
+    explicit FilePreview(QString imageScheme, bool embedded, QObject* parent = nullptr);
+
     // The app's part: the window (made the first time it is wanted, with
     // its frame ready), the launcher it goes beside, the settings.
     void setWindowFactory(std::function<QQuickWindow*()> factory) { m_makeWindow = std::move(factory); }
     void setLauncherWindow(QWindow* launcher);
-    void setBuiltInOnly(bool on) { m_builtInOnly = on; } // 预览方式: 内置
+    void setBuiltInOnly(bool on) { m_builtInOnly = on || m_embedded; } // 预览方式: 内置
     void setDark(bool dark);
     // Text files besides the usual ones (the content search's kinds).
     void setTextExtensions(QStringList extensions);
@@ -110,6 +123,9 @@ public:
     void show(const Item& item);
     // Open: the current row's file now (none: a row that is not a file).
     void follow(const std::optional<Item>& item);
+    // The pointer went on to another row: a followed file's handler that has
+    // not started yet waits again (load).
+    void postponeHandler();
     Q_INVOKABLE void close();
     // The × in the header: closes, and says so (the launcher then does not
     // bring the preview back the next time it opens).
@@ -130,13 +146,22 @@ public:
     QStringListModel* lines() { return &m_lines; }
     int lineCount() const { return m_lineCount; }
     Q_INVOKABLE int lineNumberAt(int row) const { return row >= 0 && row < m_lineNumbers.size() ? m_lineNumbers[row] : 0; }
+    // The text picked with the mouse, from a position in a row to one in a
+    // later row (the window draws it); selectedText: as in the file, pieces
+    // of one long line joined again. Gone with the content.
+    Q_INVOKABLE void setSelection(int fromRow, int fromPos, int toRow, int toPos);
+    QString selectedText() const;
     QStringList facts() const { return m_facts; }
     QString message() const { return m_message; }
     bool slow() const { return m_slow; }
 
     Q_INVOKABLE void openFile(); // 打开 in the header: as Enter on the row
-    // The content area, where a preview handler draws (PreviewWindow.qml).
+    // The content area, where a preview handler draws (PreviewBody.qml).
     Q_INVOKABLE void setHandlerArea(QQuickItem* area);
+    // The window holding the area moved: the handler's window goes along.
+    void placeHandler();
+    // Where a handler draws on the screen now (physical), if one does.
+    std::optional<QRect> handlerRect() const;
 
     // "image://preview/<n>": the picture, or the thumbnail, of the file shown.
     QQuickImageProvider* imageProvider();
@@ -151,11 +176,10 @@ private:
     struct Loaded; // what the worker found out
     class Images;
 
-    void load(const Item& item);
+    void load(const Item& item, bool followed = false); // followed: a handler waits until the row stayed
     void apply(quint64 generation, std::shared_ptr<Loaded> loaded);
     void showWindow(QSize wanted); // logical
     QRect placeBeside(QSize wanted); // the window's place by the launcher (logical)
-    void placeHandler();
     void startHandler(quint64 generation, const QUuid& handler);
     void handlerFailed(quint64 generation);
     bool screenRect(QQuickItem* item, int* left, int* top, int* right, int* bottom) const; // physical
@@ -166,6 +190,8 @@ private:
     QPointer<QQuickWindow> m_window;
     QPointer<QWindow> m_launcher;
     QPointer<QQuickItem> m_handlerArea;
+    const QString m_imageScheme = QStringLiteral("preview");
+    const bool m_embedded = false;
     bool m_builtInOnly = false;
     bool m_dark = false;
     QStringList m_textExtensions;
@@ -175,6 +201,7 @@ private:
     QElapsedTimer m_externalSince; // its window comes a moment after it is asked
     Item m_item;
     std::atomic<quint64> m_generation {0};
+    QDeadlineTimer m_handlerNotBefore; // load(followed): when its handler may start (expired: at once)
     ComWorker* m_worker = nullptr; // never deleted: a shell call may still be running at exit
     std::unique_ptr<PreviewHost> m_host;
     std::shared_ptr<Images> m_images;
@@ -185,10 +212,11 @@ private:
     QSize m_imageSize;
     QStringListModel m_lines;
     QVector<int> m_lineNumbers;
+    int m_selFromRow = 0, m_selFromPos = 0, m_selToRow = 0, m_selToPos = 0; // empty when equal
     int m_lineCount = 0;
     int m_textRows = 0;
-    int m_side = -1; // placeBeside: right, left, below, or over the middle; -1 not chosen yet
-    QRect m_sideFor; // the launcher's place when it was chosen
+    PreviewSide m_side = PreviewSide::None; // placeBeside's side; None: not chosen yet
+    QRect m_sideArea; // reset the side only when the monitor/work area changes
     bool m_overLauncher = false; // no room beside it: in front of it
     QStringList m_facts;
     QString m_message;

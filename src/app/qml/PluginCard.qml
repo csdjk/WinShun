@@ -15,6 +15,13 @@ import WinShun
 Rectangle {
     id: card
 
+    property SettingsEditor editor: null
+    required property bool webSearch
+    readonly property real dpr: Screen.devicePixelRatio // one Screen attached object for all its items (GitHub #111)
+    readonly property Item webOptions: detailsLoader.item ? detailsLoader.item.webOptions : null
+    readonly property bool detailsSettled: !expanded || (detailsLoader.item !== null
+        && Math.abs(details.height - detailsLoader.item.implicitHeight) < 0.5)
+    signal editWebShortcut(int index, Item button)
     required property PluginSettings plugins
     required property string pluginId
     required property string name
@@ -34,10 +41,17 @@ Rectangle {
     required property var permissions
     required property var settings
     required property bool hasReadme
+    required property bool settingsWindow // the plugin's own settings window: 设置 beside the switch
     required property bool hasData
     required property bool aiExpose // the manifest offers its commands to the AI: the switch below shows
     required property bool aiEnabled
     required property string aiNote
+    // `elevated` while Win顺 runs as administrator (PluginSettings' Card):
+    // "elevated" a shield by the name; "unconfirmed" / "changed" a line with
+    // 确认; "unavailable" and "confirming" (the copy being made) the line alone.
+    required property string elevation
+    required property string elevationNote
+    required property string elevationProblem // why the last 确认 did not work: under the note, here where it was clicked
     property bool marked: false // what the settings search found
     property bool expanded: false
     property bool animated: true // not in the offscreen preview: it draws no frames to run them
@@ -46,7 +60,7 @@ Rectangle {
     property string pendingFocus // the command whose keyword box takes the focus once made
 
     // Anything to unfold: a plugin that cannot be used has none.
-    readonly property bool hasDetails: keywords.length > 0 || aiExpose || permissions.length > 0 || settings.length > 0
+    readonly property bool hasDetails: webSearch || keywords.length > 0 || aiExpose || permissions.length > 0 || settings.length > 0
     readonly property color toneColor: tone === "ok" ? Theme.success
                                      : tone === "busy" ? Theme.accent
                                      : tone === "warn" ? Theme.caution
@@ -63,16 +77,29 @@ Rectangle {
         pendingFocus = command
     }
 
-    function onPixel(v) { return Math.round(v * Screen.devicePixelRatio) / Screen.devicePixelRatio }
+    function onPixel(v) { return Math.round(v * card.dpr) / card.dpr }
 
     onExpandedChanged: if (expanded) loadedOnce = true
     Component.onCompleted: if (expanded) loadedOnce = true
 
     implicitHeight: body.implicitHeight + 24
     radius: Theme.controlRadius
-    color: marked ? Theme.selection : "transparent"
-    border.width: 1
-    border.color: Theme.cardBorder
+    color: "transparent"
+
+    Hook { // the style's card (Theme.cardPart), a plate inside the section's
+        anchors.fill: parent
+        part: Theme.cardPart
+        corner: Theme.controlRadius
+        extra: ({ inset: true })
+        dpr: card.dpr
+    }
+    Rectangle { // found by the settings search: the card's face, marked
+        visible: card.marked
+        anchors.fill: parent
+        anchors.margins: Theme.edge(card.dpr)
+        radius: Math.max(0, Theme.controlRadius - Theme.edge(card.dpr))
+        color: Theme.selection
+    }
 
     Rectangle { // found by the settings search: a mark by the name, as SettingRow has
         visible: card.marked
@@ -112,7 +139,7 @@ Rectangle {
                 y: 2
 
                 Image { // whole device pixels, unsmoothed (see ResultRow)
-                    readonly property real dpr: Screen.devicePixelRatio
+                    readonly property real dpr: card.dpr
                     readonly property int pixels: Math.round(32 * dpr)
 
                     x: 1 / 64
@@ -146,10 +173,33 @@ Rectangle {
                         textFormat: Text.PlainText
                         color: Theme.text
                         font.pixelSize: Theme.fontBody
-                        font.weight: Font.DemiBold
+                        font.weight: Theme.fontStrong
                         elide: Text.ElideRight
                         width: Math.min(implicitWidth, parent.width - (bundledTag.visible ? bundledTag.width + 8 : 0)
-                                                        - (aiTag.visible ? aiTag.width + 8 : 0))
+                                                        - (aiTag.visible ? aiTag.width + 8 : 0)
+                                                        - (shield.visible ? shield.width + 8 : 0))
+                    }
+                    Glyph { // it runs as administrator, as Win顺 does
+                        id: shield
+                        visible: card.elevation === "elevated"
+                        anchors.verticalCenter: nameText.verticalCenter
+                        width: 16
+                        height: 16
+                        glyph: String.fromCharCode(0xE7EF) // Admin: Phosphor's shield-check
+                        size: 14
+                        color: Theme.subtext
+                        Accessible.role: Accessible.Graphic
+                        Accessible.name: card.elevationNote
+
+                        MouseArea {
+                            id: shieldArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                        }
+                        HoverTip {
+                            target: shieldArea.containsMouse ? shield : null
+                            text: card.elevationNote
+                        }
                     }
                     Tag { // 随包: it came with Win顺
                         id: bundledTag
@@ -190,11 +240,11 @@ Rectangle {
                             y: Math.round(statusText.y + statusText.fontInfo.pixelSize * 0.62 - height / 2)
                             width: 8
                             height: 8
-                            radius: 4
+                            radius: Theme.pillRadius(width)
                             color: card.toneColor
 
                             SequentialAnimation on opacity { // starting
-                                running: card.tone === "busy" && SystemTheme.animations
+                                running: card.tone === "busy" && SystemTheme.animations && (card.Window.window?.visible ?? false) // the hidden settings window kept: no frames to drive
                                 loops: Animation.Infinite
                                 alwaysRunToEnd: true
                                 NumberAnimation { to: 0.3; duration: 600; easing.type: Easing.InOutSine }
@@ -220,30 +270,76 @@ Rectangle {
                     Repeater {
                         model: card.keywords.filter(k => k.keyword.length > 0)
 
-                        delegate: Rectangle { // the keyword, as keys to press; a click goes to its box
+                        delegate: Item { // the keyword, as keys to press; a click goes to its box
                             id: keycap
 
                             required property var modelData
 
                             width: Math.max(28, keycapText.implicitWidth + 14)
                             height: 24
-                            radius: Theme.controlRadius
-                            color: Theme.keycap
 
+                            Hook { // the style's key (Theme.keySurface): it can be pressed
+                                id: keycapPart
+                                anchors.fill: parent
+                                part: Theme.keySurface
+                                hovered: keycapArea.containsMouse
+                                pressed: keycapArea.pressed
+                                role: "toolbar"
+                                dpr: card.dpr
+                            }
                             Text {
                                 id: keycapText
                                 anchors.centerIn: parent
+                                anchors.verticalCenterOffset: keycapPart.out("contentOffsetY", 0)
                                 text: keycap.modelData.keyword
                                 textFormat: Text.PlainText
-                                color: keycap.modelData.conflict.length > 0 ? Theme.danger : Theme.text
+                                color: keycap.modelData.conflict.length > 0 ? Theme.danger : keycapPart.out("foreground", Theme.text)
                                 font.pixelSize: Theme.fontCaption
                             }
                             MouseArea {
+                                id: keycapArea
                                 anchors.fill: parent
+                                hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: card.focusKeyword(keycap.modelData.command)
                             }
                         }
+                    }
+                }
+                Column { // `elevated` waits for the user (or cannot be): why, what the last 确认 came to, and the one click
+                    visible: card.elevation === "unconfirmed" || card.elevation === "changed" || card.elevation === "unavailable"
+                             || card.elevation === "confirming"
+                    width: parent.width
+                    spacing: 6
+
+                    Text {
+                        width: parent.width
+                        text: card.elevationNote
+                        textFormat: Text.PlainText
+                        color: Theme.caution
+                        font.pixelSize: Theme.fontCaption
+                        wrapMode: Text.Wrap
+                        lineHeight: 1.15
+                    }
+                    Text {
+                        objectName: "elevationProblem"
+                        visible: card.elevationProblem.length > 0
+                        width: parent.width
+                        text: card.elevationProblem
+                        textFormat: Text.PlainText
+                        color: Theme.danger
+                        font.pixelSize: Theme.fontCaption
+                        wrapMode: Text.Wrap
+                        lineHeight: 1.15
+                    }
+                    FlatButton {
+                        dpr: card.dpr
+                        objectName: "elevationConfirm"
+                        visible: card.elevation === "unconfirmed" || card.elevation === "changed"
+                        anchors.right: parent.right
+                        implicitHeight: 28
+                        text: card.elevationProblem.length > 0 ? qsTr("再试一次") : qsTr("确认")
+                        onClicked: card.plugins.confirmElevation(card.pluginId)
                     }
                 }
             }
@@ -254,13 +350,23 @@ Rectangle {
                 y: 0
                 spacing: 8
 
+                FlatButton { // the plugin's own window, while it runs
+                    dpr: card.dpr
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: card.settingsWindow && card.usable && card.pluginEnabled
+                    implicitHeight: 32
+                    text: qsTr("设置")
+                    onClicked: card.plugins.showSettings(card.pluginId)
+                }
                 ToggleSwitch {
+                    dpr: card.dpr
                     anchors.verticalCenter: parent.verticalCenter
                     enabled: card.usable
                     checked: card.pluginEnabled
                     onToggled: (on) => card.plugins.setEnabled(card.pluginId, on)
                 }
                 FlatButton { // the menu: 说明, 打开文件夹, 重新加载, 查看日志, 卸载
+                    dpr: card.dpr
                     id: menuButton
                     anchors.verticalCenter: parent.verticalCenter
                     implicitHeight: 32
@@ -322,13 +428,24 @@ Rectangle {
         id: detailsComponent
 
         Column {
+            property alias webOptions: webOptionsLoader.item
             width: detailsLoader.width
             spacing: 12
 
             Rectangle {
                 width: parent.width
-                height: Theme.edge(Screen.devicePixelRatio)
+                height: Theme.edge(card.dpr)
                 color: Theme.divider
+            }
+
+            Loader {
+                id: webOptionsLoader
+                width: parent.width
+                active: card.webSearch && card.expanded && card.pluginEnabled && card.editor !== null
+                sourceComponent: WebSearchOptions {
+                    editor: card.editor
+                    onEditRequested: (index, button) => card.editWebShortcut(index, button)
+                }
             }
 
             Column { // the keywords: two to a line where they fit
@@ -390,6 +507,7 @@ Rectangle {
                                     elide: Text.ElideRight
                                 }
                                 InputBox {
+                                    dpr: card.dpr
                                     id: keywordBox
                                     anchors.left: keywordLabel.right
                                     anchors.leftMargin: 8
@@ -405,6 +523,7 @@ Rectangle {
                                     }
                                 }
                                 FlatButton { // the keyword was changed: back to the plugin's
+                                    dpr: card.dpr
                                     id: resetButton
                                     visible: keywordCell.modelData.user
                                     anchors.right: parent.right
@@ -460,6 +579,7 @@ Rectangle {
                     }
                 }
                 ToggleSwitch {
+                    dpr: card.dpr
                     id: aiSwitch
                     anchors.right: parent.right
                     y: Math.round((aiColumn.implicitHeight - height) / 2)
@@ -549,7 +669,7 @@ Rectangle {
 
                 Rectangle {
                     width: parent.width
-                    height: Theme.edge(Screen.devicePixelRatio)
+                    height: Theme.edge(card.dpr)
                     color: Theme.divider
                 }
 
@@ -614,6 +734,7 @@ Rectangle {
                             Component {
                                 id: boolControl
                                 ToggleSwitch {
+                                    dpr: card.dpr
                                     checked: settingRow.modelData.value === true
                                     onToggled: (on) => card.plugins.setSettingValue(card.pluginId, settingRow.modelData.key, on)
                                 }
@@ -672,6 +793,7 @@ Rectangle {
                                         onActivated: (index) => choice.choose(index)
                                     }
                                     FlatButton {
+                                        dpr: card.dpr
                                         id: menuButton
                                         visible: !choice.fits
                                         implicitHeight: 32
@@ -706,6 +828,7 @@ Rectangle {
                                         elide: Text.ElideMiddle
                                     }
                                     FlatButton {
+                                        dpr: card.dpr
                                         implicitHeight: 32
                                         text: qsTr("选择")
                                         onClicked: settingRow.kind === "folder" ? card.plugins.pickFolderSetting(card.pluginId, settingRow.modelData.key)

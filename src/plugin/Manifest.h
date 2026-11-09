@@ -46,6 +46,11 @@ enum class Permission : std::uint32_t {
     WinshunContent = 1u << 10,
     Notifications = 1u << 11, // winshun/notify with "toast": a system notification (Host gates it)
     NetworkListen = 1u << 12, // it opens ports for devices nearby (a declaration)
+    SystemSettings = 1u << 13, // change Windows settings; switch-provider integration
+    // Runs as administrator when Win顺 itself does (never a UAC prompt of its
+    // own): only runtime.program exe, not with sandbox strict, and only from
+    // the copy the user confirmed (Elevation.h).
+    Elevated = 1u << 14,
 };
 
 struct Permissions {
@@ -69,6 +74,7 @@ struct Runtime {
     RunMode mode = RunMode::Once;
     Program program = Program::Python;
     QString programPath; // Program::Exe: relative to the plugin folder
+    QString hostQtVersion; // nonempty: opt in to the host's Qt, major.minor[.minimumPatch]
     QStringList args;
     QString script; // relative to the plugin folder; empty for Exe
     QString cwd; // relative to the plugin folder; empty: the folder
@@ -133,6 +139,7 @@ struct Command {
     QList<Action> actions;
     Run run; // Kind::None: the plugin's process answers
     int cacheSeconds = 0;
+    bool contentSearch = false; // optional provider of indexed content results
     QJsonObject ai;
     bool zeroCode() const noexcept { return run.kind != Run::Kind::None; }
     friend bool operator==(const Command&, const Command&) = default;
@@ -164,6 +171,17 @@ struct Manifest {
     QList<Command> commands;
     QList<Setting> settings;
     bool aiExpose = false;
+    // A resident plugin with windows of its own (`ui`; GitHub #138): a
+    // submenu of Win顺's tray menu with this title, its entries asked for
+    // (trayMenu) as the menu opens; what it does with Win顺's pictures (the
+    // clipboard history's, picture files among the results): "pin" (贴到屏幕)
+    // and "edit" (编辑), asked for as `picture`; a 设置 button on its card
+    // that asks it to show its own settings window (showSettings).
+    Text trayMenu;
+    QStringList pictures;
+    bool settingsWindow = false;
+    bool systemSwitches = false; // provider of the search UI's existing switch rows
+    bool webSearch = false; // declarative URL provider; no process or static keyword commands
 
     const Command* command(QStringView commandId) const;
     bool resident() const noexcept { return runtime && runtime->mode == RunMode::Resident; }

@@ -1,13 +1,24 @@
 #include "Settings.h"
+#include "DoubleTapAction.h"
+#include "WebSearchConfig.h"
+#include "PreviewShortcut.h"
 #include "Query.h"
+#include "SettingsCommand.h"
+#include "StartupAccess.h"
 
 #include "ServiceVolumeAccess.h"
+#include "platform/InputMode.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QFileInfo>
+#include <QFile>
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <algorithm>
+#include <windows.h>
+#include <shellapi.h>
 
 using namespace Qt::StringLiterals;
 
@@ -22,6 +33,648 @@ class SettingsTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void pureSearchPreference()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(!settings.pureSearch);
+        settings.pureSearch = true;
+        QVERIFY(settings.saveChecked());
+        ws::Settings restored;
+        restored.load();
+        QVERIFY(restored.pureSearch);
+        restored.pureSearch = false;
+        QVERIFY(restored.saveChecked());
+        settings.load();
+        QVERIFY(!settings.pureSearch);
+    }
+    void doubleTapActionPreference()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.doubleTapAction, u"launcher"_s);
+        for (const QString& action : {u"clipboard"_s, ws::doubletap::encode(u"winshun.capture"_s, u"Win+Shift+S"_s)}) {
+            settings.doubleTapAction = action;
+            QVERIFY(settings.saveChecked());
+            ws::Settings restored;
+            restored.load();
+            QCOMPARE(restored.doubleTapAction, action);
+            QCOMPARE(restored.doubleTapKey, u"ctrl"_s);
+        }
+        const auto decoded = ws::doubletap::decode(settings.doubleTapAction);
+        QCOMPARE(decoded.plugin, u"winshun.capture"_s);
+        QCOMPARE(decoded.key, u"Win+Shift+S"_s);
+        for (const QString& invalid : {u"bad"_s, u"plugin:/Ctrl+A"_s, u"plugin:x/"_s, u"plugin:../Ctrl+A"_s}) {
+            settings.doubleTapAction = invalid;
+            QVERIFY(settings.saveChecked());
+            settings.load();
+            QCOMPARE(settings.doubleTapAction, u"launcher"_s);
+        }
+    }
+    void searchHistoryAndScopePreferences()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(!settings.mergeFileScope);
+        QCOMPARE(settings.queryHistoryKeys, u"ctrl"_s);
+        settings.mergeFileScope = true;
+        settings.queryHistoryKeys = u"alt"_s;
+        QVERIFY(settings.saveChecked());
+        ws::Settings restored;
+        restored.load();
+        QVERIFY(restored.mergeFileScope);
+        QCOMPARE(restored.queryHistoryKeys, u"alt"_s);
+        restored.queryHistoryKeys = u"off"_s;
+        QVERIFY(restored.saveChecked());
+        settings.load();
+        QCOMPARE(settings.queryHistoryKeys, u"off"_s);
+        restored.queryHistoryKeys = u"unknown"_s;
+        QVERIFY(restored.saveChecked());
+        settings.load();
+        QCOMPARE(settings.queryHistoryKeys, u"ctrl"_s);
+    }
+
+    void startupArgumentsRoundTrip()
+    {
+        const QStringList original {u"--profile"_s, u"F:\\中文 profile\\"_s, u"--background"_s,
+            u"--query"_s, u"say \"hello\" \\"_s, u"--settings-at"_s, QString()};
+        for (const auto& arguments : {original, ws::startupaccess::fallbackArguments(original)}) {
+            const QString line = u"WinShun.exe "_s + ws::startupaccess::commandLine(arguments);
+            int count = 0;
+            wchar_t** parsed = ::CommandLineToArgvW(line.toStdWString().c_str(), &count);
+            QVERIFY(parsed);
+            QStringList actual;
+            for (int i = 1; i < count; ++i)
+                actual.append(QString::fromWCharArray(parsed[i]));
+            ::LocalFree(parsed);
+            QCOMPARE(actual, arguments);
+        }
+    }
+
+    void pluginBuiltinsPreference()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(!settings.pluginBuiltinsExpanded);
+        settings.pluginBuiltinsExpanded = true;
+        QVERIFY(settings.saveChecked());
+        ws::Settings restored;
+        restored.load();
+        QVERIFY(restored.pluginBuiltinsExpanded);
+        restored.pluginBuiltinsExpanded = false;
+        QVERIFY(restored.saveChecked());
+        settings.load();
+        QVERIFY(!settings.pluginBuiltinsExpanded);
+    }
+
+    void startupIndexAccess()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        auto selected = ws::Settings::defaults();
+        selected.indexAccess = u"direct"_s;
+        QVERIFY(selected.saveChecked());
+        ws::Settings restarted;
+        restarted.load();
+        QCOMPARE(ws::startupaccess::storedMode(ws::Settings::filePath()), restarted.indexAccess);
+        using ws::startupaccess::needsElevation;
+        QVERIFY(needsElevation(restarted.indexAccess, true, false, false));
+        {
+            QSettings raw(ws::Settings::filePath(), QSettings::IniFormat);
+            raw.setValue(u"Index/Access"_s, u"  DiReCt  "_s);
+        }
+        QCOMPARE(ws::startupaccess::storedMode(ws::Settings::filePath()), u"direct"_s);
+        QVERIFY(!needsElevation(restarted.indexAccess, true, true, false));
+        QVERIFY(!needsElevation(restarted.indexAccess, false, false, false));
+        QVERIFY(!needsElevation(restarted.indexAccess, true, false, true));
+        for (const auto mode : {u"auto", u"service", u"walk"})
+            QVERIFY(!needsElevation(mode, true, false, false));
+        const QStringList arguments {u"--background"_s, u"--profile"_s, u"F:\\用户资料\\Win顺"_s,
+            u"--query"_s, u"report \"draft\""_s, u"--settings"_s, u"--settings-at"_s, u"indexAccess"_s};
+        const auto fallback = ws::startupaccess::fallbackArguments(arguments);
+        QCOMPARE(fallback.sliced(0, arguments.size()), arguments);
+        QCOMPARE(fallback.last(), ws::startupaccess::unelevatedOnce);
+        QCOMPARE(fallback.size(), arguments.size() + 1);
+        restarted.load();
+        QCOMPARE(restarted.indexAccess, u"direct"_s); // declining once does not change the next launch
+        QVERIFY(needsElevation(restarted.indexAccess, true, false, false));
+    }
+
+    void panelHotkeyPreference()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(settings.panelHotkey.isEmpty());
+        settings.hotkey = u"Alt+Space"_s;
+        settings.panelHotkey = u"Ctrl+Alt+F"_s;
+        QVERIFY(settings.saveChecked());
+        ws::Settings restored;
+        restored.load();
+        QCOMPARE(restored.panelHotkey, u"Ctrl+Alt+F"_s);
+        QCOMPARE(restored.hotkey, u"Alt+Space"_s);
+        restored.panelHotkey.clear();
+        QVERIFY(restored.saveChecked());
+        settings.load();
+        QVERIFY(settings.panelHotkey.isEmpty());
+        QCOMPARE(settings.hotkey, u"Alt+Space"_s);
+    }
+
+    void folderMenuInlineCounts()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.folderMenuRecentInline, 0);
+        QCOMPARE(settings.folderMenuWindowsInline, 0);
+        settings.folderMenuRecentInline = 3;
+        settings.folderMenuWindowsInline = 10;
+        QVERIFY(settings.saveChecked());
+        ws::Settings restored;
+        restored.load();
+        QCOMPARE(restored.folderMenuRecentInline, 3);
+        QCOMPARE(restored.folderMenuWindowsInline, 10);
+        {
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Launcher/FolderMenuRecentInline"_s, -1);
+            ini.setValue(u"Launcher/FolderMenuWindowsInline"_s, 50);
+        }
+        restored.load();
+        QCOMPARE(restored.folderMenuRecentInline, 0);
+        QCOMPARE(restored.folderMenuWindowsInline, 10);
+    }
+
+    void uiFontPreference()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(settings.uiFont.isEmpty());
+        for (const QString& family : {u"Microsoft YaHei UI"_s, u"未安装的字体"_s, QString()}) {
+            settings.uiFont = family;
+            QVERIFY(settings.saveChecked());
+            ws::Settings restored;
+            restored.load();
+            QCOMPARE(restored.uiFont, family); // portable profiles keep the user's choice on another PC
+        }
+    }
+
+    void keyboardHints()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(settings.shortcutHelp);
+        QVERIFY(settings.footerHints);
+        for (const bool help : {false, true}) {
+            for (const bool footer : {false, true}) {
+                settings.shortcutHelp = help;
+                settings.footerHints = footer;
+                settings.save();
+                ws::Settings restored;
+                restored.load();
+                QCOMPARE(restored.shortcutHelp, help);
+                QCOMPARE(restored.footerHints, footer);
+            }
+        }
+    }
+
+    void retiredExteriorLogoSetting_data()
+    {
+        QTest::addColumn<bool>("oldValue");
+        QTest::newRow("previously-shown") << true;
+        QTest::newRow("previously-hidden") << false;
+    }
+
+    void retiredExteriorLogoSetting()
+    {
+        QFETCH(bool, oldValue);
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        {
+            QSettings old(ws::Settings::filePath(), QSettings::IniFormat);
+            old.setValue(u"Appearance/SearchLogo"_s, oldValue);
+            old.setValue(u"Appearance/TaskbarIcon"_s, u"mono"_s);
+        }
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.taskbarIcon, u"mono"_s);
+        QVERIFY(settings.saveChecked());
+        QSettings saved(ws::Settings::filePath(), QSettings::IniFormat);
+        QVERIFY(!saved.contains(u"Appearance/SearchLogo"_s));
+        QCOMPARE(saved.value(u"Appearance/TaskbarIcon"_s).toString(), u"mono"_s);
+    }
+
+    void webPluginMigration()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        {
+            QSettings old(ws::Settings::filePath(), QSettings::IniFormat);
+            old.setValue(u"WebSearch/Defaults"_s, ws::kWebDefaultsVersion);
+            old.setValue(u"WebSearch/Suggestions"_s, false);
+            old.beginWriteArray(u"WebSearch"_s, 1);
+            old.setArrayIndex(0);
+            old.setValue(u"Keyword"_s, u"my"_s);
+            old.setValue(u"Name"_s, u"我的网站"_s);
+            old.setValue(u"Url"_s, u"https://example.test/?q=%s"_s);
+            old.setValue(u"Home"_s, u"https://example.test/home"_s);
+            old.setValue(u"Icon"_s, u"0123456789abcdef.png"_s);
+            old.setValue(u"Suggest"_s, QString());
+            old.endArray();
+            old.setValue(u"Plugin.winshun.web/Enabled"_s, true);
+            old.setValue(u"Plugin.winshun.web/Keyword.gh"_s, u"code"_s);
+            old.setValue(u"Plugin.winshun.web/Keyword.yt"_s, QString());
+            old.setValue(u"Plugin.winshun.web/Keyword.bd"_s, u"MY"_s); // The built-in retains this word.
+            old.sync();
+        }
+        ws::Settings migrated;
+        migrated.load();
+        QVERIFY(migrated.plugin(ws::webplugin::kId)->enabled);
+        QCOMPARE(migrated.webShortcuts.first().keyword, u"my"_s);
+        QCOMPARE(migrated.webShortcuts.first().icon, u"0123456789abcdef.png"_s);
+        QCOMPARE(migrated.webShortcuts.first().home, u"https://example.test/home"_s);
+        QVERIFY(migrated.webShortcuts.first().suggest.isEmpty());
+        QVERIFY(!migrated.webSuggestions);
+        QVERIFY(ws::typedKeyword(migrated.webShortcuts, u"code WinShun").has_value());
+        QVERIFY(!ws::typedKeyword(migrated.webShortcuts, u"gh WinShun").has_value());
+        QVERIFY(!ws::typedKeyword(migrated.webShortcuts, u"yt WinShun").has_value());
+        QCOMPARE(std::count_if(migrated.webShortcuts.cbegin(), migrated.webShortcuts.cend(), [](const auto& s) {
+            return s.keyword.compare(u"my", Qt::CaseInsensitive) == 0;
+        }), 1);
+        QVERIFY(migrated.saveChecked());
+        ws::Settings again;
+        again.load();
+        QCOMPARE(again.webShortcuts, migrated.webShortcuts);
+        QVERIFY(!again.webSuggestions);
+        // Disabling and deleting every website are both intentional, persistent choices.
+        again.pluginConfig(ws::webplugin::kId.toString()).enabled = false;
+        again.webShortcuts.clear();
+        QVERIFY(again.saveChecked());
+        ws::Settings disabled;
+        disabled.load();
+        QVERIFY(!disabled.plugin(ws::webplugin::kId)->enabled);
+        QVERIFY(disabled.webShortcuts.isEmpty());
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        QVERIFY(ini.contains(u"WebSearch/size"_s)); // Rollback source was not destroyed or re-imported.
+        QVERIFY(ini.value(u"Plugins/WebSearchMigrated"_s).toBool());
+    }
+
+    void webPluginFreshProfile()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings fresh;
+        fresh.load();
+        QVERIFY(!fresh.plugin(ws::webplugin::kId)->enabled);
+        QVERIFY(fresh.webShortcutsInUse().isEmpty());
+        QVERIFY(!fresh.webShortcuts.isEmpty()); // Ready when installed/enabled.
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        QVERIFY(!ini.contains(u"WebSearch/size"_s));
+        ws::Settings reopened;
+        reopened.load();
+        QVERIFY(!reopened.plugin(ws::webplugin::kId)->enabled);
+        reopened.pluginConfig(ws::webplugin::kId.toString()).enabled = true;
+        QCOMPARE(reopened.webShortcutsInUse(), reopened.webShortcuts);
+        reopened.pluginConfig(ws::webplugin::kId.toString()).enabled = false;
+        QVERIFY(reopened.webShortcutsInUse().isEmpty());
+    }
+
+    void webPluginCustomManifestMigration()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        const QString folder = profile.filePath(u"plugins/winshun.web"_s);
+        QVERIFY(QDir().mkpath(folder));
+        QFile manifest(folder + u"/plugin.json"_s);
+        QVERIFY(manifest.open(QIODevice::WriteOnly));
+        const auto command = QJsonObject {{u"id"_s, u"gh"_s}, {u"keyword"_s, u"old"_s}, {u"title"_s, u"自定义站点"_s},
+            {u"run"_s, QJsonObject {{u"url"_s, u"https://private.test/search?q=%s"_s}, {u"home"_s, u"https://private.test/start"_s}}}};
+        const QByteArray original = QJsonDocument(QJsonObject {{u"id"_s, u"winshun.web"_s}, {u"commands"_s, QJsonArray {command}}}).toJson();
+        manifest.write(original);
+        manifest.close();
+        QSettings old(ws::Settings::filePath(), QSettings::IniFormat);
+        old.setValue(u"Plugin.winshun.web/Enabled"_s, true);
+        old.setValue(u"Plugin.winshun.web/Keyword.gh"_s, u"custom"_s);
+        old.sync();
+        ws::Settings migrated;
+        migrated.load();
+        const auto match = ws::typedKeyword(migrated.webShortcuts, u"custom 汉字");
+        QVERIFY(match);
+        const auto& shortcut = migrated.webShortcuts[match->index];
+        QCOMPARE(shortcut.url, u"https://private.test/search?q=%s"_s);
+        QCOMPARE(shortcut.home, u"https://private.test/start"_s);
+        QCOMPARE(shortcut.name, u"自定义站点"_s);
+        QVERIFY(!ws::typedKeyword(migrated.webShortcuts, u"gh 汉字"));
+        QVERIFY(manifest.open(QIODevice::ReadOnly));
+        QCOMPARE(manifest.readAll(), original);
+    }
+
+    void onboardingLifecycle()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings fresh;
+        fresh.load();
+        QVERIFY(!fresh.onboardingComplete);
+        // load() writes defaults, but an interrupted welcome is still pending.
+        ws::Settings interrupted;
+        interrupted.load();
+        QVERIFY(!interrupted.onboardingComplete);
+        interrupted.onboardingComplete = true;
+        interrupted.onboardingCapturePending = true;
+        QVERIFY(interrupted.saveChecked());
+        ws::Settings completed;
+        completed.load();
+        QVERIFY(completed.onboardingComplete);
+        QVERIFY(completed.onboardingCapturePending);
+        completed.onboardingCapturePending = false;
+        QVERIFY(completed.saveChecked());
+        ws::Settings ready;
+        ready.load();
+        QVERIFY(!ready.onboardingCapturePending);
+    }
+
+    void onboardingExistingProfile()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        {
+            QSettings legacy(ws::Settings::filePath(), QSettings::IniFormat);
+            legacy.setValue(u"Clipboard/Enabled"_s, true);
+            legacy.setValue(u"Launcher/Hotkey"_s, u"Ctrl+Alt+F9"_s);
+            legacy.setValue(u"Content/Index"_s, true);
+            legacy.sync();
+        }
+        ws::Settings upgraded;
+        upgraded.load();
+        QVERIFY(upgraded.onboardingComplete);
+        QVERIFY(upgraded.clipboard);
+        QVERIFY(upgraded.contentIndex);
+        QCOMPARE(upgraded.hotkey, u"Ctrl+Alt+F9"_s);
+        // Prepared profiles and previews deliberately skip the first-run UI.
+        QVERIFY(ws::Settings::defaults().onboardingComplete);
+    }
+
+    void settingsSaveFailure()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        // A directory cannot be atomically replaced by a settings file.
+        QVERIFY(QDir().mkpath(ws::Settings::filePath()));
+        QVERIFY(!ws::Settings::defaults().saveChecked());
+    }
+
+    void systemSwitchesMigration()
+    {
+        const QString id = u"winshun.switches"_s;
+        {
+            QTemporaryDir profile;
+            QVERIFY(profile.isValid());
+            ws::Settings::useProfile(profile.path());
+            ws::Settings settings;
+            settings.load();
+            QVERIFY(!settings.plugin(id) || !settings.plugin(id)->enabled);
+            settings.save();
+            settings.load();
+            QVERIFY(!settings.plugin(id) || !settings.plugin(id)->enabled);
+        }
+        for (const bool oldSearchSystem : {true, false}) {
+            QTemporaryDir profile;
+            QVERIFY(profile.isValid());
+            ws::Settings::useProfile(profile.path());
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Results/SearchSystem"_s, oldSearchSystem);
+            ini.sync();
+            ws::Settings settings;
+            settings.load();
+            QVERIFY(settings.plugin(id));
+            QCOMPARE(settings.plugin(id)->enabled, oldSearchSystem);
+            QVERIFY(settings.plugin(id)->confirmed.contains(u"system:settings"_s));
+            for (ws::PluginConfig& config : settings.plugins)
+                if (config.id == id)
+                    config.enabled = false;
+            settings.save();
+            settings.load();
+            QVERIFY(!settings.plugin(id)->enabled);
+        }
+        {
+            QTemporaryDir profile;
+            QVERIFY(profile.isValid());
+            ws::Settings::useProfile(profile.path());
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Plugin.winshun.switches/Enabled"_s, false);
+            ini.sync();
+            ws::Settings settings;
+            settings.load();
+            QVERIFY(settings.plugin(id));
+            QVERIFY(!settings.plugin(id)->enabled);
+        }
+    }
+
+    void englishOnOpen()
+    {
+        // Off unless set: the input method as the user left it (GitHub #201).
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(!settings.englishOnOpen);
+        settings.englishOnOpen = true;
+        settings.save();
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        QCOMPARE(ini.value(u"Launcher/EnglishOnOpen"_s).toBool(), true);
+        ws::Settings restored;
+        restored.load();
+        QVERIFY(restored.englishOnOpen);
+        ini.setValue(u"Launcher/EnglishOnOpen"_s, false);
+        ini.sync();
+        restored.load();
+        QVERIFY(!restored.englishOnOpen);
+
+        // What it sets, and when it is still the user's untouched state.
+        using ws::win::InputMode;
+        const InputMode chinese {.open = true, .conversion = IME_CMODE_NATIVE | IME_CMODE_SYMBOL, .sentence = 8};
+        const InputMode letters = ws::win::lettersMode(chinese);
+        QVERIFY(!letters.open);
+        QCOMPARE(letters.conversion, DWORD {IME_CMODE_SYMBOL});
+        QCOMPARE(letters.sentence, DWORD {8});
+        QVERIFY(ws::win::sameLetters(letters, {.open = false, .conversion = IME_CMODE_ROMAN, .sentence = 0}));
+        QVERIFY(!ws::win::sameLetters(letters, {.open = true, .conversion = IME_CMODE_SYMBOL, .sentence = 8}));
+        QVERIFY(!ws::win::sameLetters(letters, {.open = false, .conversion = IME_CMODE_NATIVE, .sentence = 8}));
+        QVERIFY(!ws::win::lettersMode({.open = true, .conversion = IME_CMODE_FULLSHAPE}).open);
+        QCOMPARE(ws::win::lettersMode({.open = true, .conversion = IME_CMODE_FULLSHAPE}).conversion, DWORD {0});
+
+        // WeChat's input method, as read in the box (the native bit does not
+        // follow Shift): every opening switches, whatever it reads.
+        const auto opening = [](const InputMode& before) {
+            const InputMode after = ws::win::lettersMode(before); // what switchToLetters sets
+            return std::pair {after, !ws::win::sameLetters(after, before)};
+        };
+        const auto [first, firstChanged] = opening({.open = true, .conversion = IME_CMODE_NATIVE});
+        QVERIFY(firstChanged);
+        QCOMPARE(first, (InputMode {.open = false, .conversion = 0}));
+        const InputMode shifted {.open = true, .conversion = 0}; // Chinese again by Shift in the box
+        QVERIFY(!ws::win::sameLetters(shifted, first)); // the user's: not put back on closing
+        const auto [second, secondChanged] = opening(shifted); // the next opening
+        QVERIFY(secondChanged);
+        QCOMPARE(second, (InputMode {.open = false, .conversion = 0}));
+        QVERIFY(!opening({.open = false, .conversion = 0}).second); // English already: nothing to put back
+    }
+
+    void startListOptions()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.recentItems, 5);
+        QVERIFY(settings.favoritesOnStart);
+        settings.recentItems = 20;
+        settings.favoritesOnStart = false;
+        settings.save();
+        ws::Settings restored;
+        restored.load();
+        QCOMPARE(restored.recentItems, 20);
+        QVERIFY(!restored.favoritesOnStart);
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        for (const int invalid : {-1, 0, 10000}) {
+            ini.setValue(u"Results/RecentItems"_s, invalid);
+            ini.sync();
+            restored.load();
+            QCOMPARE(restored.recentItems, std::clamp(invalid, 1, 200));
+        }
+    }
+
+    void clipboardOpeningPosition()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QVERIFY(!settings.clipboardAtPointer);
+        QVERIFY(!settings.clipboardPauseInFullScreen);
+        for (const bool atPointer : {true, false}) {
+            settings.clipboardAtPointer = atPointer;
+            settings.clipboardPauseInFullScreen = atPointer;
+            settings.save();
+            ws::Settings restored;
+            restored.load();
+            QCOMPARE(restored.clipboardAtPointer, atPointer);
+            QCOMPARE(restored.clipboardPauseInFullScreen, atPointer);
+        }
+    }
+
+    // 剪贴板大小: its own step, kept as written; unknown names fall back to following 界面大小.
+    void clipboardUiSize()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.clipboardUiSize, u"follow"_s);
+        for (const QString size : {u"dense"_s, u"compact"_s, u"standard"_s, u"roomy"_s, u"follow"_s}) {
+            settings.clipboardUiSize = size;
+            settings.save();
+            ws::Settings restored;
+            restored.load();
+            QCOMPARE(restored.clipboardUiSize, size);
+        }
+        {
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Clipboard/UiSize"_s, u"huge"_s);
+        }
+        ws::Settings invalid;
+        invalid.load();
+        QCOMPARE(invalid.clipboardUiSize, u"follow"_s);
+    }
+
+    void previewHotkey()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.previewHotkey, u"Alt+P"_s);
+        for (const QString& key : {u"Space"_s, u"Ctrl+Shift+P"_s, u"F8"_s, QString()}) {
+            settings.previewHotkey = key;
+            settings.save();
+            ws::Settings restored;
+            restored.load();
+            QCOMPARE(restored.previewHotkey, key);
+        }
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        for (const QString& key : {u"P"_s, u"Enter"_s, u"Ctrl+C"_s, u"Ctrl+P"_s, u"Ctrl+J"_s, u"Alt+F4"_s, u"Shift+F10"_s}) {
+            ini.setValue(u"Results/PreviewHotkey"_s, key);
+            ini.sync();
+            settings.load();
+            QCOMPARE(settings.previewHotkey, u"Alt+P"_s);
+        }
+        ini.setValue(u"Results/PreviewHotkey"_s, u" ctrl + shift + p "_s);
+        ini.sync();
+        settings.load();
+        QCOMPARE(settings.previewHotkey, u"Ctrl+Shift+P"_s);
+        ini.remove(u"Results/PreviewHotkey"_s);
+        ini.sync();
+        settings.load();
+        QCOMPARE(settings.previewHotkey, u"Alt+P"_s);
+    }
+
+    void previewShortcutRules()
+    {
+        using namespace ws::previewkeys;
+        QVERIFY(allowed(u"Space"_s));
+        QVERIFY(allowed(u"Alt+P"_s));
+        QVERIFY(allowed(u"Ctrl+Shift+P"_s));
+        QVERIFY(allowed(u"F8"_s));
+        for (const QString& key : {u"Shift+Space"_s, u"Alt+Space"_s, u"P"_s, u"Shift+P"_s,
+                 u"Ctrl+1"_s, u"Alt+1"_s, u"Ctrl+C"_s, u"Ctrl+Shift+C"_s, u"Ctrl+R"_s,
+                 u"Ctrl+J"_s, u"Ctrl+K"_s, u"Ctrl+N"_s, u"Ctrl+P"_s, u"Ctrl+U"_s, u"Ctrl+D"_s, u"Ctrl+,"_s,
+                 u"Alt+F4"_s, u"Shift+F10"_s, u"Meta+P"_s, u"Ctrl+P, Ctrl+O"_s})
+            QVERIFY2(!allowed(key), qPrintable(key));
+        const QKeySequence space(u"Space"_s);
+        QVERIFY(matches(space, Qt::Key_Space, Qt::NoModifier));
+        QVERIFY(matches(space, Qt::Key_Space, Qt::KeypadModifier));
+        QVERIFY(!matches(space, Qt::Key_Space, Qt::ShiftModifier));
+        QVERIFY(!matches(space, Qt::Key_Space, Qt::ControlModifier));
+        QVERIFY(!matches(QKeySequence(), Qt::Key_Space, Qt::NoModifier));
+        QVERIFY(matches(QKeySequence(u"Alt+P"_s), Qt::Key_P, Qt::AltModifier));
+        QVERIFY(!matches(QKeySequence(u"Alt+P"_s), Qt::Key_P, Qt::AltModifier | Qt::ShiftModifier));
+    }
+
     void oneCommander()
     {
         QTemporaryDir profile;
@@ -39,57 +692,6 @@ private slots:
         ini.sync();
         restored.load();
         QCOMPARE(restored.fileManager, u"onecommander"_s);
-    }
-
-    void captureIssue83()
-    {
-        QTemporaryDir profile;
-        QVERIFY(profile.isValid());
-        ws::Settings::useProfile(profile.path());
-        ws::Settings settings;
-        settings.load();
-        QVERIFY(settings.captureLastPinHotkey.isEmpty());
-        QVERIFY(settings.captureSaveFolder.isEmpty());
-        QVERIFY(settings.captureRecordingFolder.isEmpty());
-        QVERIFY(!settings.captureRecordingSystemAudio && !settings.captureRecordingMicrophone);
-        QCOMPARE(settings.captureRecordingQuality, 1);
-        QVERIFY(settings.captureRecordingCursor && settings.captureRecordingCountdown);
-        QVERIFY(!settings.captureRecordingClicks);
-        QCOMPARE(settings.captureRecordingFormat, 0);
-        settings.captureLastPinHotkey = u"Ctrl+Alt+F8"_s;
-        settings.captureSaveFolder = profile.filePath(u"截图 文件夹"_s);
-        settings.captureRecordingFolder = profile.filePath(u"录屏"_s);
-        settings.captureRecordingSystemAudio = true;
-        settings.captureRecordingMicrophone = true;
-        settings.captureRecordingQuality = 0;
-        settings.captureRecordingCursor = false;
-        settings.captureRecordingCountdown = false;
-        settings.captureRecordingClicks = true;
-        settings.captureRecordingFormat = 1;
-        settings.save();
-        ws::Settings restored;
-        restored.load();
-        QCOMPARE(restored.captureLastPinHotkey, settings.captureLastPinHotkey);
-        QCOMPARE(restored.captureSaveFolder, settings.captureSaveFolder);
-        QCOMPARE(restored.captureRecordingFolder, settings.captureRecordingFolder);
-        QVERIFY(restored.captureRecordingSystemAudio && restored.captureRecordingMicrophone);
-        QCOMPARE(restored.captureRecordingQuality, 0);
-        QVERIFY(!restored.captureRecordingCursor && !restored.captureRecordingCountdown);
-        QVERIFY(restored.captureRecordingClicks);
-        QCOMPARE(restored.captureRecordingFormat, 1);
-
-        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
-        ini.remove(u"Capture/RecordingQuality"_s);
-        ini.setValue(u"Capture/RecordingHighQuality"_s, true); // the first version's preference
-        ini.sync();
-        restored.load();
-        QCOMPARE(restored.captureRecordingQuality, 2);
-        ini.setValue(u"Capture/RecordingQuality"_s, 99);
-        ini.setValue(u"Capture/RecordingFormat"_s, 99);
-        ini.sync();
-        restored.load();
-        QCOMPARE(restored.captureRecordingQuality, 1);
-        QCOMPARE(restored.captureRecordingFormat, 0);
     }
 
     void opusTyping()
@@ -119,6 +721,29 @@ private slots:
         QVERIFY(settings.explorerTyping);
     }
 
+    // GitHub #82: typed in Opus, that tab's folder (the default, for an older
+    // profile and a value nobody knows too) or the whole PC.
+    void opusTypingScope()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.load();
+        QCOMPARE(settings.opusTypingScope, u"folder"_s);
+        settings.opusTypingScope = u"all"_s;
+        settings.save();
+        ws::Settings read;
+        read.load();
+        QCOMPARE(read.opusTypingScope, u"all"_s);
+
+        QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+        ini.setValue(u"Launcher/OpusTypingScope"_s, u"elsewhere"_s);
+        ini.sync();
+        read.load();
+        QCOMPARE(read.opusTypingScope, u"folder"_s);
+    }
+
     // GitHub #110: typed in a folder's window, its rows first (the new
     // default, for a profile from before too) or that folder alone.
     void folderTyping()
@@ -140,6 +765,14 @@ private slots:
         ini.sync();
         read.load();
         QCOMPARE(read.folderTyping, u"only"_s);
+        settings.folderTyping = u"level"_s; // this level only (GitHub #182)
+        settings.save();
+        read.load();
+        QCOMPARE(read.folderTyping, u"level"_s);
+        ini.setValue(u"Launcher/FolderTyping"_s, u" LEVEL "_s);
+        ini.sync();
+        read.load();
+        QCOMPARE(read.folderTyping, u"level"_s);
         for (const QString& value : {u"everywhere"_s, QString()}) {
             ini.setValue(u"Launcher/FolderTyping"_s, value);
             ini.sync();
@@ -220,6 +853,35 @@ private slots:
         QCOMPARE(again.shareOptions().shares.size(), std::size_t {2});
     }
 
+    void shareScanSettings()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings settings;
+        settings.shares = {{u"\\\\nas\\docs"_s, {}, false, {true, 23 * 60, 6 * 60 + 30, 3}},
+            {u"\\\\wsl.localhost\\Ubuntu\\home\\dev"_s, {}, true, {false, 9 * 60, 18 * 60, 1}}};
+        settings.save();
+        ws::Settings again;
+        again.load();
+        QCOMPARE(again.shares, settings.shares);
+        QCOMPARE(again.shareOptions().shares[0].scan, settings.shares[0].scan);
+        QCOMPARE(again.shareOptions().shares[1].scan, settings.shares[1].scan);
+        {
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Shares/1/ScanFrom"_s, -1);
+            ini.setValue(u"Shares/1/ScanUntil"_s, 9999);
+            ini.setValue(u"Shares/1/ScanDepth"_s, -5);
+            for (const QString& key : {u"ScanScheduled"_s, u"ScanFrom"_s, u"ScanUntil"_s, u"ScanDepth"_s})
+                ini.remove(u"Shares/2/"_s + key); // older settings: unchanged behaviour
+        }
+        again.load();
+        QCOMPARE(again.shares[0].scan.fromMinute, 0);
+        QCOMPARE(again.shares[0].scan.untilMinute, 1439);
+        QCOMPARE(again.shares[0].scan.maxDepth, 0);
+        QCOMPARE(again.shares[1].scan, ws::ShareScan {});
+    }
+
     // GitHub #114: a WebDAV folder, as its web address or as Windows writes
     // it, is kept in one form: one added twice is seen (addShare), and two
     // spellings of one in the settings file become one.
@@ -259,7 +921,10 @@ private slots:
         QVERIFY(pictures.words.isEmpty());
         types.append({u"设计图"_s, {u"dwg"_s, u"dxf"_s}, {}, u"cad"_s});
         QCOMPARE(ws::splitFileTypeQuery(u":CAD 泵 size:>1mb"_s, types, u"folder").words, u"泵 size:>1mb"_s);
-        for (const QString text : {u":unknown 报告"_s, u"\":folder\" 报告"_s, u"C:\\folder\\报告"_s, u"报告 :folder"_s}) {
+        const auto suffixFolder = ws::splitFileTypeQuery(u"报告 :folder"_s, types, u"folder");
+        QCOMPARE(suffixFolder.type, std::optional<int>(-2));
+        QCOMPARE(suffixFolder.words, u"报告"_s);
+        for (const QString text : {u":unknown 报告"_s, u"\":folder\" 报告"_s, u"C:\\folder\\报告"_s, u"报告 \":folder\""_s}) {
             const auto literal = ws::splitFileTypeQuery(text, types, u"folder");
             QVERIFY(!literal.type);
             QCOMPARE(literal.words, text);
@@ -378,6 +1043,59 @@ private slots:
         QVERIFY(none.folderMenuFavorites && none.folderMenuRecent && none.folderMenuWindows);
     }
 
+    // The double click is a choice of its own (GitHub #196): on as it always
+    // was, and off stays off with the middle button on.
+    void folderMenuTriggers()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings fresh;
+        fresh.load();
+        QVERIFY(fresh.folderMenuDouble && !fresh.folderMenuMiddle);
+
+        fresh.folderMenuDouble = false;
+        fresh.folderMenuMiddle = true;
+        fresh.save();
+        ws::Settings again;
+        again.load();
+        QVERIFY(!again.folderMenuDouble && again.folderMenuMiddle);
+
+        // A hand-edited file with no trigger or no place gets them back.
+        {
+            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
+            ini.setValue(u"Launcher/FolderMenuDouble"_s, false);
+            ini.setValue(u"Launcher/FolderMenuMiddle"_s, false);
+            ini.setValue(u"Launcher/FolderMenuExplorer"_s, false);
+            ini.setValue(u"Launcher/FolderMenuDesktop"_s, false);
+        }
+        ws::Settings none;
+        none.load();
+        QVERIFY(none.folderMenuDouble && none.folderMenuExplorer && none.folderMenuDesktop);
+    }
+
+    // The actions under the menu's lists (GitHub #200): all on as before, each
+    // kept on its own.
+    void folderMenuItems()
+    {
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        ws::Settings::useProfile(profile.path());
+        ws::Settings fresh;
+        fresh.load();
+        QVERIFY(fresh.folderMenuItemSearch && fresh.folderMenuItemCopyPath && fresh.folderMenuItemCmd && fresh.folderMenuItemPowerShell
+            && fresh.folderMenuItemFavorite && fresh.folderMenuItemSettings);
+
+        fresh.folderMenuItemCopyPath = false;
+        fresh.folderMenuItemCmd = false;
+        fresh.folderMenuItemSettings = false;
+        fresh.save();
+        ws::Settings again;
+        again.load();
+        QVERIFY(again.folderMenuItemSearch && !again.folderMenuItemCopyPath && !again.folderMenuItemCmd && again.folderMenuItemPowerShell
+            && again.folderMenuItemFavorite && !again.folderMenuItemSettings);
+    }
+
     // What a new install leaves off until wanted: the folder menu, the dialog
     // bar, 粘贴为文件. A file from before without their keys keeps the first
     // two on, as they were; a choice written stays.
@@ -425,54 +1143,6 @@ private slots:
 
     // GitHub #44: the other sorts and the double-click setting. A click opens
     // by default; every sort name is kept, and a stranger reads as the best match.
-    // The capture's mouse buttons (#46): the old behaviour by default, kept
-    // across a save, and a name not known (or "back" on a button that cannot
-    // step back) falls to the default.
-    void captureMouseActions()
-    {
-        QTemporaryDir profile;
-        QVERIFY(profile.isValid());
-        ws::Settings::useProfile(profile.path());
-        ws::Settings fresh;
-        fresh.load();
-        QCOMPARE(fresh.captureMouseDoubleLeft, u"copy"_s);
-        QCOMPARE(fresh.captureMouseRight, u"back"_s);
-        QCOMPARE(fresh.captureMouseMiddle, u"none"_s);
-        QCOMPARE(fresh.captureMouseBack, u"none"_s);
-        QCOMPARE(fresh.captureMouseForward, u"none"_s);
-        QVERIFY(!fresh.capturePinOnCopy);
-
-        ws::Settings s;
-        s.load();
-        s.captureMouseDoubleLeft = u"save"_s;
-        s.captureMouseRight = u"cancel"_s;
-        s.captureMouseMiddle = u"copypin"_s;
-        s.capturePinOnCopy = true;
-        s.captureMouseBack = u"ocr"_s;
-        s.captureMouseForward = u"copy"_s;
-        s.save();
-        ws::Settings back;
-        back.load();
-        QCOMPARE(back.captureMouseDoubleLeft, u"save"_s);
-        QCOMPARE(back.captureMouseRight, u"cancel"_s);
-        QCOMPARE(back.captureMouseMiddle, u"copypin"_s);
-        QVERIFY(back.capturePinOnCopy);
-        QCOMPARE(back.captureMouseBack, u"ocr"_s);
-        QCOMPARE(back.captureMouseForward, u"copy"_s);
-
-        {
-            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
-            ini.setValue(u"Capture/MouseDoubleLeft"_s, u"back"_s);
-            ini.setValue(u"Capture/MouseRight"_s, u"Back"_s);
-            ini.setValue(u"Capture/MouseMiddle"_s, u"nonsense"_s);
-        }
-        ws::Settings odd;
-        odd.load();
-        QCOMPARE(odd.captureMouseDoubleLeft, u"copy"_s);
-        QCOMPARE(odd.captureMouseRight, u"back"_s);
-        QCOMPARE(odd.captureMouseMiddle, u"none"_s);
-    }
-
     // A number written by hand that is none ("abc", "", "1h") reads as the
     // default, not as the 0 a failed conversion gives ("每 0 小时", GitHub
     // #114); a 0 written as one stays 0 (the WebDAV folders: only at start).
@@ -501,136 +1171,6 @@ private slots:
         QCOMPARE(read(u"Content/MaxFileSizeMB"_s, u"lots"_s).contentMaxSizeMB[0], d.contentMaxSizeMB[0]);
     }
 
-    // The OCR choices of the mouse buttons and the toolbar's buttons left off (#57).
-    void captureOcrActionsAndToolbarButtons()
-    {
-        QTemporaryDir profile;
-        QVERIFY(profile.isValid());
-        ws::Settings::useProfile(profile.path());
-        ws::Settings fresh;
-        fresh.load();
-        QVERIFY(fresh.captureToolbarHidden.isEmpty()); // all shown
-        QCOMPARE(ws::Settings::captureToolbarButtonIds(),
-            (QStringList {u"undo"_s, u"redo"_s, u"copy"_s, u"save"_s, u"pin"_s, u"ocr"_s, u"long"_s, u"record"_s, u"qr"_s, u"delay"_s, u"cancel"_s}));
-
-        ws::Settings s;
-        s.load();
-        s.captureMouseDoubleLeft = u"ocrcopy"_s;
-        s.captureMouseMiddle = u"ocrsearch"_s;
-        s.captureMouseBack = u"ocrweb"_s;
-        s.captureToolbarHidden = u"pin,redo"_s;
-        s.save();
-        {
-            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
-            // Written once, in a stable form.
-            QCOMPARE(ini.value(u"Capture/ToolbarHidden"_s).toString(), u"pin,redo"_s);
-        }
-        ws::Settings back;
-        back.load();
-        QCOMPARE(back.captureMouseDoubleLeft, u"ocrcopy"_s);
-        QCOMPARE(back.captureMouseMiddle, u"ocrsearch"_s);
-        QCOMPARE(back.captureMouseBack, u"ocrweb"_s);
-        QCOMPARE(back.captureToolbarHidden, u"redo,pin"_s); // the toolbar's order
-
-        // Unknown ids, repeats, case and blanks are cleaned on the way in.
-        QCOMPARE(ws::Settings::normalizedToolbarHidden(u" Cancel, OCR ,nonsense,cancel,,undo "_s), u"undo,ocr,cancel"_s);
-        QCOMPARE(ws::Settings::normalizedToolbarHidden(u"nothing"_s), QString());
-        {
-            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
-            ini.setValue(u"Capture/ToolbarHidden"_s, u"copy,save,bogus,copy"_s);
-            ini.setValue(u"Capture/MouseRight"_s, u"ocrweb"_s);
-        }
-        ws::Settings odd;
-        odd.load();
-        QCOMPARE(odd.captureToolbarHidden, u"copy,save"_s);
-        // Written by hand with no quotes, "ocr,undo" is a list to QSettings: still read (found in the live test).
-        {
-            QFile file(ws::Settings::filePath());
-            QVERIFY(file.open(QIODevice::ReadOnly));
-            QByteArray text = file.readAll();
-            file.close();
-            const qsizetype at = text.indexOf("ToolbarHidden=");
-            QVERIFY(at >= 0);
-            const qsizetype end = text.indexOf('\n', at);
-            text.replace(at, end - at, "ToolbarHidden=ocr,undo");
-            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
-            file.write(text);
-            file.close();
-        }
-        ws::Settings typed;
-        typed.load();
-        QCOMPARE(typed.captureToolbarHidden, u"undo,ocr"_s);
-        QCOMPARE(odd.captureMouseRight, u"ocrweb"_s);
-
-        // Stage 7's options: defaults, a round trip, and values it does not know fall back.
-        QVERIFY(!typed.captureCursor && typed.captureControlsUia && typed.captureDelay == 5);
-        QCOMPARE(typed.captureColorFormat, u"hex"_s);
-        QVERIFY(typed.capturePinsHotkey.isEmpty() && typed.capturePinsRestoreHotkey.isEmpty());
-        QCOMPARE(typed.capturePinDoubleClick, u"reset"_s);
-        typed.captureCursor = true;
-        typed.captureControlsUia = false;
-        typed.captureDelay = 10;
-        typed.captureColorFormat = u"hsl"_s;
-        typed.capturePinsHotkey = u"Ctrl+Alt+H"_s;
-        typed.capturePinsRestoreHotkey = u"Ctrl+Alt+J"_s;
-        typed.capturePinDoubleClick = u"close"_s;
-        typed.save();
-        ws::Settings seven;
-        seven.load();
-        QVERIFY(seven.captureCursor && !seven.captureControlsUia);
-        QCOMPARE(seven.captureDelay, 10);
-        QCOMPARE(seven.captureColorFormat, u"hsl"_s);
-        QCOMPARE(seven.capturePinsHotkey, u"Ctrl+Alt+H"_s);
-        QCOMPARE(seven.capturePinsRestoreHotkey, u"Ctrl+Alt+J"_s);
-        QCOMPARE(seven.capturePinDoubleClick, u"close"_s);
-        {
-            QSettings ini(ws::Settings::filePath(), QSettings::IniFormat);
-            ini.setValue(u"Capture/DelaySeconds"_s, 7);
-            ini.setValue(u"Capture/ColorFormat"_s, u"cmyk"_s);
-            ini.setValue(u"Capture/PinDoubleClick"_s, u"explode"_s);
-        }
-        ws::Settings odd7;
-        odd7.load();
-        QCOMPARE(odd7.captureDelay, 5);
-        QCOMPARE(odd7.captureColorFormat, u"hex"_s);
-        QCOMPARE(odd7.capturePinDoubleClick, u"reset"_s);
-        typed.captureCursor = false;
-        typed.captureControlsUia = true;
-        typed.captureDelay = 5;
-        typed.captureColorFormat = u"hex"_s;
-        typed.capturePinsHotkey.clear();
-        typed.capturePinsRestoreHotkey.clear();
-        typed.capturePinDoubleClick = u"reset"_s;
-        typed.save();
-
-        // Smart redaction's options: defaults, a round trip, and the words typed by hand with no quotes.
-        QVERIFY(typed.captureSmartPrescan && !typed.captureSmartIpMac && !typed.captureSmartAllText);
-        QVERIFY(typed.captureSmartWords.isEmpty());
-        typed.captureSmartPrescan = false;
-        typed.captureSmartWords = u"Atlas,客户甲"_s;
-        typed.save();
-        ws::Settings words;
-        words.load();
-        QVERIFY(!words.captureSmartPrescan);
-        QCOMPARE(words.captureSmartWords, u"Atlas,客户甲"_s);
-        {
-            QFile file(ws::Settings::filePath());
-            QVERIFY(file.open(QIODevice::ReadOnly));
-            QByteArray text = file.readAll();
-            file.close();
-            const qsizetype at = text.indexOf("SmartWords=");
-            QVERIFY(at >= 0);
-            text.replace(at, text.indexOf('\n', at) - at, "SmartWords=Atlas, Beta;Atlas");
-            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
-            file.write(text);
-            file.close();
-        }
-        ws::Settings hand;
-        hand.load();
-        QCOMPARE(hand.captureSmartWords, u"Atlas,Beta"_s);
-        QCOMPARE(ws::Settings::normalizedSmartWords(u"a，b、c；d\n e ,a"_s), (QStringList {u"a"_s, u"b"_s, u"c"_s, u"d"_s, u"e"_s}));
-    }
-
     void sortAndDoubleClick()
     {
         QTemporaryDir profile;
@@ -640,17 +1180,20 @@ private slots:
         fresh.load();
         QCOMPARE(fresh.sort, u"match"_s);
         QVERIFY(!fresh.doubleClickToOpen);
+        QVERIFY(fresh.previewFollowsPointer);
 
         for (const QStringView name : ws::kSortNames) {
             ws::Settings s;
             s.load();
             s.sort = name.toString();
             s.doubleClickToOpen = true;
+            s.previewFollowsPointer = false;
             s.save();
             ws::Settings back;
             back.load();
             QCOMPARE(back.sort, name.toString());
             QVERIFY(back.doubleClickToOpen);
+            QVERIFY(!back.previewFollowsPointer);
         }
         QCOMPARE(ws::sortIndex(u"newest"), 1);
         QCOMPARE(ws::sortIndex(u"smallest"), 7);
@@ -842,6 +1385,34 @@ private slots:
             QVERIFY(!ws::Settings::isNetworkPath(f));
             for (const QString& o : defaults)
                 QVERIFY2(f == o || !f.startsWith(o + u'\\', Qt::CaseInsensitive), qPrintable(f + u" in "_s + o));
+        }
+    }
+
+    // `WinShun.exe --settings --settings-at 9,0` to a copy that is running: the place travels
+    // with the command (it was dropped, and the window opened on its first page).
+    void settingsCommandCarriesThePlace()
+    {
+        namespace sc = ws::settingscommand;
+        QCOMPARE(sc::make({}), u"settings"_s);
+        QCOMPARE(sc::make(u"9,0"_s), u"settings:9,0"_s);
+        QCOMPARE(sc::make(u"indexAccess"_s), u"settings:indexAccess"_s);
+        QString place = u"left over"_s;
+        QVERIFY(sc::parse(u"settings"_s, &place));
+        QVERIFY(place.isEmpty());
+        QVERIFY(sc::parse(u"settings:9,1"_s, &place));
+        QCOMPARE(place, u"9,1"_s);
+        QVERIFY(sc::parse(u"settings:indexAccess"_s, &place));
+        QCOMPARE(place, u"indexAccess"_s);
+        QVERIFY(sc::parse(u"settings:"_s, &place)); // no place: just open
+        QVERIFY(place.isEmpty());
+        QVERIFY(sc::parse(u"settings"_s, nullptr));
+        // Other commands are not this one.
+        for (const QString& other : {u"toggle"_s, u"quit"_s, u"show"_s, u"query:settings"_s, u"settingsx"_s, QString()})
+            QVERIFY2(!sc::parse(other, &place), qPrintable(other));
+        // What make() builds, parse() reads back.
+        for (const QString& at : {u"0,0"_s, u"9,2"_s, u"indexAccess"_s}) {
+            QVERIFY(sc::parse(sc::make(at), &place));
+            QCOMPARE(place, at);
         }
     }
 };

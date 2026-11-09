@@ -40,6 +40,8 @@ constexpr Named kPermissions[] = {
     {Permission::FilesRead, u"files:read"},
     {Permission::Notifications, u"notifications"},
     {Permission::NetworkListen, u"network:listen"},
+    {Permission::SystemSettings, u"system:settings"},
+    {Permission::Elevated, u"elevated"},
 };
 
 // Collects the first error; every check after it is skipped.
@@ -164,6 +166,16 @@ std::optional<Runtime> readRuntime(const QJsonValue& value, Check& check)
         r.program = Program::Exe;
         r.programPath = program;
         relativeInside(program, u"runtime.program"_s, check);
+    }
+    const QString qt = stringField(o, u"qt"_s, where, check);
+    r.hostQtVersion = stringField(o, u"qtVersion"_s, where, check);
+    if (o.contains(u"qt"_s) || o.contains(u"qtVersion"_s)) {
+        if (qt != u"host")
+            check.fail(u"runtime.qt 只支持 host；自带 Qt 时请省略 qt 和 qtVersion"_s);
+        else if (r.program != Program::Exe || !r.programPath.endsWith(u".exe"_s, Qt::CaseInsensitive))
+            check.fail(u"runtime.qt: host 只支持原生 exe 插件"_s);
+        else if (!QRegularExpression(u"^[1-9][0-9]*\\.[0-9]+(?:\\.[0-9]+)?$"_s).match(r.hostQtVersion).hasMatch())
+            check.fail(u"runtime.qtVersion 要是主次版本或完整版本，例如 6.12 或 6.12.0"_s);
     }
     r.args = stringList(o.contains(u"args"_s) ? o.value(u"args"_s) : QJsonValue(QJsonArray()), u"runtime.args"_s, check);
     r.script = stringField(o, u"script"_s, where, check);
@@ -399,6 +411,11 @@ Command readCommand(const QJsonValue& value, int index, bool hasRuntime, Check& 
     c.description = textOr(o.value(u"description"_s), where + u".description"_s, check);
     c.hint = textOr(o.value(u"hint"_s), where + u".hint"_s, check);
     c.icon = stringField(o, u"icon"_s, where, check);
+    if (o.contains(u"contentSearch"_s) && !o.value(u"contentSearch"_s).isBool())
+        check.fail(where + u".contentSearch 要是布尔值"_s);
+    c.contentSearch = o.value(u"contentSearch"_s).toBool();
+    if (c.contentSearch && !hasRuntime)
+        check.fail(where + u".contentSearch 需要插件进程"_s);
     if (c.icon.endsWith(u".svg"_s, Qt::CaseInsensitive))
         check.fail(where + u".icon 是 SVG：Win顺 不带 SVG 支持，请用 PNG"_s);
     if (o.contains(u"keyword"_s)) {
@@ -453,7 +470,7 @@ Command readCommand(const QJsonValue& value, int index, bool hasRuntime, Check& 
         if (cache.isObject())
             c.cacheSeconds = intField(cache.toObject(), u"seconds"_s, 0, 0, 86400, where + u".cache"_s, check);
         else if (cache.isDouble())
-            c.cacheSeconds = std::clamp(static_cast<int>(cache.toDouble()), 0, 86400);
+            c.cacheSeconds = static_cast<int>(std::clamp(cache.toDouble(), 0.0, 86400.0));
         else
             check.fail(where + u".cache 要是 {seconds} 或数字"_s);
     }
@@ -559,6 +576,8 @@ std::optional<Manifest> Manifest::parse(const QByteArray& json, QString* error)
         check.fail(u"缺少 id（作者.名字）"_s);
     else if (!validPluginId(m.id))
         check.fail(u"id 只能用小写字母、数字、点、连字符和下划线（作者.名字）"_s);
+    else if (m.id.endsWith(u".data"))
+        check.fail(u"id 不能以 .data 结尾：这个后缀留给插件数据文件夹"_s);
     const auto name = readText(o.value(u"name"_s), u"name"_s, check);
     if (!name && !check.failed())
         check.fail(u"缺少 name"_s);
@@ -584,8 +603,28 @@ std::optional<Manifest> Manifest::parse(const QByteArray& json, QString* error)
     m.runtime = readRuntime(o.value(u"runtime"_s), check);
     m.permissions = readPermissions(o.value(u"permissions"_s), check);
 
+    // `elevated`: the plugin's own program, as administrator when Win顺 is.
+    // An interpreter could come from a folder the user can write to (a
+    // per-user Python, node, pwsh; Windows PowerShell's modules from
+    // Documents), and a strict sandbox is the opposite of what it asks.
+    if (m.permissions.has(Permission::Elevated)) {
+        if (!m.runtime || m.runtime->program != Program::Exe)
+            check.fail(u"elevated 权限只给自带程序的插件（runtime.program 为 exe）"_s);
+        else if (m.runtime->sandbox == SandboxLevel::Strict)
+            check.fail(u"elevated 权限不能和 runtime.sandbox strict 一起用"_s);
+        else if (!m.runtime->hostQtVersion.isEmpty())
+            check.fail(u"共享宿主 Qt 只支持普通权限插件；请移除 elevated 权限或自带 Qt"_s);
+    }
+
+    if (o.contains(u"webSearch"_s) && !o.value(u"webSearch"_s).isBool())
+        check.fail(u"webSearch 要是布尔值"_s);
+    m.webSearch = o.value(u"webSearch"_s).toBool();
+    if (m.webSearch && m.id != u"winshun.web")
+        check.fail(u"webSearch 是官方网页搜索插件的宿主能力"_s);
+    if (m.webSearch && m.runtime)
+        check.fail(u"webSearch 是零代码网址功能，不能声明 runtime"_s);
     const QJsonValue commands = o.value(u"commands"_s);
-    if (!commands.isArray() || commands.toArray().isEmpty())
+    if (!commands.isArray() || (commands.toArray().isEmpty() && !m.webSearch))
         check.fail(u"commands 要至少有一个命令"_s);
     else {
         int i = 0;
@@ -600,6 +639,16 @@ std::optional<Manifest> Manifest::parse(const QByteArray& json, QString* error)
             }
         }
     }
+    // Older user-installed copies of the official URL sample can stay on
+    // disk. Their keyword/URL data is migrated, and the host supplies the
+    // new provider without also indexing the old static commands.
+    if (m.id == u"winshun.web" && !m.runtime && !m.webSearch && !m.commands.isEmpty()
+        && std::all_of(m.commands.cbegin(), m.commands.cend(), [](const Command& command) { return command.run.kind == Run::Kind::Url; })) {
+        m.webSearch = true;
+        m.commands.clear();
+    }
+    if (m.webSearch && !m.commands.isEmpty())
+        check.fail(u"webSearch 的网站由插件设置管理，commands 应为空"_s);
     if (o.contains(u"settings"_s)) {
         const QJsonValue settings = o.value(u"settings"_s);
         if (!settings.isArray())
@@ -610,6 +659,34 @@ std::optional<Manifest> Manifest::parse(const QByteArray& json, QString* error)
     }
     if (o.value(u"ai"_s).isObject())
         m.aiExpose = o.value(u"ai"_s).toObject().value(u"expose"_s).toBool();
+
+    m.trayMenu = textOr(o.value(u"trayMenu"_s), u"trayMenu"_s, check);
+    if (o.contains(u"pictures"_s)) {
+        const QJsonValue pictures = o.value(u"pictures"_s);
+        if (!pictures.isArray())
+            check.fail(u"pictures 要是数组"_s);
+        for (const QJsonValue& v : pictures.toArray()) {
+            const QString verb = v.toString();
+            if (verb != u"pin" && verb != u"edit")
+                check.fail(u"pictures 里只能有 pin 和 edit"_s);
+            else if (!m.pictures.contains(verb))
+                m.pictures.append(verb);
+        }
+    }
+    m.settingsWindow = o.value(u"settingsWindow"_s).toBool();
+    if (o.contains(u"systemSwitches"_s) && !o.value(u"systemSwitches"_s).isBool())
+        check.fail(u"systemSwitches 要是布尔值"_s);
+    m.systemSwitches = o.value(u"systemSwitches"_s).toBool();
+    if (m.systemSwitches && (!m.resident() || !m.permissions.has(Permission::Ui)
+        || !m.permissions.has(Permission::SystemSettings)))
+        check.fail(u"systemSwitches 要常驻，并声明 ui 和 system:settings 权限"_s);
+    if (m.systemSwitches && m.resident()
+        && (m.runtime->start != StartWhen::Eager || m.runtime->idleExitSec != 0))
+        check.fail(u"systemSwitches 要 start eager 和 idleExitSec 0，持续监听并持有保持唤醒请求"_s);
+    // What Win顺 asks of the plugin's own process, which shows windows.
+    if ((!m.trayMenu.isEmpty() || !m.pictures.isEmpty() || m.settingsWindow)
+        && (!m.resident() || !m.permissions.has(Permission::Ui)))
+        check.fail(u"trayMenu、pictures 和 settingsWindow 要常驻（runtime.mode resident）并要 ui 权限"_s);
 
     if (check.failed())
         return fail(check.error);

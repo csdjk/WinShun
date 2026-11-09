@@ -1,5 +1,7 @@
 #include "McpClients.h"
 
+#include "platform/Shell.h"
+
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
@@ -8,11 +10,15 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPointer>
 #include <QProcess>
 #include <QSaveFile>
 #include <QVariantMap>
 
 #include <algorithm>
+#include <thread>
+
+#include <shlobj.h>
 
 using namespace Qt::StringLiterals;
 
@@ -34,27 +40,37 @@ QString env(const char* name)
 
 QString home()
 {
-    return env("USERPROFILE");
+    return QDir::fromNativeSeparators(QString::fromStdWString(win32::knownFolder(FOLDERID_Profile)));
+}
+
+QString under(const QString& folder, const QString& relative)
+{
+    return folder.isEmpty() ? QString() : QDir(folder).filePath(relative);
+}
+
+QString appData(const GUID& id)
+{
+    return QDir::fromNativeSeparators(QString::fromStdWString(win32::knownFolder(id)));
 }
 
 QString claudeDesktopConfig()
 {
-    return env("APPDATA") + u"/Claude/claude_desktop_config.json"_s;
+    return under(appData(FOLDERID_RoamingAppData), u"Claude/claude_desktop_config.json"_s);
 }
 
 QString cursorConfig()
 {
-    return home() + u"/.cursor/mcp.json"_s;
+    return under(home(), u".cursor/mcp.json"_s);
 }
 
 QString vsCodeConfig()
 {
-    return env("APPDATA") + u"/Code/User/mcp.json"_s;
+    return under(appData(FOLDERID_RoamingAppData), u"Code/User/mcp.json"_s);
 }
 
 QString claudeCodeConfig()
 {
-    return home() + u"/.claude.json"_s;
+    return under(home(), u".claude.json"_s);
 }
 
 // The relay's entry as the file wants it.
@@ -92,6 +108,8 @@ bool namesRelay(const QString& path, const QString& key)
 // allows them) is left alone.
 Result mergeInto(const QString& path, const QString& key, const QJsonObject& entry, const QString& restart)
 {
+    if (path.isEmpty())
+        return {false, Tr::tr("无法确定用户配置目录")};
     QJsonObject root;
     QFile file(path);
     const bool existed = file.exists();
@@ -134,11 +152,14 @@ QString claudeCommand()
                 return QDir::toNativeSeparators(candidate);
         }
     }
-    const QString local = home() + u"/.local/bin/claude.exe"_s;
+    const QString profile = home();
+    if (profile.isEmpty())
+        return {};
+    const QString local = under(profile, u".local/bin/claude.exe"_s);
     if (QFileInfo::exists(local))
         return QDir::toNativeSeparators(local);
     QStringList bundled;
-    QDirIterator it(home() + u"/.vscode/extensions"_s, {u"anthropic.claude-code-*"_s}, QDir::Dirs | QDir::NoDotAndDotDot);
+    QDirIterator it(under(profile, u".vscode/extensions"_s), {u"anthropic.claude-code-*"_s}, QDir::Dirs | QDir::NoDotAndDotDot);
     while (it.hasNext()) {
         const QString exe = it.next() + u"/resources/native-binary/claude.exe"_s;
         if (QFileInfo::exists(exe))
@@ -157,6 +178,24 @@ QString quoted(const QString& path)
 
 } // namespace
 
+namespace {
+// Where the last install put the Skill, as ws printed it (the GUI thread's).
+QString g_installedSkill;
+} // namespace
+
+QString skillPath()
+{
+    if (!g_installedSkill.isEmpty())
+        return g_installedSkill;
+    const QString config = env("CLAUDE_CONFIG_DIR");
+    const bool drive = config.size() >= 3 && config[1] == u':' && config[2] == u'/'
+        && ((config[0] >= u'A' && config[0] <= u'Z') || (config[0] >= u'a' && config[0] <= u'z'));
+    const bool share = config.size() > 2 && config.startsWith(u"//");
+    if (!config.isEmpty() && !drive && !share)
+        return {};
+    return QDir::toNativeSeparators(under(config.isEmpty() ? under(home(), u".claude"_s) : config, u"skills/winshun/SKILL.md"_s));
+}
+
 QString relayPath()
 {
     const QString path = QCoreApplication::applicationDirPath() + u"/WinShunMcp.exe"_s;
@@ -168,7 +207,8 @@ std::vector<Client> detect()
     std::vector<Client> clients;
     {
         Client c {u"claude-desktop"_s, u"Claude Desktop"_s};
-        c.installed = QFileInfo(env("APPDATA") + u"/Claude"_s).isDir() || QFileInfo(env("LOCALAPPDATA") + u"/AnthropicClaude"_s).isDir();
+        c.installed = QFileInfo(under(appData(FOLDERID_RoamingAppData), u"Claude"_s)).isDir()
+            || QFileInfo(under(appData(FOLDERID_LocalAppData), u"AnthropicClaude"_s)).isDir();
         c.configPath = QDir::toNativeSeparators(claudeDesktopConfig());
         c.connected = namesRelay(claudeDesktopConfig(), u"mcpServers"_s);
         c.note = Tr::tr("完全退出并重新打开 Claude Desktop 后生效");
@@ -176,15 +216,19 @@ std::vector<Client> detect()
     }
     {
         Client c {u"claude-code"_s, u"Claude Code"_s};
-        c.installed = !claudeCommand().isEmpty() || QFileInfo(home() + u"/.claude"_s).isDir();
+        c.installed = !claudeCommand().isEmpty() || QFileInfo(under(home(), u".claude"_s)).isDir()
+            || (!env("CLAUDE_CONFIG_DIR").isEmpty() && QFileInfo(env("CLAUDE_CONFIG_DIR")).isDir());
         c.configPath = QDir::toNativeSeparators(claudeCodeConfig());
         c.connected = namesRelay(claudeCodeConfig(), u"mcpServers"_s);
         c.note = Tr::tr("加在用户范围（所有项目）；新开的会话里生效");
+        c.skillPath = skillPath();
+        c.skillInstalled = QFileInfo::exists(c.skillPath);
         clients.push_back(c);
     }
     {
         Client c {u"cursor"_s, u"Cursor"_s};
-        c.installed = QFileInfo(home() + u"/.cursor"_s).isDir() || QFileInfo(env("LOCALAPPDATA") + u"/Programs/cursor"_s).isDir();
+        c.installed = QFileInfo(under(home(), u".cursor"_s)).isDir()
+            || QFileInfo(under(appData(FOLDERID_LocalAppData), u"Programs/cursor"_s)).isDir();
         c.configPath = QDir::toNativeSeparators(cursorConfig());
         c.connected = namesRelay(cursorConfig(), u"mcpServers"_s);
         c.note = Tr::tr("Cursor 的设置 → MCP 里能看到它，马上可用");
@@ -192,8 +236,8 @@ std::vector<Client> detect()
     }
     {
         Client c {u"vscode"_s, u"VS Code"_s};
-        c.installed = QFileInfo(env("APPDATA") + u"/Code/User"_s).isDir()
-            || QFileInfo(env("LOCALAPPDATA") + u"/Programs/Microsoft VS Code"_s).isDir();
+        c.installed = QFileInfo(under(appData(FOLDERID_RoamingAppData), u"Code/User"_s)).isDir()
+            || QFileInfo(under(appData(FOLDERID_LocalAppData), u"Programs/Microsoft VS Code"_s)).isDir();
         c.configPath = QDir::toNativeSeparators(vsCodeConfig());
         c.connected = namesRelay(vsCodeConfig(), u"servers"_s);
         c.note = Tr::tr("VS Code 的 Copilot 聊天（代理模式）里能用；“MCP: 列出服务器”可以查看");
@@ -207,7 +251,8 @@ QVariantList toVariant(const std::vector<Client>& clients)
     QVariantList out;
     for (const Client& c : clients) {
         out.push_back(QVariantMap {{u"id"_s, c.id}, {u"name"_s, c.name}, {u"installed"_s, c.installed},
-            {u"connected"_s, c.connected}, {u"configPath"_s, c.configPath}, {u"note"_s, c.note}});
+            {u"connected"_s, c.connected}, {u"configPath"_s, c.configPath}, {u"note"_s, c.note},
+            {u"skillInstalled"_s, c.skillInstalled}, {u"skillPath"_s, c.skillPath}});
     }
     return out;
 }
@@ -273,6 +318,47 @@ QString snippet(const QString& id)
         return u"claude mcp add --scope user winshun -- "_s + quoted(relay) + u" --start-winshun"_s;
     const QJsonObject root {{topKey(id), QJsonObject {{kServerKey, serverEntry(id)}}}};
     return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+void installSkill(const QString& wsExe, QObject* context, std::function<void(Result)> done)
+{
+    if (wsExe.isEmpty()) {
+        done({false, Tr::tr("没找到 ws.exe，重新安装 Win顺 就有了")});
+        return;
+    }
+    constexpr unsigned long kTimeoutMs = 20'000;
+    std::thread([context = QPointer<QObject>(context), program = wsExe.toStdWString(), done = std::move(done)] {
+        // --encoding utf8 whatever WS_ENCODING says in this program's environment: its words are read as UTF-8 here.
+        const shell::Captured run = shell::runUnelevatedCaptured(program, L"skill --install claude --encoding utf8", kTimeoutMs);
+        // ws prints the path it wrote and exits 0; anything else, it says why.
+        const QString output = QString::fromUtf8(run.output.data(), static_cast<qsizetype>(run.output.size())).trimmed();
+        Result result;
+        if (!run.started) {
+            result.message = Tr::tr("没能运行 ws.exe");
+        } else if (run.timedOut) {
+            result.message = Tr::tr("ws.exe 在 %1 秒内没有回答，已结束它").arg(kTimeoutMs / 1000);
+        } else if (run.exitCode == 0) {
+            result.ok = true;
+            const QString path = output.section(u'\n', 0, 0).trimmed();
+            result.file = path;
+            result.message = Tr::tr("已装 Skill：%1。Claude Code 新开的会话里就能用。").arg(path.isEmpty() ? skillPath() : path);
+        } else {
+            // Its own words, briefly: the first lines, not a screenful.
+            QString why = output.left(300);
+            if (output.size() > 300)
+                why += u"…"_s;
+            result.message = Tr::tr("装 Skill 没有成功（退出码 %1）：%2").arg(run.exitCode).arg(why.isEmpty() ? Tr::tr("ws.exe 没有说明原因") : why);
+        }
+        // On the GUI thread, which asks whether `context` is still there (it may go meanwhile).
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [context, done, result] {
+            // Whether it is there is judged from where ws put it, not from where this program
+            // thinks it goes: ws ran with the user's environment as the registry has it now.
+            if (result.ok && !result.file.isEmpty())
+                g_installedSkill = QDir::toNativeSeparators(result.file);
+            if (context)
+                done(result);
+        }, Qt::QueuedConnection);
+    }).detach();
 }
 
 } // namespace ws::mcpclients

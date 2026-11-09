@@ -10,6 +10,7 @@
 // cap on resident processes.
 
 #include "Catalog.h"
+#include "Elevation.h"
 #include "Items.h"
 #include "JsonRpc.h"
 #include "McpTools.h"
@@ -17,6 +18,8 @@
 #include "SearchTypes.h"
 
 #include <QHash>
+#include <QCache>
+#include <QDeadlineTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QObject>
@@ -29,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ws::plugin {
 
@@ -63,10 +67,20 @@ public:
         QString dataRoot; // where <id>.data folders go; empty: userPluginDir
         QString logPath; // plugins.log; empty: no file
         QString runnerExe; // WinShunPluginHost.exe
+        // Win顺's own folder, told to plugins as WS_APP_DIR: where its Qt is,
+        // for a plugin built on it (winshun.capture, GitHub #138). Empty: the runner's.
+        QString appDir;
         QString locale = QStringLiteral("zh");
         QString theme = QStringLiteral("light");
+        QJsonObject appearance; // setAppearance's `look`
         QString version; // of Win顺
         int maxResident = 8;
+        // The `elevated` permission (Elevation.h): whether Win顺 counts as
+        // elevated (empty: its token says; tests play one), and where the
+        // confirmed copies are (empty root: %ProgramData%'s, protected).
+        std::optional<bool> elevatedHost;
+        QString elevationRoot;
+        bool elevationProtected = true;
     };
 
     explicit Host(Options options, QObject* parent = nullptr);
@@ -76,8 +90,38 @@ public:
     const Options& options() const noexcept { return m_options; }
     void setToolBridge(ToolBridge bridge) { m_bridge = std::move(bridge); }
     // The interface's language and theme changed: for the plugins started
-    // from now on (the ones running keep what they were told).
-    void setAppearance(const QString& locale, const QString& theme);
+    // from now on (the ones running keep what they were told). `look`, for
+    // the plugins with windows of their own (initialize's appearance): the
+    // language and Win顺's 外观 settings (themeSetting, corners, uiSize,
+    // transparency, renderer); the running ones with the `ui` permission
+    // hear appearance when it changes.
+    void setAppearance(const QString& locale, const QString& theme, const QJsonObject& look = {});
+
+    // Win顺's tools for plugins alone, not the AI's (the screenshot plugin,
+    // GitHub #138: a picture into the clipboard history, the launcher with a
+    // text), answered by the app: held to the manifest's permission as the
+    // others are (onToolCall); `run` learns who asks and its data folder.
+    struct AppTool {
+        QString name;
+        Permission permission;
+        std::function<void(const QString& pluginId, const QString& dataDir, const QJsonObject& arguments,
+            std::function<void(mcp::ToolResult)> done)>
+            run;
+    };
+    void setAppTools(std::vector<AppTool> tools) { m_appTools = std::move(tools); }
+
+    // What Win顺 asks of a resident plugin besides queries, for what its
+    // manifest declares (trayMenu, pictures, settingsWindow): only
+    // while it runs and is ready, else false (and `reply` at once, failed).
+    // `reply` once, on this thread: failed for an error, the plugin gone or
+    // no answer within its timeoutMs. `foreground`: for what the user just
+    // chose, the plugin may bring a window of its own to the front.
+    using Reply = std::function<void(bool ok, const QJsonValue& result)>;
+    bool request(const QString& id, const QString& method, const QJsonObject& params, Reply reply, bool foreground = false);
+    bool notify(const QString& id, const QString& method, const QJsonObject& params, bool foreground = false);
+    // A plugin's data folder (<id>.data, WS_DATA_DIR), as it is told to it;
+    // not made here.
+    QString dataDir(const QString& id) const;
 
     // From the settings (stage 2 wires the INI): which plugins are on,
     // keywords the user changed, the [WebSearch] keywords, each plugin's
@@ -138,11 +182,38 @@ public:
         int crashes = 0; // within the last five minutes
         int timeouts = 0; // in a row, of the resident process
         QString error; // Unusable (manifest, missing program) or the last crash
+        bool elevated = false; // its resident process runs as administrator (the elevated runner)
     };
     State state(const QString& id) const;
     Runner::TokenSource tokenSource() const { return m_runner ? m_runner->tokenSource() : Runner::TokenSource::None; }
     QJsonObject runnerFacts() const { return m_runner ? m_runner->facts() : QJsonObject(); }
     bool runnerReady() const { return m_runner && m_runner->isReady(); }
+
+    // The `elevated` permission (Elevation.h): what a plugin's next start
+    // comes to, its confirmed version and why not, for its card; looked at
+    // again when older than a few seconds (a start always looks afresh).
+    struct ElevationState {
+        elevation::Verdict verdict = elevation::Verdict::NotAsked;
+        QString version; // the version confirmed
+        QString detail;
+    };
+    ElevationState elevationState(const QString& id);
+    bool hostElevated() const noexcept { return m_hostElevated; }
+    const elevation::Store& elevationStore() const noexcept { return m_store; }
+    // The user's 确认 in an elevated Win顺: its files as they are now are the
+    // ones to run as administrator; a resident process running starts again
+    // (on the elevated runner). False with `error`. Blocking (the files are
+    // hashed and copied): the settings page does the copy off the GUI thread
+    // itself (elevation::confirmFolder / confirmPackage) and then calls
+    // elevationConfirmed.
+    bool confirmElevation(const QString& id, QString* error = nullptr);
+    void elevationConfirmed(const QString& id); // what changes once a copy is confirmed
+    // The copies of plugins no longer installed, gone (elevated only).
+    void sweepElevation();
+    // The plugin's AI tools are not offered while it would run elevated: the
+    // AI's requests come from programs with the user's normal rights.
+    bool runsElevated(const QString& id) const;
+    static constexpr std::uint64_t kElevatedInstances = std::uint64_t {1} << 48; // the elevated runner's first instance
 
     // Tests: the backoff delays multiplied by this (1 = the real ones).
     void setBackoffScale(double scale) { m_backoffScale = scale; }
@@ -171,6 +242,9 @@ signals:
     void queryFailed(std::uint64_t queryId, const QString& pluginId, const QString& why); // timed out, crashed, errored
     void progress(std::uint64_t queryId, const QString& pluginId, const QString& text);
     void notice(const QString& pluginId, const QString& text); // winshun/notify: for the footer
+    // winshun/hotkeys: the shortcuts a plugin registers itself; empty when it
+    // says so, or its process ended.
+    void hotkeysChanged(const QString& pluginId, const QStringList& keys);
     // winshun/notify with "toast" from a plugin with the "notifications"
     // permission: a system notification. At most one per plugin every
     // kToastGapMs (a newer one waiting replaces the one before it); the
@@ -187,6 +261,7 @@ signals:
     // `open` effect to that plugin's permissions (OpenPolicy), whatever asked.
     void actionDone(std::uint64_t requestId, const QString& pluginId, const ws::plugin::Effects& effects, bool ok, const QString& error);
     void processStarted(const QString& pluginId, quint32 pid);
+    void systemSwitchesChanged(const QString& pluginId, const QStringList& ids);
     void processExited(const QString& pluginId, quint32 code);
     void restartScheduled(const QString& pluginId, int delayMs); // the real delay
     void disabledAfterCrashes(const QString& pluginId);
@@ -211,6 +286,14 @@ private:
     const Entry* entry(const QString& id) const;
     bool ensureRunner();
     void onRunnerExited();
+    bool ensureElevatedRunner();
+    void connectRunner(Runner* runner);
+    void onElevatedRunnerExited();
+    void runnerGone(bool elevated); // its instances have exited
+    Runner* runnerFor(std::uint64_t instance) const;
+    void stopInstance(std::uint64_t instance);
+    void sendInstance(std::uint64_t instance, const QByteArray& line);
+    std::uint64_t launchSpec(const Runner::Spec& spec); // on the runner the spec asks for
     void onStarted(std::uint64_t instance, quint32 pid);
     void onFailed(std::uint64_t instance, const QString& stage, quint32 error);
     void onLine(std::uint64_t instance, const QByteArray& line);
@@ -218,6 +301,7 @@ private:
 
     // Resident plugins.
     void startResident(Plugin& p);
+    void sendOrHold(Plugin& p, const Pending& q); // now, or once the process is ready
     void sendQuery(Plugin& p, const Pending& q);
     void onQueryReply(const QString& id, std::uint64_t queryId, const jsonrpc::Message& response);
     void onQueryTimeout(const QString& id);
@@ -244,6 +328,9 @@ private:
 
     Runner::Spec specFor(Plugin& p, const Entry& e, RunKind kind, const Pending* q, QString* error);
     QString dataDirFor(const Entry& e);
+    QString cacheKey(const QString& pluginId, const Pending& query) const;
+    std::optional<Items> cached(const QString& key);
+    void remember(const QString& pluginId, const Pending& query, const QueryResult& result);
     void log(const QString& line);
     void touch(Plugin& p);
     // Developer mode's trace of a line (see traced()); `line` is a JSON-RPC
@@ -255,12 +342,34 @@ private:
     Options m_options;
     Catalog m_catalog;
     ToolBridge m_bridge;
+    std::vector<AppTool> m_appTools;
     std::unique_ptr<Runner> m_runner;
+    std::unique_ptr<Runner> m_elevatedRunner; // made when a plugin first starts elevated
+    bool m_hostElevated = false;
+    elevation::Store m_store;
+    struct ElevationSeen {
+        ElevationState state;
+        QString dir; // Elevated: the confirmed copy
+        std::optional<Manifest> manifest; // Elevated: the copy's own (the same as the catalog's)
+        std::shared_ptr<elevation::Hold> hold; // Elevated, for a start: the store's folders held open
+        QDeadlineTimer fresh;
+    };
+    // And remembered (without the hold) for elevationState. `hold`: for a
+    // start, the folders kept from being swapped until the process runs.
+    ElevationSeen lookElevation(const Entry& e, bool hold = false);
+    QHash<QString, ElevationSeen> m_elevation;
+    std::unordered_map<std::uint64_t, std::shared_ptr<elevation::Hold>> m_holds; // by instance, until it has started (or failed)
     int m_runnerRestarts = 0;
     QTimer m_runnerBackoff;
+    QTimer m_preload; // coalesces catalog/configuration changes before starting eager plugins
     std::map<QString, std::unique_ptr<Plugin>> m_plugins;
     std::map<std::uint64_t, QString> m_owners; // instance -> plugin
     QHash<QString, QJsonObject> m_settings;
+    struct CachedResult {
+        Items items;
+        QDeadlineTimer expires;
+    };
+    QCache<QString, CachedResult> m_cache {2048}; // 2 MiB of serialized query/results, LRU
     std::uint64_t m_nextToolCall = 1;
     std::map<std::uint64_t, std::unique_ptr<CommandCall>> m_commandCalls;
     std::uint64_t m_nextCommandCall = std::uint64_t {1} << 40; // apart from the launcher's query ids

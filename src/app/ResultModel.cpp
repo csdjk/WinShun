@@ -1,4 +1,5 @@
 #include "ResultModel.h"
+#include "FolderSizes.h"
 #include "ResultColumns.h"
 
 #include "AppCatalog.h"
@@ -15,9 +16,11 @@
 #include "WebShortcut.h"
 #include "Wtf8.h"
 #include "platform/SiteIcons.h"
-#include "platform/SwitchKeepAwake.h"
+#include "platform/Shell.h"
+#include "KeepAwakeText.h"
 
 #include <QGuiApplication>
+#include <QFileInfo>
 #include <QLocale>
 #include <QStyleHints>
 #include <QTime>
@@ -114,6 +117,11 @@ QString webSearchTitle(const SearchResult& r, std::pair<qsizetype, qsizetype>* w
 // shortcut's: the address it opens, and for its site the keyword.
 QString appOrigin(const SearchResult& r)
 {
+    if (r.isWindow())
+        return ResultModel::tr("切换到窗口 · %1").arg(r.target.isEmpty()
+            ? ResultModel::tr("正在运行") : QFileInfo(r.target).completeBaseName());
+    if (r.isSettings())
+        return ResultModel::tr("外观、快捷键与插件");
     if (r.isCommand())
         return ResultModel::tr("自定义命令 · %1").arg(r.words.isEmpty() ? r.target : r.words);
     switch (r.app) {
@@ -159,7 +167,7 @@ SwitchState stateOf(const Switches* switches, const SearchResult& r)
 QString switchNote(const SwitchState& state)
 {
     if (state.until.isValid() && state.on == SwitchState::Value::On)
-        return SwitchKeepAwake::noteOf(state.until, QDateTime::currentDateTime());
+        return KeepAwakeText::noteOf(state.until, QDateTime::currentDateTime());
     return state.note;
 }
 
@@ -203,18 +211,40 @@ ResultModel::ResultModel(QObject* parent)
     });
 }
 
+ResultModel::~ResultModel() = default;
+
+void ResultModel::setFolderIndex(std::function<std::shared_ptr<FileIndex>()> index)
+{
+    m_folderSizes = std::make_unique<FolderSizes>(std::move(index));
+    connect(m_folderSizes.get(), &FolderSizes::changed, this, [this](const QString& path) {
+        for (int row = 0; row < count(); ++row)
+            if (m_items[row].isDir && m_items[row].path == path)
+                emit dataChanged(this->index(row), this->index(row), {SizeRole});
+    });
+}
+
+void ResultModel::setFolderSizesEnabled(bool on)
+{
+    if (on == m_folderSizesEnabled) return;
+    m_folderSizesEnabled = on;
+    if (m_folderSizes) m_folderSizes->reset();
+    if (count()) emit dataChanged(index(0), index(count() - 1), {SizeRole});
+}
+
 void ResultModel::setSwitches(Switches* switches)
 {
     if (switches == m_switches)
         return;
+    if (m_switches)
+        disconnect(m_switches, nullptr, this, nullptr);
     m_switches = switches;
-    if (!switches)
-        return;
     // A switch changed (here, in another program, in Settings): its rows
     // are not new rows, only their switch and second line are.
-    connect(switches, &Switches::changed, this, &ResultModel::switchChanged);
+    if (switches)
+        connect(switches, &Switches::changed, this, &ResultModel::switchChanged);
     if (!m_items.isEmpty()) // read before this was set
-        emit dataChanged(index(0), index(count() - 1), {SwitchOnRole, SwitchReadyRole, FolderRole});
+        emit dataChanged(index(0), index(count() - 1), {SwitchOnRole, SwitchLevelRole, SwitchBusyRole, SwitchNoteRole,
+            SwitchErrorRole, SwitchReadyRole, NameRole, NameHtmlRole, FolderRole});
 }
 
 void ResultModel::switchChanged(const QString& id)
@@ -223,7 +253,7 @@ void ResultModel::switchChanged(const QString& id)
         if (m_items[row].switchId == id)
             emit dataChanged(index(row), index(row),
                 {SwitchOnRole, SwitchLevelRole, SwitchBusyRole, SwitchNoteRole, SwitchErrorRole, SwitchReadyRole,
-                    FolderRole});
+                    NameRole, NameHtmlRole, FolderRole});
     }
 }
 
@@ -312,15 +342,15 @@ QVariant ResultModel::data(const QModelIndex& index, int role) const
         return r->isWeb() && !r->words.isEmpty() ? webSearchTitle(*r) : r->name;
     case NameHtmlRole: {
         if (r->suggestion) // what was typed stands out in it, as in a file's name
-            return highlighted(r->words, nameMatches(r->words, m_highlights), m_highlightColor);
+            return highlighted(r->words, nameMatches(r->words, m_highlights), m_highlightColor, elide::boldWeight(m_highlightWeight));
         if (const QString title = switchTitle(*r); !title.isEmpty())
-            return highlighted(title, nameMatches(title, m_highlights), m_highlightColor);
+            return highlighted(title, nameMatches(title, m_highlights), m_highlightColor, elide::boldWeight(m_highlightWeight));
         if (r->isWeb() && !r->words.isEmpty()) { // the words stand out, whatever the query's terms
             std::pair<qsizetype, qsizetype> words;
             const QString title = webSearchTitle(*r, &words);
-            return highlighted(title, {words}, m_highlightColor);
+            return highlighted(title, {words}, m_highlightColor, elide::boldWeight(m_highlightWeight));
         }
-        return highlighted(r->name, nameMatches(r->name, m_highlights), m_highlightColor);
+        return highlighted(r->name, nameMatches(r->name, m_highlights), m_highlightColor, elide::boldWeight(m_highlightWeight));
     }
     case NameMatchesRole: {
         QVariantList out;
@@ -346,11 +376,18 @@ QVariant ResultModel::data(const QModelIndex& index, int role) const
         return r->isApp() ? appOrigin(*r) : parentFolder(r->path);
     case PathRole:
         return r->path;
+    case WindowResultRole:
+        return r->isWindow();
     case IsDirRole:
         return r->isDir;
     case IconRole:
         if (r->isWeb() || r->isApp()) {
             const bool dark = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+            if (r->isWindow())
+                return r->target.isEmpty() ? FileIconProvider::pluginIconUrl(QString(), u"glyph:U+E8A7"_s, dark)
+                                          : FileIconProvider::iconUrl(r->target, false);
+            if (r->isSettings())
+                return FileIconProvider::pluginIconUrl(QString(), u"glyph:U+E713"_s, dark);
             if (r->isCommand())
                 return FileIconProvider::commandIconUrl(r->target, r->workingDirectory, r->icon, dark);
             if (r->isWeb())
@@ -377,7 +414,7 @@ QVariant ResultModel::data(const QModelIndex& index, int role) const
     case SnippetHtmlRole:
         if (r->snippet.isEmpty())
             return QString();
-        return highlighted(r->snippet, r->snippetMatches, m_highlightColor);
+        return highlighted(r->snippet, r->snippetMatches, m_highlightColor, elide::boldWeight(m_highlightWeight));
     case LineRole:
         return r->line;
     case LocationRole:
@@ -395,11 +432,14 @@ QVariant ResultModel::data(const QModelIndex& index, int role) const
     case PackagedAppRole:
         return r->isPackagedApp();
     case ElevatableRole:
-        return r->elevatable;
+        return !r->missing && !r->offline && (r->isApp() ? r->elevatable
+            : !r->isDir && shell::canRunAsAdministrator(r->path));
     case RevealableRole:
-        return !r->isApp() || (!r->isPlace() && !r->target.isEmpty());
+        return !r->isApp() || (!r->isWindow() && !r->isPlace() && !r->target.isEmpty());
     case CopyableRole:
         return !r->isApp() || r->hasCopyableTarget();
+    case SettingsActionRole:
+        return r->isSettings();
     case SelectedRole:
         return m_selected.contains(r->path);
     case ModifiedRole:
@@ -411,6 +451,8 @@ QVariant ResultModel::data(const QModelIndex& index, int role) const
             return QString();
         return QDateTime::fromSecsSinceEpoch(r->modified).toLocalTime().toString(u"yyyy-MM-dd HH:mm"_s);
     case SizeRole:
+        if (r->isDir && !r->offline && !r->missing && m_folderSizesEnabled && m_folderSizes)
+            return m_folderSizes->text(r->path);
         return (r->isApp() && !r->isPlugin()) || r->isDir || r->size < 0 ? QString() : sizeText(static_cast<std::uint64_t>(r->size));
     case OfflineRole:
         return r->offline;
@@ -510,6 +552,7 @@ QHash<int, QByteArray> ResultModel::roleNames() const
         {ElevatableRole, "elevatable"},
         {RevealableRole, "revealable"},
         {CopyableRole, "copyable"},
+        {SettingsActionRole, "settingsAction"},
         {SelectedRole, "selected"},
         {ModifiedRole, "modified"},
         {ModifiedFullRole, "modifiedFull"},
@@ -521,6 +564,7 @@ QHash<int, QByteArray> ResultModel::roleNames() const
         {OfflineRole, "offline"},
         {PluginRole, "plugin"},
         {SourceRole, "source"},
+        {WindowResultRole, "windowResult"},
         {FavoriteRole, "favorite"},
         {FavoriteKeywordRole, "favoriteKeyword"},
         {MissingRole, "missing"},
@@ -562,7 +606,7 @@ QStringList ResultModel::copyTexts() const
 }
 
 QString ResultModel::elidedHtml(
-    const QString& text, const QVariantList& matches, qreal width, const QFont& font, const QColor& color)
+    const QString& text, const QVariantList& matches, qreal width, const QFont& font, const QColor& color, int weight)
 {
     elide::Ranges ranges;
     for (qsizetype i = 0; i + 1 < matches.size(); i += 2) {
@@ -573,10 +617,11 @@ QString ResultModel::elidedHtml(
     }
     if (!ranges.isEmpty())
         diagnostics::watchHighlightFont(font); // GitHub #70: the highlights drawn as other characters
-    return elide::shortenedHtml(text, ranges, width, font, color);
+    return elide::shortenedHtml(text, ranges, width, font, color, elide::boldWeight(weight));
 }
 void ResultModel::assign(SearchResults items, QStringList highlights)
 {
+    if (m_folderSizes) m_folderSizes->reset();
     const int oldCount = count();
     const int newCount = static_cast<int>(items.size());
     const int common = std::min(oldCount, newCount);
@@ -600,6 +645,8 @@ void ResultModel::assign(SearchResults items, QStringList highlights)
     }
     if (first >= 0)
         emit dataChanged(index(first), index(last));
+    else if (m_folderSizesEnabled && common > 0)
+        emit dataChanged(index(0), index(common - 1), {SizeRole});
 
     if (newCount > oldCount) {
         beginInsertRows({}, oldCount, newCount - 1);
@@ -850,6 +897,16 @@ void ResultModel::setHighlightColor(const QColor& color)
     m_highlightColor = color;
     emit highlightColorChanged();
     if (!m_items.isEmpty()) // a web search's title too, and where content matches are
+        emit dataChanged(index(0), index(count() - 1), {NameHtmlRole, SnippetHtmlRole});
+}
+
+void ResultModel::setHighlightWeight(int weight)
+{
+    if (weight == m_highlightWeight)
+        return;
+    m_highlightWeight = weight;
+    emit highlightColorChanged();
+    if (!m_items.isEmpty())
         emit dataChanged(index(0), index(count() - 1), {NameHtmlRole, SnippetHtmlRole});
 }
 

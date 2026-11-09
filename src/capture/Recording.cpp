@@ -32,6 +32,7 @@
 #include <mmdeviceapi.h>
 
 #include <algorithm>
+#include <optional>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -67,6 +68,37 @@ void Timeline::resume(qint64 now)
 qint64 Timeline::elapsed(qint64 now) const
 {
     return std::max<qint64>(0, (m_pause >= 0 ? m_pause : now) - m_start - m_paused);
+}
+
+void bgraToNv12(const unsigned char* bgra, int pitch, int width, int height, unsigned char* luma, int lumaStride,
+    unsigned char* chroma, int chromaStride)
+{
+    // BT.709 scaled to 16-235 (Y) and 16-240 (Cb, Cr), in 1/65536; each
+    // chroma row sums to zero so that greys stay neutral.
+    constexpr int yr = 11966, yg = 40254, yb = 4064;
+    constexpr int ur = -6597, ug = -22188, ub = 28785;
+    constexpr int vr = 28785, vg = -26148, vb = -2637;
+    const auto y = [](const unsigned char* p) {
+        return static_cast<unsigned char>(16 + ((yr * p[2] + yg * p[1] + yb * p[0] + 32768) >> 16));
+    };
+    for (int row = 0; row + 1 < height; row += 2) {
+        const unsigned char* top = bgra + qsizetype(row) * pitch;
+        const unsigned char* bottom = top + pitch;
+        unsigned char* first = luma + qsizetype(row) * lumaStride;
+        unsigned char* second = first + lumaStride;
+        unsigned char* uv = chroma + qsizetype(row / 2) * chromaStride;
+        for (int x = 0; x + 1 < width; x += 2) {
+            const unsigned char* a = top + 4 * x;
+            const unsigned char* b = bottom + 4 * x;
+            first[x] = y(a);
+            first[x + 1] = y(a + 4);
+            second[x] = y(b);
+            second[x + 1] = y(b + 4);
+            const int r = a[2] + a[6] + b[2] + b[6], g = a[1] + a[5] + b[1] + b[5], bl = a[0] + a[4] + b[0] + b[4];
+            uv[x] = static_cast<unsigned char>(128 + ((ur * r + ug * g + ub * bl + 131072) >> 18)); // four pixels: >> 16 + 2
+            uv[x + 1] = static_cast<unsigned char>(128 + ((vr * r + vg * g + vb * bl + 131072) >> 18));
+        }
+    }
 }
 
 namespace {
@@ -110,7 +142,7 @@ winrt::com_ptr<IMFMediaType> videoType(const GUID& subtype, QSize size, int fps)
 
 class Graphics {
 public:
-    explicit Graphics(HMONITOR monitor)
+    Graphics(HMONITOR monitor, bool withVideo)
     {
         winrt::com_ptr<IDXGIFactory1> factory;
         check(::CreateDXGIFactory1(IID_PPV_ARGS(factory.put())), "DXGI factory");
@@ -131,14 +163,26 @@ public:
                 }
             }
         }
-        check(::D3D11CreateDevice(selected.get(), selected ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-            nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            nullptr, 0, D3D11_SDK_VERSION, device.put(), nullptr, context.put()), "D3D11 device");
+        const auto create = [&](UINT flags) {
+            device = nullptr;
+            context = nullptr;
+            return ::D3D11CreateDevice(selected.get(), selected ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, device.put(), nullptr, context.put());
+        };
+        // GitHub #214: a driver without D3D11 video (a virtual machine's, the
+        // basic display adapter, an old one) refuses the flag with
+        // DXGI_ERROR_UNSUPPORTED. Such a device still captures the screen;
+        // the CPU then makes the NV12 for the software encoder.
+        video = withVideo && SUCCEEDED(create(D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT));
+        if (!video)
+            check(create(D3D11_CREATE_DEVICE_BGRA_SUPPORT), "D3D11 device");
         if (auto threading = context.try_as<ID3D10Multithread>())
             threading->SetMultithreadProtected(TRUE); // MF's encoder may use this device on its own threads
-        UINT token = 0;
-        check(::MFCreateDXGIDeviceManager(&token, manager.put()), "DXGI device manager");
-        check(manager->ResetDevice(device.get(), token), "DXGI device binding");
+        if (video) {
+            UINT token = 0;
+            check(::MFCreateDXGIDeviceManager(&token, manager.put()), "DXGI device manager");
+            check(manager->ResetDevice(device.get(), token), "DXGI device binding");
+        }
     }
 
     winrt::com_ptr<ID3D11Texture2D> texture(QSize size, DXGI_FORMAT format, bool staging = false)
@@ -158,7 +202,8 @@ public:
 
     winrt::com_ptr<ID3D11Device> device;
     winrt::com_ptr<ID3D11DeviceContext> context;
-    winrt::com_ptr<IMFDXGIDeviceManager> manager;
+    winrt::com_ptr<IMFDXGIDeviceManager> manager; // with D3D11 video only
+    bool video = false;
 };
 
 class Converter {
@@ -272,9 +317,11 @@ public:
             check(pool->SetUINT32(MF_SA_D3D11_BINDFLAGS, D3D11_BIND_RENDER_TARGET), "GPU pool render targets");
             check(pool->SetUINT32(MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT), "GPU pool usage");
             check(m_allocator->InitializeSampleAllocatorEx(2, 12, pool.get(), in.get()), "bounded GPU sample pool");
-        } else {
+        } else if (graphics.video) {
             m_nv12 = graphics.texture(m_size, DXGI_FORMAT_NV12);
             m_staging = graphics.texture(m_size, DXGI_FORMAT_NV12, true);
+        } else {
+            m_staging = graphics.texture(m_size, DXGI_FORMAT_B8G8R8A8_UNORM, true); // the CPU converts (#214)
         }
         // Inspect the selected transform; requesting hardware is not proof
         // that the sink writer actually found a hardware encoder.
@@ -302,7 +349,8 @@ public:
         check(m_writer->BeginWriting(), "start encoder");
     }
 
-    void video(Converter& converter, ID3D11Texture2D* source, qint64 time, qint64 duration)
+    // `converter` is null without D3D11 video, and then never on the GPU path.
+    void video(Converter* converter, ID3D11Texture2D* source, qint64 time, qint64 duration)
     {
         winrt::com_ptr<IMFSample> sample;
         if (m_gpu) {
@@ -315,11 +363,15 @@ public:
             UINT slice = 0;
             check(dxgi->GetResource(IID_PPV_ARGS(target.put())), "encoder texture");
             check(dxgi->GetSubresourceIndex(&slice), "encoder texture slice");
-            converter.convert(source, target.get(), slice);
+            converter->convert(source, target.get(), slice);
             check(buffer->SetCurrentLength(DWORD(m_size.width() * m_size.height() * 3 / 2)), "GPU video length");
         } else {
-            converter.convert(source, m_nv12.get(), 0);
-            m_graphics.context->CopyResource(m_staging.get(), m_nv12.get());
+            if (converter) {
+                converter->convert(source, m_nv12.get(), 0);
+                m_graphics.context->CopyResource(m_staging.get(), m_nv12.get());
+            } else {
+                m_graphics.context->CopyResource(m_staging.get(), source);
+            }
             D3D11_MAPPED_SUBRESOURCE mapped {};
             check(m_graphics.context->Map(m_staging.get(), 0, D3D11_MAP_READ, 0, &mapped), "software encoder readback");
             const auto unmap = qScopeGuard([&] { m_graphics.context->Unmap(m_staging.get(), 0); });
@@ -329,9 +381,14 @@ public:
             BYTE* bytes = nullptr;
             check(buffer->Lock(&bytes, nullptr, nullptr), "software video lock");
             std::memset(bytes, 0, size);
-            for (int row = 0; row < m_size.height() * 3 / 2; ++row)
-                std::memcpy(bytes + size_t(row) * m_stride, static_cast<const BYTE*>(mapped.pData) + size_t(row) * mapped.RowPitch,
-                    size_t(m_size.width()));
+            const auto* pixels = static_cast<const BYTE*>(mapped.pData);
+            if (converter) {
+                for (int row = 0; row < m_size.height() * 3 / 2; ++row)
+                    std::memcpy(bytes + size_t(row) * m_stride, pixels + size_t(row) * mapped.RowPitch, size_t(m_size.width()));
+            } else {
+                bgraToNv12(pixels, int(mapped.RowPitch), m_size.width(), m_size.height(), bytes, int(m_stride),
+                    bytes + size_t(m_stride) * m_size.height(), int(m_stride));
+            }
             check(buffer->Unlock(), "software video unlock");
             check(buffer->SetCurrentLength(size), "software video length");
             check(::MFCreateSample(sample.put()), "software video sample");
@@ -513,18 +570,21 @@ public:
         m_pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(inspectable.as<wd3d::IDirect3DDevice>(), format, 2, m_item.Size());
         m_session = m_pool.CreateCaptureSession(m_item);
         m_session.IsCursorCaptureEnabled(options.cursor);
+        // Borderless capture is optional. An unpackaged desktop program
+        // must not wait for a consent operation just to start recording.
         try {
-            if (wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless).get()
-                == winrt::Windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus::Allowed)
-                m_session.IsBorderRequired(false);
+            if (auto border = m_session.try_as<wgc::IGraphicsCaptureSession3>()) border.IsBorderRequired(false);
         } catch (const winrt::hresult_error&) { }
         m_shared = std::make_shared<Shared>();
         m_token = m_pool.FrameArrived([state = m_shared](const auto& pool, const auto&) {
             try {
                 const auto frame = pool.TryGetNextFrame();
-                const std::lock_guard lock(state->mutex);
-                if (state->pending) state->pending.Close();
-                state->pending = frame; // one pending frame, never an accumulating queue
+                wgc::Direct3D11CaptureFrame previous {nullptr};
+                {
+                    const std::lock_guard lock(state->mutex);
+                    previous = std::exchange(state->pending, frame);
+                }
+                if (previous) previous.Close(); // release driver resources outside our mutex
             } catch (const winrt::hresult_error& error) {
                 const std::lock_guard lock(state->mutex);
                 state->error = error.code().value;
@@ -616,7 +676,8 @@ Result run(const Options& options, Control& control, const std::function<void(co
     }
     // A new, owned staging file beside the destination; incomplete output
     // is never mistaken for a successfully saved MP4.
-    const QString temporary = options.path + u"."_s + QUuid::createUuid().toString(QUuid::Id128) + u".partial.mp4"_s;
+    const QString temporary = options.temporary.isEmpty()
+        ? options.path + u"."_s + QUuid::createUuid().toString(QUuid::Id128) + u".partial.mp4"_s : options.temporary;
     QFile reservation(temporary);
     if (!reservation.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
         result.error = QCoreApplication::translate("Recording", "无法写入录屏文件夹：%1").arg(reservation.errorString());
@@ -625,7 +686,12 @@ Result run(const Options& options, Control& control, const std::function<void(co
     reservation.close();
     bool finalized = false;
     std::unique_ptr<Writer> writer;
+    const auto stage = [&](const QString& name) {
+        result.stage = name;
+        if (progress) progress(result);
+    };
     try {
+        stage(u"media startup"_s);
         const HMODULE platform = ::LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         const HMODULE readwrite = ::LoadLibraryExW(L"mfreadwrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         const auto libraries = qScopeGuard([&] {
@@ -644,21 +710,26 @@ Result run(const Options& options, Control& control, const std::function<void(co
             ::MFShutdown();
         });
         const RECT area {options.region.left(), options.region.top(), options.region.right() + 1, options.region.bottom() + 1};
-        Graphics graphics(::MonitorFromRect(&area, MONITOR_DEFAULTTOPRIMARY));
+        stage(u"graphics device"_s);
+        Graphics graphics(::MonitorFromRect(&area, MONITOR_DEFAULTTOPRIMARY), !options.noVideoDevice);
         const QSize encodedSize((options.region.width() + 1) & ~1, (options.region.height() + 1) & ~1);
-        Converter converter(graphics, encodedSize, encodedSize, options.fps);
+        std::optional<Converter> converter;
+        if (graphics.video)
+            converter.emplace(graphics, encodedSize, encodedSize, options.fps);
         winrt::com_ptr<ID3D11Texture2D> padded;
         if (encodedSize != options.region.size())
             padded = graphics.texture(encodedSize, DXGI_FORMAT_B8G8R8A8_UNORM);
-        if (!options.software) {
+        stage(u"encoder startup"_s);
+        if (!options.software && graphics.video) {
             try { writer = std::make_unique<Writer>(graphics, options, temporary, true); }
             catch (const Failure&) { writer.reset(); }
         }
         if (!writer)
             writer = std::make_unique<Writer>(graphics, options, temporary, false);
-        result.encoder = writer->encoder;
+        result.encoder = graphics.video ? writer->encoder : writer->encoder + u" (no D3D11 video: NV12 on the CPU)"_s;
         result.hardware = writer->actualHardware;
         std::vector<std::unique_ptr<Audio>> audio;
+        stage(u"audio startup"_s);
         if (syntheticMs < 0) {
             try {
                 if (options.systemAudio) audio.push_back(std::make_unique<Audio>(true));
@@ -672,6 +743,7 @@ Result run(const Options& options, Control& control, const std::function<void(co
             }
         }
         std::unique_ptr<Source> source;
+        stage(u"screen capture startup"_s);
         winrt::com_ptr<ID3D11Texture2D> generated;
         if (syntheticMs < 0)
             source = std::make_unique<Source>(graphics, options);
@@ -717,6 +789,7 @@ Result run(const Options& options, Control& control, const std::function<void(co
         qint64 syntheticKey = showKeys && syntheticMs >= 0 ? kSecond / 10 : -1;
         if (options.keyInput) options.keyInput->discardBefore(start);
         for (const auto& input : audio) input->start();
+        stage(u"encoding"_s);
         qint64 nextVideo = 0, nextAudio = 0, lastUpdate = -kSecond;
         const qint64 interval = kSecond / options.fps;
         const bool withAudio = options.systemAudio || options.microphone;
@@ -841,7 +914,7 @@ Result run(const Options& options, Control& control, const std::function<void(co
                     input = padded.get();
                 }
                 try {
-                    writer->video(converter, input, nextVideo, interval);
+                    writer->video(converter ? &*converter : nullptr, input, nextVideo, interval);
                 } catch (const Failure&) {
                     // Transform metadata is only diagnostic: some vendors do
                     // not expose a hardware URL even on the GPU input path.
@@ -850,7 +923,7 @@ Result run(const Options& options, Control& control, const std::function<void(co
                     writer = std::make_unique<Writer>(graphics, options, temporary, false);
                     result.encoder = writer->encoder;
                     result.hardware = writer->actualHardware;
-                    writer->video(converter, input, nextVideo, interval);
+                    writer->video(converter ? &*converter : nullptr, input, nextVideo, interval);
                 }
                 ++result.frames;
                 nextVideo = std::max(nextVideo + interval, elapsed / interval * interval);
@@ -879,9 +952,11 @@ Result run(const Options& options, Control& control, const std::function<void(co
                 for (const auto& input : audio) input->collect(clock, nowTicks(), false);
             audioUntil(end * kAudioRate / kSecond);
         }
+        stage(u"capture shutdown"_s);
         source.reset();
         pointer.reset();
         audio.clear();
+        stage(u"finalize MP4"_s);
         if (result.frames && !control.discard) check(writer->finish(), "finalize MP4");
         finalized = true;
         writer.reset();

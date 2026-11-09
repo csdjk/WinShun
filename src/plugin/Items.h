@@ -58,6 +58,9 @@ struct Item {
     QString previewText;
     QList<Action> actions; // overriding the command's
     bool valid = true;
+    // GitHub #202: no file of its own to show, but the plugin tells what it
+    // is when asked (`details`): the content pane and the preview ask.
+    bool details = false;
     QJsonValue data; // opaque; goes back with the action
     // Zero-code: what the row does instead of opening something.
     QString searchQuery; // run a search in the launcher
@@ -83,10 +86,12 @@ QueryResult parseResult(const QJsonValue& value);
 QueryResult parseOutput(const QByteArray& text);
 
 struct Effect {
-    enum class Kind { Hide, Keep, SetQuery, Notify, Copy, Open, Replace };
+    // Reveal: {type: "reveal", path}: the file manager on its folder, the item
+    // selected (only selects: no program starts); gone, its folder if still there.
+    enum class Kind { Hide, Keep, SetQuery, Notify, Copy, Open, Replace, Reveal };
     Kind kind = Kind::Hide;
     QString text; // SetQuery, Notify, Copy
-    Open open;
+    Open open; // Open; Reveal: a Path, its target only
     Items items; // Replace
     friend bool operator==(const Effect&, const Effect&) = default;
 };

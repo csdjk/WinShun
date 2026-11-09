@@ -1,5 +1,6 @@
 #include "ClipModel.h"
 
+#include "ClipThumbnailProvider.h"
 #include "ColorText.h"
 #include "FileIconProvider.h"
 
@@ -8,7 +9,7 @@
 #include <QLocale>
 #include <QMimeDatabase>
 #include <QSet>
-#include <QUrl>
+#include <QTimeZone>
 
 #include <algorithm>
 
@@ -21,19 +22,20 @@ namespace {
 constexpr qsizetype kTitleChars = 200; // more never fits on a row
 constexpr qsizetype kLeadIn = 16; // characters before a match deep in the text, when the title shows it
 
-// Wraps the given ranges of `text` in accent-coloured bold (Text.StyledText).
-QString highlighted(const QString& text, QList<std::pair<qsizetype, qsizetype>> ranges, const QColor& color)
+// Wraps the given ranges of `text` in the match colour, bold where `bold` (Text.StyledText).
+QString highlighted(const QString& text, QList<std::pair<qsizetype, qsizetype>> ranges, const QColor& color, bool bold)
 {
     std::sort(ranges.begin(), ranges.end());
     QString html;
     html.reserve(text.size() + 64);
-    const QString open = u"<font color=\"%1\"><b>"_s.arg(color.name());
+    const QString open = u"<font color=\"%1\">%2"_s.arg(color.name(), bold ? u"<b>"_s : QString());
+    const QString close = bold ? u"</b></font>"_s : u"</font>"_s;
     qsizetype pos = 0;
     for (const auto& [start, length] : ranges) {
         if (start < pos || length <= 0)
             continue; // overlapping ranges: keep the first
         html += text.mid(pos, start - pos).toHtmlEscaped();
-        html += open + text.mid(start, length).toHtmlEscaped() + u"</b></font>"_s;
+        html += open + text.mid(start, length).toHtmlEscaped() + close;
         pos = start + length;
     }
     html += text.mid(pos).toHtmlEscaped();
@@ -147,8 +149,12 @@ QVariant ClipModel::data(const QModelIndex& index, int role) const
         return FileIconProvider::iconUrl(first, dir);
     }
     case ImageRole: {
-        if (c->kind == ClipKind::Image) // none until its file is written (pictureSaved)
-            return m_store->imagePending(c->id) ? QString() : QUrl::fromLocalFile(m_store->imagePath(c->id)).toString();
+        // Thumbnails decoded off the GUI thread and kept (ClipThumbnailProvider).
+        // None until its file is written (pictureSaved). Never rewritten, but
+        // an entry restored from a backup can bring the same id back with
+        // another picture: its copy time tells them apart.
+        if (c->kind == ClipKind::Image)
+            return m_store->imagePending(c->id) ? QString() : ClipThumbnailProvider::url(m_store->imagePath(c->id), c->created);
         if (c->kind != ClipKind::Files && c->kind != ClipKind::Path)
             return QString();
         const QStringList files = c->files();
@@ -156,12 +162,16 @@ QVariant ClipModel::data(const QModelIndex& index, int role) const
             return QString();
         const QString& path = files.constFirst();
         // Presentation only: WeChat can copy a picture as a file. Keep its
-        // original kind and paste formats; Qt decodes the thumbnail asynchronously.
-        // MatchExtension never reads the file's contents on the GUI thread.
-        if (!QMimeDatabase().mimeTypeForFile(path, QMimeDatabase::MatchExtension).name().startsWith(u"image/")
-            || fileMissing(*c) || !QFileInfo(path).isFile())
+        // original kind and paste formats. MatchExtension never reads the
+        // file's contents on the GUI thread.
+        static const QMimeDatabase mimes;
+        if (!mimes.mimeTypeForFile(path, QMimeDatabase::MatchExtension).name().startsWith(u"image/") || fileMissing(*c))
             return QString();
-        return QUrl::fromLocalFile(path).toString();
+        const QFileInfo file(path);
+        if (!file.isFile())
+            return QString();
+        // Written again since (the same name, another picture): another address.
+        return ClipThumbnailProvider::url(path, file.lastModified(QTimeZone::UTC).toMSecsSinceEpoch());
     }
     case ColorRole:
         return colorOf(*c);
@@ -204,7 +214,7 @@ QString ClipModel::title(const Clip& clip) const
             first = std::min(first, span.first);
         const qsizetype from = std::max<qsizetype>(0, first - kLeadIn);
         const QString line = (from > 0 ? u"…"_s : QString()) + oneLine(QStringView(words).mid(from));
-        return tr("图片：") + highlighted(line, matcher.spans(line), m_highlightColor);
+        return tr("图片：") + highlighted(line, matcher.spans(line), m_highlightColor, m_highlightWeight >= 600);
     }
     case ClipKind::Files: {
         const QStringList files = clip.files();
@@ -223,7 +233,7 @@ QString ClipModel::title(const Clip& clip) const
         }
         if (names.size() > 1)
             line = tr("%1 等 %Ln 个文件", nullptr, static_cast<int>(names.size())).arg(line);
-        return highlighted(line, matcher.spans(line), m_highlightColor);
+        return highlighted(line, matcher.spans(line), m_highlightColor, m_highlightWeight >= 600);
     }
     default:
         break;
@@ -247,7 +257,7 @@ QString ClipModel::title(const Clip& clip) const
         const qsizetype from = std::max(firstChar, first - kLeadIn);
         line = (from > firstChar ? u"…"_s : QString()) + oneLine(text.mid(from));
     }
-    return highlighted(line, matcher.spans(line), m_highlightColor);
+    return highlighted(line, matcher.spans(line), m_highlightColor, m_highlightWeight >= 600);
 }
 
 QString ClipModel::detail(const Clip& clip) const
@@ -547,6 +557,16 @@ std::vector<const Clip*> ClipModel::selection() const
             clips.push_back(c);
     }
     return clips;
+}
+
+void ClipModel::setHighlightWeight(int weight)
+{
+    if (weight == m_highlightWeight)
+        return;
+    m_highlightWeight = weight;
+    emit highlightColorChanged();
+    if (count() > 0)
+        emit dataChanged(index(0), index(count() - 1), {TitleRole});
 }
 
 void ClipModel::setHighlightColor(const QColor& color)

@@ -36,6 +36,13 @@ enum MenuCommand {
     AllTopmostCommand
 };
 
+shell::MenuItem command(int id, QString text, char16_t glyph, bool checked = false, bool enabled = true)
+{
+    shell::MenuItem item {id, std::move(text), checked, enabled};
+    item.glyph = QString(QChar(glyph));
+    return item;
+}
+
 } // namespace
 
 PinManager::PinManager(Callbacks callbacks, QObject* parent)
@@ -73,6 +80,8 @@ void PinManager::pin(const QImage& image, QPoint origin, bool screenshot, QByteA
     };
     host.dark = m_callbacks.dark;
     host.accent = m_callbacks.accent;
+    host.edge = m_callbacks.edge;
+    host.pillRadius = m_callbacks.pillRadius;
     host.copyText = m_callbacks.copyText;
     host.readLines = m_callbacks.readLines;
     host.takenTabs = [this](const PinWindow* self) {
@@ -95,6 +104,7 @@ void PinManager::pin(const QImage& image, QPoint origin, bool screenshot, QByteA
     pin->setScreenshot(screenshot);
     pin->setProject(std::move(project));
     pin->setDoubleClick(m_doubleClick);
+    pin->setKeys(m_keys);
     if (pin->hwnd())
         m_pins.push_back(std::move(pin));
 }
@@ -170,6 +180,12 @@ void PinManager::setAllHidden(bool hidden)
         p->setAllHidden(hidden);
 }
 
+void PinManager::restyle()
+{
+    for (const auto& p : m_pins)
+        p->restyle();
+}
+
 bool PinManager::allTopmost() const
 {
     return !m_pins.empty() && std::ranges::all_of(m_pins, [](const auto& p) { return p->topmost(); });
@@ -186,6 +202,13 @@ void PinManager::setDoubleClick(PinDoubleClick action)
     m_doubleClick = action;
     for (const auto& p : m_pins)
         p->setDoubleClick(action);
+}
+
+void PinManager::setKeys(const CaptureKeys& keys)
+{
+    m_keys = keys;
+    for (const auto& p : m_pins)
+        p->setKeys(keys);
 }
 
 void PinManager::closed(PinWindow* pin)
@@ -206,54 +229,58 @@ void PinManager::closed(PinWindow* pin)
 
 void PinManager::showMenu(PinWindow* pin, POINT at)
 {
-    const QString ocr = m_callbacks.ocrAvailable ? tr("识别文字") : tr("识别文字（没有安装文字识别模型）");
+    const bool ocrAvailable = m_callbacks.ocrAvailable && m_callbacks.ocrAvailable();
+    const QString ocr = ocrAvailable ? tr("识别文字") : tr("识别文字（安装增强识别…）");
     const bool full = pin->form() == PinForm::Full;
-    shell::MenuItem turn {0, tr("旋转与翻转")};
+    // The key after a tab; nothing when the action has none.
+    const auto hint = [this](KeyAction action) { return m_keys.has(action) ? u"\t"_s + m_keys.text(action) : QString(); };
+    auto turn = command(0, tr("旋转与翻转"), 0xE777);
     turn.children = {
-        {RotateRightCommand, tr("向右转 90°") + u"\tR"_s},
-        {RotateLeftCommand, tr("向左转 90°") + u"\tShift+R"_s},
-        {FlipHorizontalCommand, tr("左右翻转") + u"\tH"_s},
-        {FlipVerticalCommand, tr("上下翻转") + u"\tV"_s},
+        command(RotateRightCommand, tr("向右转 90°") + hint(KeyAction::PinRotateRight), 0xE72C),
+        command(RotateLeftCommand, tr("向左转 90°") + hint(KeyAction::PinRotateLeft), 0xE777),
+        command(FlipHorizontalCommand, tr("左右翻转") + hint(KeyAction::PinFlipHorizontal), 0xE8DE),
+        command(FlipVerticalCommand, tr("上下翻转") + hint(KeyAction::PinFlipVertical), 0xE8CB),
     };
-    shell::MenuItem collapse {0, tr("收起")};
+    auto collapse = command(0, tr("收起"), 0xE73F);
     collapse.children = {
-        {CollapseTileCommand, tr("收成小块") + u"\tSpace"_s},
-        {CollapseEdgeCommand, tr("收到屏幕顶边")},
+        command(CollapseTileCommand, tr("收成小块") + hint(KeyAction::PinCollapse), 0xE73F),
+        command(CollapseEdgeCommand, tr("收到屏幕顶边"), 0xE74A),
     };
-    shell::MenuItem all {0, tr("全部贴图")};
+    auto all = command(0, tr("全部贴图"), 0xE8A9);
     all.children = {
-        {HideAllCommand, m_hidden ? tr("显示全部贴图") : tr("隐藏全部贴图")},
-        {AllTopmostCommand, tr("全部置顶"), allTopmost()},
-        {CloseAllCommand, tr("关闭全部贴图")},
+        command(HideAllCommand, m_hidden ? tr("显示全部贴图") : tr("隐藏全部贴图"), 0xE890),
+        command(AllTopmostCommand, tr("全部置顶"), 0xE718, allTopmost()),
+        command(CloseAllCommand, tr("关闭全部贴图"), 0xE8BB),
     };
     std::vector<shell::MenuItem> items {
-        {CopyCommand, tr("复制") + u"\tCtrl+C"_s},
-        {SaveCommand, tr("保存到“屏幕截图”") + u"\tCtrl+S"_s},
-        {SaveAsCommand, tr("另存为…")},
+        command(CopyCommand, tr("复制") + hint(KeyAction::PinCopy), 0xE8C8),
+        command(SaveCommand, tr("保存到“屏幕截图”") + hint(KeyAction::PinSave), 0xE74E),
+        command(SaveAsCommand, tr("另存为…"), 0xE74E),
         shell::MenuItem::separator(),
     };
     if (full) {
-        items.push_back({EditCommand, tr("编辑")});
-        items.push_back({OcrCommand, ocr, false, m_callbacks.ocrAvailable});
-        items.push_back({PickTextCommand, tr("选择文字") + u"\tT"_s, pin->textMode(), m_callbacks.ocrAvailable && pin->canPickText()});
+        items.push_back(command(EditCommand, tr("编辑"), 0xE70F));
+        items.push_back(command(OcrCommand, ocr, 0xE8A5));
+        items.push_back(command(PickTextCommand, tr("选择文字") + hint(KeyAction::PinTextPick), 0xE8D2,
+            pin->textMode(), ocrAvailable && pin->canPickText()));
         items.push_back(shell::MenuItem::separator());
         items.push_back(std::move(turn));
         items.push_back(std::move(collapse));
         items.push_back(shell::MenuItem::separator());
-        items.push_back({TopmostCommand, tr("置顶"), pin->topmost()});
-        items.push_back({ClickThroughCommand, tr("鼠标穿透（按住 Ctrl 可操作）"), pin->clickThrough()});
+        items.push_back(command(TopmostCommand, tr("置顶"), 0xE718, pin->topmost()));
+        items.push_back(command(ClickThroughCommand, tr("鼠标穿透（按住 Ctrl 可操作）"), 0xE7C9, pin->clickThrough()));
     } else {
-        items.push_back({ExpandCommand, tr("展开")});
+        items.push_back(command(ExpandCommand, tr("展开"), 0xE740));
         items.push_back(shell::MenuItem::separator());
-        items.push_back({TopmostCommand, tr("置顶"), pin->topmost()});
+        items.push_back(command(TopmostCommand, tr("置顶"), 0xE718, pin->topmost()));
     }
     items.push_back(shell::MenuItem::separator());
-    items.push_back({CloseCommand, tr("关闭") + u"\tEsc"_s});
-    items.push_back({CloseOthersCommand, tr("关闭其他")});
+    items.push_back(command(CloseCommand, tr("关闭") + hint(KeyAction::PinClose), 0xE8BB));
+    items.push_back(command(CloseOthersCommand, tr("关闭其他"), 0xE8BB));
     items.push_back(std::move(all));
     const HWND hwnd = pin->hwnd();
     m_menuPin = pin; // the pin keeps the mouse while its menu is up
-    const int chosen = shell::popupMenu(hwnd, items, at);
+    const int chosen = m_callbacks.popupMenu ? m_callbacks.popupMenu(hwnd, items, at) : shell::popupMenu(hwnd, items, at);
     m_menuPin = nullptr;
     // The pin may have gone while the menu was up (the tray closed them all).
     if (std::ranges::find(m_pins, pin, &std::unique_ptr<PinWindow>::get) == m_pins.end())

@@ -1,4 +1,5 @@
 #pragma once
+#include "platform/OcrPackage.h"
 
 #include "ClipImport.h"
 #include "IndexService.h"
@@ -18,8 +19,11 @@
 
 namespace ws {
 
+class CliSetup;
 class FavoritesSettings;
 class PluginSettings;
+class HealthMonitor;
+class OcrPackage;
 class ShortcutCapture;
 class SystemCatalog;
 
@@ -27,9 +31,12 @@ class SystemCatalog;
 // away and reported through edited(); there is no OK / Cancel step.
 class SettingsEditor : public QObject {
     Q_OBJECT
+    Q_MOC_INCLUDE("HealthMonitor.h")
     QML_ELEMENT
     QML_UNCREATABLE("Provided by the application")
     Q_PROPERTY(bool doubleCtrl READ doubleCtrl WRITE setDoubleCtrl NOTIFY changed FINAL)
+    Q_PROPERTY(QString doubleTapAction READ doubleTapAction WRITE setDoubleTapAction NOTIFY changed FINAL)
+    Q_PROPERTY(QVariantList doubleTapActions READ doubleTapActions NOTIFY doubleTapActionsChanged FINAL)
     Q_PROPERTY(QString doubleTapKey READ doubleTapKey WRITE setDoubleTapKey NOTIFY changed FINAL) // ctrl | alt | shift
     Q_PROPERTY(QString doubleCtrlKey READ doubleCtrlKey WRITE setDoubleCtrlKey NOTIFY changed FINAL) // both | left | right
     // The Ctrl PowerToys' Find My Mouse also opens on with a double tap,
@@ -41,6 +48,8 @@ class SettingsEditor : public QObject {
             NOTIFY changed FINAL)
     Q_PROPERTY(QStringList doubleCtrlExcludedApps READ doubleCtrlExcludedApps NOTIFY changed FINAL)
     Q_PROPERTY(QString hotkey READ hotkey WRITE setHotkey NOTIFY changed FINAL)
+    Q_PROPERTY(QString panelHotkey READ panelHotkey WRITE setPanelHotkey NOTIFY changed FINAL)
+    Q_PROPERTY(QString panelHotkeyError READ panelHotkeyError NOTIFY hotkeyErrorChanged FINAL)
     Q_PROPERTY(QString shortcutAgain READ shortcutAgain WRITE setShortcutAgain NOTIFY changed FINAL) // close | panel
     Q_PROPERTY(QString hotkeyError READ hotkeyError NOTIFY hotkeyErrorChanged FINAL)
     Q_PROPERTY(bool recordingHotkey READ recordingHotkey WRITE setRecordingHotkey NOTIFY recordingHotkeyChanged FINAL)
@@ -69,14 +78,26 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(bool explorerMenu READ explorerMenu WRITE setExplorerMenu NOTIFY changed FINAL)
     Q_PROPERTY(bool explorerTyping READ explorerTyping WRITE setExplorerTyping NOTIFY changed FINAL)
     Q_PROPERTY(bool opusTyping READ opusTyping WRITE setOpusTyping NOTIFY changed FINAL)
-    Q_PROPERTY(QString folderTyping READ folderTyping WRITE setFolderTyping NOTIFY changed FINAL) // first | only (GitHub #110)
+    Q_PROPERTY(QString opusTypingScope READ opusTypingScope WRITE setOpusTypingScope NOTIFY changed FINAL) // folder | all (GitHub #82)
+    Q_PROPERTY(QString folderTyping READ folderTyping WRITE setFolderTyping NOTIFY changed FINAL) // first | only | level (GitHub #110, #182)
     // The folder menu on a double click (Settings::folderMenu: on unless "off").
     Q_PROPERTY(bool folderMenu READ folderMenu WRITE setFolderMenu NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuDouble READ folderMenuDouble WRITE setFolderMenuDouble NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuMiddle READ folderMenuMiddle WRITE setFolderMenuMiddle NOTIFY changed FINAL)
     Q_PROPERTY(bool folderMenuExplorer READ folderMenuExplorer WRITE setFolderMenuExplorer NOTIFY changed FINAL)
     // The groups it lists (GitHub #51); the last one on cannot be switched off.
     Q_PROPERTY(bool folderMenuFavorites READ folderMenuFavorites WRITE setFolderMenuFavorites NOTIFY changed FINAL)
     Q_PROPERTY(bool folderMenuRecent READ folderMenuRecent WRITE setFolderMenuRecent NOTIFY changed FINAL)
     Q_PROPERTY(bool folderMenuWindows READ folderMenuWindows WRITE setFolderMenuWindows NOTIFY changed FINAL)
+    Q_PROPERTY(int folderMenuRecentInline READ folderMenuRecentInline WRITE setFolderMenuRecentInline NOTIFY changed FINAL)
+    Q_PROPERTY(int folderMenuWindowsInline READ folderMenuWindowsInline WRITE setFolderMenuWindowsInline NOTIFY changed FINAL)
+    // The actions under the lists (GitHub #200).
+    Q_PROPERTY(bool folderMenuItemSearch READ folderMenuItemSearch WRITE setFolderMenuItemSearch NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuItemCopyPath READ folderMenuItemCopyPath WRITE setFolderMenuItemCopyPath NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuItemCmd READ folderMenuItemCmd WRITE setFolderMenuItemCmd NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuItemPowerShell READ folderMenuItemPowerShell WRITE setFolderMenuItemPowerShell NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuItemFavorite READ folderMenuItemFavorite WRITE setFolderMenuItemFavorite NOTIFY changed FINAL)
+    Q_PROPERTY(bool folderMenuItemSettings READ folderMenuItemSettings WRITE setFolderMenuItemSettings NOTIFY changed FINAL)
     // The folder menu in Directory Opus, which runs a command of its settings
     // on a double click on blank space (refreshOpusFolderMenu): on | stale
     // (another copy's WinShunSearch.exe) | off | taken (a command of the
@@ -92,51 +113,12 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(QString folderMenuHotkey READ folderMenuHotkey WRITE setFolderMenuHotkey NOTIFY changed FINAL)
     Q_PROPERTY(bool dropPie READ dropPie WRITE setDropPie NOTIFY changed FINAL) // 拖放圆盘
     Q_PROPERTY(QString folderMenuHotkeyError READ folderMenuHotkeyError NOTIFY hotkeyErrorChanged FINAL)
-    // The screen capture's card on the 插件 page ([Capture]): its switch, its
-    // hotkey and that hotkey's error (as hotkeyError), PrtScn, and whether
-    // letting go of a drag copies at once; captureNote says what PrtScn's
-    // takeover could not do.
-    Q_PROPERTY(QString captureLastPinHotkey READ captureLastPinHotkey WRITE setCaptureLastPinHotkey NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureSaveFolder READ captureSaveFolder WRITE setCaptureSaveFolder NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureRecordingFolder READ captureRecordingFolder WRITE setCaptureRecordingFolder NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureRecordingSystemAudio READ captureRecordingSystemAudio WRITE setCaptureRecordingSystemAudio NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureRecordingMicrophone READ captureRecordingMicrophone WRITE setCaptureRecordingMicrophone NOTIFY changed FINAL)
-    Q_PROPERTY(int captureRecordingQuality READ captureRecordingQuality WRITE setCaptureRecordingQuality NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureRecordingCursor READ captureRecordingCursor WRITE setCaptureRecordingCursor NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureRecordingCountdown READ captureRecordingCountdown WRITE setCaptureRecordingCountdown NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureRecordingClicks READ captureRecordingClicks WRITE setCaptureRecordingClicks NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureLastPinHotkeyError READ captureLastPinHotkeyError NOTIFY hotkeyErrorChanged FINAL)
-    Q_PROPERTY(bool captureEnabled READ captureEnabled WRITE setCaptureEnabled NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureHotkey READ captureHotkey WRITE setCaptureHotkey NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureHotkeyError READ captureHotkeyError NOTIFY hotkeyErrorChanged FINAL)
-    Q_PROPERTY(bool capturePrintScreen READ capturePrintScreen WRITE setCapturePrintScreen NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureCopyOnSelect READ captureCopyOnSelect WRITE setCaptureCopyOnSelect NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureMagnifier READ captureMagnifier WRITE setCaptureMagnifier NOTIFY changed FINAL)
-    Q_PROPERTY(bool capturePinOnCopy READ capturePinOnCopy WRITE setCapturePinOnCopy NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureMouseDoubleLeft READ captureMouseDoubleLeft WRITE setCaptureMouseDoubleLeft NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureMouseRight READ captureMouseRight WRITE setCaptureMouseRight NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureMouseMiddle READ captureMouseMiddle WRITE setCaptureMouseMiddle NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureMouseBack READ captureMouseBack WRITE setCaptureMouseBack NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureMouseForward READ captureMouseForward WRITE setCaptureMouseForward NOTIFY changed FINAL)
-    // The capture toolbar's buttons left off it: comma separated ids (Settings::captureToolbarButtonIds).
-    Q_PROPERTY(QString captureToolbarHidden READ captureToolbarHidden WRITE setCaptureToolbarHidden NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureNote READ captureNote NOTIFY hotkeyErrorChanged FINAL)
-    // Smart redaction's options (Settings::captureSmart*).
-    Q_PROPERTY(bool captureCursor READ captureCursor WRITE setCaptureCursor NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureHdrFile READ captureHdrFile WRITE setCaptureHdrFile NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureControlsUia READ captureControlsUia WRITE setCaptureControlsUia NOTIFY changed FINAL)
-    Q_PROPERTY(int captureDelay READ captureDelay WRITE setCaptureDelay NOTIFY changed FINAL)
-    Q_PROPERTY(QString capturePinDoubleClick READ capturePinDoubleClick WRITE setCapturePinDoubleClick NOTIFY changed FINAL)
-    Q_PROPERTY(QString capturePinsHotkey READ capturePinsHotkey WRITE setCapturePinsHotkey NOTIFY changed FINAL)
-    Q_PROPERTY(QString capturePinsRestoreHotkey READ capturePinsRestoreHotkey WRITE setCapturePinsRestoreHotkey NOTIFY changed FINAL)
-    Q_PROPERTY(QString capturePinsHotkeyError READ capturePinsHotkeyError NOTIFY hotkeyErrorChanged FINAL)
-    Q_PROPERTY(QString capturePinsRestoreHotkeyError READ capturePinsRestoreHotkeyError NOTIFY hotkeyErrorChanged FINAL)
-    Q_PROPERTY(bool captureSmartPrescan READ captureSmartPrescan WRITE setCaptureSmartPrescan NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureSmartIpMac READ captureSmartIpMac WRITE setCaptureSmartIpMac NOTIFY changed FINAL)
-    Q_PROPERTY(bool captureSmartAllText READ captureSmartAllText WRITE setCaptureSmartAllText NOTIFY changed FINAL)
-    Q_PROPERTY(QString captureSmartWords READ captureSmartWords WRITE setCaptureSmartWords NOTIFY changed FINAL)
     // The screenshot history's keyword (jt): set through saveCaptureKeyword.
     Q_PROPERTY(QString captureKeyword READ captureKeyword NOTIFY changed FINAL)
+    // The screenshot plugin, as App reads it: installed, on (the history works), and the shortcuts it holds.
+    Q_PROPERTY(bool screenshotInstalled READ screenshotInstalled NOTIFY screenshotPluginChanged FINAL)
+    Q_PROPERTY(bool screenshotHistory READ screenshotHistory NOTIFY screenshotPluginChanged FINAL)
+    Q_PROPERTY(QStringList screenshotHotkeys READ screenshotHotkeys NOTIFY screenshotPluginChanged FINAL)
     // 粘贴为文件's card on the 插件 page ([PasteFile]): its switch, Ctrl+V in
     // Explorer and on the desktop, the right-click menu's verb.
     Q_PROPERTY(bool pasteFileEnabled READ pasteFileEnabled WRITE setPasteFileEnabled NOTIFY changed FINAL)
@@ -194,6 +176,8 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(bool contentInLowPriority READ contentInLowPriority WRITE setContentInLowPriority NOTIFY changed FINAL)
     Q_PROPERTY(bool contentDocuments READ contentDocuments WRITE setContentDocuments NOTIFY changed FINAL)
     Q_PROPERTY(QString contentIndexStatus READ contentIndexStatus NOTIFY contentIndexStatusChanged FINAL)
+    // The 运行状况 page's readings and charts (App's HealthMonitor).
+    Q_PROPERTY(ws::HealthMonitor* monitor READ monitor NOTIFY monitorChanged FINAL)
     // 结果列表
     Q_PROPERTY(bool foldersFirst READ foldersFirst WRITE setFoldersFirst NOTIFY changed FINAL)
     // 优先显示的文件类型 as shown and typed: "exe; bat; cmd"; written, read as
@@ -205,14 +189,28 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(bool showFileSize READ showFileSize WRITE setShowFileSize NOTIFY changed FINAL)
     Q_PROPERTY(bool doubleClickToOpen READ doubleClickToOpen WRITE setDoubleClickToOpen NOTIFY changed FINAL)
     Q_PROPERTY(bool tabEntersFavoriteFolder READ tabEntersFavoriteFolder WRITE setTabEntersFavoriteFolder NOTIFY changed FINAL)
+    Q_PROPERTY(bool searchApps READ searchApps WRITE setSearchApps NOTIFY changed FINAL)
+    Q_PROPERTY(bool searchSystem READ searchSystem WRITE setSearchSystem NOTIFY changed FINAL)
+    Q_PROPERTY(bool regexMode READ regexMode WRITE setRegexMode NOTIFY changed FINAL)
     Q_PROPERTY(bool thumbnails READ thumbnails WRITE setThumbnails NOTIFY changed FINAL)
     Q_PROPERTY(bool webSuggestions READ webSuggestions WRITE setWebSuggestions NOTIFY changed FINAL)
     Q_PROPERTY(QString sort READ sort WRITE setSort NOTIFY changed FINAL) // match | newest | oldest | name | folder | type | largest | smallest (kSortNames)
     Q_PROPERTY(QString startList READ startList WRITE setStartList NOTIFY changed FINAL) // opened | modified | none
+    Q_PROPERTY(int recentItems READ recentItems WRITE setRecentItems NOTIFY changed FINAL)
+    Q_PROPERTY(bool mergeFileScope READ mergeFileScope WRITE setMergeFileScope NOTIFY changed FINAL)
+    Q_PROPERTY(QString queryHistoryKeys READ queryHistoryKeys WRITE setQueryHistoryKeys NOTIFY changed FINAL)
+    Q_PROPERTY(bool favoritesOnStart READ favoritesOnStart WRITE setFavoritesOnStart NOTIFY changed FINAL)
     Q_PROPERTY(bool clearOnOpen READ clearOnOpen WRITE setClearOnOpen NOTIFY changed FINAL)
+    Q_PROPERTY(bool englishOnOpen READ englishOnOpen WRITE setEnglishOnOpen NOTIFY changed FINAL)
     Q_PROPERTY(QString numberKeys READ numberKeys WRITE setNumberKeys NOTIFY changed FINAL) // ctrl | alt | off
     Q_PROPERTY(QString numberHints READ numberHints WRITE setNumberHints NOTIFY changed FINAL) // held | always | off
+    Q_PROPERTY(bool shortcutHelp READ shortcutHelp WRITE setShortcutHelp NOTIFY changed FINAL)
+    Q_PROPERTY(bool footerHints READ footerHints WRITE setFooterHints NOTIFY changed FINAL)
+    Q_PROPERTY(bool pureSearch READ pureSearch WRITE setPureSearch NOTIFY changed FINAL)
     Q_PROPERTY(QString previewWith READ previewWith WRITE setPreviewWith NOTIFY changed FINAL) // auto | builtin
+    Q_PROPERTY(QString previewHotkey READ previewHotkey WRITE setPreviewHotkey NOTIFY changed FINAL)
+    Q_PROPERTY(QString previewHotkeyError READ previewHotkeyError NOTIFY changed FINAL)
+    Q_PROPERTY(bool previewFollowsPointer READ previewFollowsPointer WRITE setPreviewFollowsPointer NOTIFY changed FINAL)
     // Which of the chosen number keys are other programs' hotkeys, or Win顺's
     // own shortcuts, said for the user; empty when none (refreshNumberKeys).
     Q_PROPERTY(QString numberKeysNote READ numberKeysNote NOTIFY numberKeysNoteChanged FINAL)
@@ -231,8 +229,11 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(QString clipboardMissingFiles READ clipboardMissingFiles WRITE setClipboardMissingFiles NOTIFY changed FINAL) // keep | hide | clean
     Q_PROPERTY(bool clipboardImages READ clipboardImages WRITE setClipboardImages NOTIFY changed FINAL)
     Q_PROPERTY(bool clipboardClickToPaste READ clipboardClickToPaste WRITE setClipboardClickToPaste NOTIFY changed FINAL)
+    Q_PROPERTY(QString clipboardUiSize READ clipboardUiSize WRITE setClipboardUiSize NOTIFY changed FINAL) // follow | dense | compact | standard | roomy
     Q_PROPERTY(bool clipboardLargePictures READ clipboardLargePictures WRITE setClipboardLargePictures NOTIFY changed FINAL)
     Q_PROPERTY(bool clipboardKeepPlace READ clipboardKeepPlace WRITE setClipboardKeepPlace NOTIFY changed FINAL)
+    Q_PROPERTY(bool clipboardAtPointer READ clipboardAtPointer WRITE setClipboardAtPointer NOTIFY changed FINAL)
+    Q_PROPERTY(bool clipboardPauseInFullScreen READ clipboardPauseInFullScreen WRITE setClipboardPauseInFullScreen NOTIFY changed FINAL)
     Q_PROPERTY(bool clipboardFlipAbove READ clipboardFlipAbove WRITE setClipboardFlipAbove NOTIFY changed FINAL)
     Q_PROPERTY(bool clipboardHoldToStep READ clipboardHoldToStep WRITE setClipboardHoldToStep NOTIFY changed FINAL)
     Q_PROPERTY(QString clipboardSearchBoxSide READ clipboardSearchBoxSide WRITE setClipboardSearchBoxSide NOTIFY changed FINAL) // near | far
@@ -286,10 +287,17 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(QString theme READ theme WRITE setTheme NOTIFY changed FINAL)
     Q_PROPERTY(QString language READ language WRITE setLanguage NOTIFY changed FINAL)
     Q_PROPERTY(QString transparency READ transparency WRITE setTransparency NOTIFY changed FINAL)
+    Q_PROPERTY(int glassTransparency READ glassTransparency WRITE setGlassTransparency NOTIFY changed FINAL)
+    Q_PROPERTY(int glassClarity READ glassClarity WRITE setGlassClarity NOTIFY changed FINAL)
     Q_PROPERTY(QString taskbarIcon READ taskbarIcon WRITE setTaskbarIcon NOTIFY changed FINAL) // color | mono
-    Q_PROPERTY(bool searchLogo READ searchLogo WRITE setSearchLogo NOTIFY changed FINAL)
     Q_PROPERTY(QString uiSize READ uiSize WRITE setUiSize NOTIFY changed FINAL) // compact | standard | roomy
+    Q_PROPERTY(QString uiFont READ uiFont WRITE setUiFont NOTIFY changed FINAL)
+    Q_PROPERTY(QStringList uiFonts READ uiFonts CONSTANT FINAL)
+    Q_PROPERTY(bool uiFontAvailable READ uiFontAvailable NOTIFY changed FINAL)
+    Q_PROPERTY(QString uiFontPreview READ uiFontPreview NOTIFY changed FINAL)
+    Q_PROPERTY(bool fontRestartRequired READ fontRestartRequired NOTIFY changed FINAL)
     Q_PROPERTY(QString corners READ corners WRITE setCorners NOTIFY changed FINAL) // round | square
+    Q_PROPERTY(QString uiStyle READ uiStyle WRITE setUiStyle NOTIFY changed FINAL) // fluent | brand | tactile | liquid
     Q_PROPERTY(bool autoUpdate READ autoUpdate WRITE setAutoUpdate NOTIFY changed FINAL)
     Q_PROPERTY(QString backupFolder READ backupFolder NOTIFY changed FINAL) // empty: no backups (see Backup)
     Q_PROPERTY(bool restartRequired READ restartRequired NOTIFY changed FINAL)
@@ -317,12 +325,18 @@ class SettingsEditor : public QObject {
     Q_PROPERTY(bool mcpPluginActions READ mcpPluginActions WRITE setMcpPluginActions NOTIFY changed FINAL) // and their actions
     Q_PROPERTY(QStringList mcpExcludedPaths READ mcpExcludedPaths NOTIFY changed FINAL) // expanded, for display
     Q_PROPERTY(QString mcpStatus READ mcpStatus NOTIFY mcpStatusChanged FINAL)
+    Q_PROPERTY(QString cliTally READ cliTally NOTIFY cliTallyChanged FINAL) // empty: ws has not been run yet
     Q_PROPERTY(QVariantList mcpClients READ mcpClients NOTIFY mcpClientsChanged FINAL)
     Q_PROPERTY(QString mcpRelayPath READ mcpRelayPath NOTIFY mcpClientsChanged FINAL) // empty: WinShunMcp.exe is missing
     Q_PROPERTY(QString mcpMessage READ mcpMessage NOTIFY mcpMessageChanged FINAL)
+    Q_PROPERTY(bool mcpSkillBusy READ mcpSkillBusy NOTIFY mcpMessageChanged FINAL) // 装 Skill is running: its button waits
+    // AI 助手 → 命令行 (ws): whether it can be used from a terminal, and the button that sets it up.
+    Q_PROPERTY(ws::CliSetup* cli READ cli CONSTANT FINAL)
     // 插件: the page's own view-model (PluginSettings), which edits the
     // [Plugin.<id>] sections here.
     Q_PROPERTY(ws::PluginSettings* plugins READ plugins CONSTANT FINAL)
+    Q_PROPERTY(bool pluginBuiltinsExpanded READ pluginBuiltinsExpanded WRITE setPluginBuiltinsExpanded NOTIFY changed FINAL)
+    Q_PROPERTY(ws::OcrPackage* ocrPackage READ ocrPackage CONSTANT FINAL)
     // 收藏夹: the page's own view-model (FavoritesSettings), on the app's
     // favorites (not in the INI: 恢复默认设置 leaves them).
     Q_PROPERTY(ws::FavoritesSettings* favorites READ favorites CONSTANT FINAL)
@@ -333,6 +347,10 @@ public:
 
     bool doubleCtrl() const { return m_settings.doubleCtrl; }
     void setDoubleCtrl(bool on);
+    QString doubleTapAction() const { return m_settings.doubleTapAction; }
+    void setDoubleTapAction(const QString& action);
+    QVariantList doubleTapActions() const;
+    void setDoubleTapPluginActions(const QVariantList& actions);
     QString doubleTapKey() const { return m_settings.doubleTapKey; }
     void setDoubleTapKey(const QString& key);
     QString doubleCtrlKey() const { return m_settings.doubleCtrlKey; }
@@ -348,11 +366,15 @@ public:
     QString shortcutAgain() const { return m_settings.shortcutAgain; }
     void setShortcutAgain(const QString& what);
     void setHotkey(const QString& hotkey);
+    QString panelHotkey() const { return m_settings.panelHotkey; }
+    void setPanelHotkey(const QString& hotkey);
+    QString panelHotkeyError() const { return m_panelHotkeyError; }
+    void setPanelHotkeyError(const QString& error);
     QString hotkeyError() const { return m_hotkeyError; }
     void setHotkeyError(const QString& error);
     bool recordingHotkey() const { return m_recordingHotkey; }
     void setRecordingHotkey(bool recording);
-    bool autostart() const;
+    bool autostart() const { return m_autostart; } // as last read (autostart::isEnabled), never asked of Task Scheduler here
     void setAutostart(bool on);
     void refreshAutostart(); // changed or read again elsewhere (the tray menu, the task itself)
     bool recordHistory() const { return m_settings.recordHistory; }
@@ -389,11 +411,17 @@ public:
     void setExplorerTyping(bool on);
     bool opusTyping() const { return m_settings.opusTyping; }
     void setOpusTyping(bool on);
+    QString opusTypingScope() const { return m_settings.opusTypingScope; }
+    void setOpusTypingScope(const QString& scope);
     QString folderTyping() const { return m_settings.folderTyping; }
     void setFolderTyping(const QString& how);
     bool folderMenu() const { return m_settings.folderMenu != u"off"; }
     void setFolderMenu(bool on);
     bool folderMenuExplorer() const { return m_settings.folderMenuExplorer; }
+    bool folderMenuDouble() const { return m_settings.folderMenuDouble; }
+    void setFolderMenuDouble(bool on);
+    bool folderMenuMiddle() const { return m_settings.folderMenuMiddle; }
+    void setFolderMenuMiddle(bool on);
     void setFolderMenuExplorer(bool on);
     bool folderMenuDesktop() const { return m_settings.folderMenuDesktop; }
     void setFolderMenuDesktop(bool on);
@@ -403,88 +431,33 @@ public:
     void setFolderMenuRecent(bool on);
     bool folderMenuWindows() const { return m_settings.folderMenuWindows; }
     void setFolderMenuWindows(bool on);
+    int folderMenuRecentInline() const { return m_settings.folderMenuRecentInline; }
+    int folderMenuWindowsInline() const { return m_settings.folderMenuWindowsInline; }
+    void setFolderMenuRecentInline(int count);
+    void setFolderMenuWindowsInline(int count);
+    bool folderMenuItemSearch() const { return m_settings.folderMenuItemSearch; }
+    void setFolderMenuItemSearch(bool on);
+    bool folderMenuItemCopyPath() const { return m_settings.folderMenuItemCopyPath; }
+    void setFolderMenuItemCopyPath(bool on);
+    bool folderMenuItemCmd() const { return m_settings.folderMenuItemCmd; }
+    void setFolderMenuItemCmd(bool on);
+    bool folderMenuItemPowerShell() const { return m_settings.folderMenuItemPowerShell; }
+    void setFolderMenuItemPowerShell(bool on);
+    bool folderMenuItemFavorite() const { return m_settings.folderMenuItemFavorite; }
+    void setFolderMenuItemFavorite(bool on);
+    bool folderMenuItemSettings() const { return m_settings.folderMenuItemSettings; }
+    void setFolderMenuItemSettings(bool on);
     QString folderMenuHotkey() const { return m_settings.folderMenuHotkey; }
     bool dropPie() const { return m_settings.dropPie; }
     void setDropPie(bool on);
     void setFolderMenuHotkey(const QString& hotkey);
     QString folderMenuHotkeyError() const { return m_folderMenuHotkeyError; }
     void setFolderMenuHotkeyError(const QString& error);
-    QString captureLastPinHotkey() const { return m_settings.captureLastPinHotkey; }
-    void setCaptureLastPinHotkey(const QString& value);
-    QString captureSaveFolder() const { return m_settings.captureSaveFolder; }
-    void setCaptureSaveFolder(const QString& value);
-    QString captureRecordingFolder() const { return m_settings.captureRecordingFolder; }
-    void setCaptureRecordingFolder(const QString& value);
-    bool captureRecordingSystemAudio() const { return m_settings.captureRecordingSystemAudio; }
-    void setCaptureRecordingSystemAudio(bool value);
-    bool captureRecordingMicrophone() const { return m_settings.captureRecordingMicrophone; }
-    void setCaptureRecordingMicrophone(bool value);
-    int captureRecordingQuality() const { return m_settings.captureRecordingQuality; }
-    void setCaptureRecordingQuality(int value);
-    bool captureRecordingCursor() const { return m_settings.captureRecordingCursor; }
-    void setCaptureRecordingCursor(bool value);
-    bool captureRecordingCountdown() const { return m_settings.captureRecordingCountdown; }
-    void setCaptureRecordingCountdown(bool value);
-    bool captureRecordingClicks() const { return m_settings.captureRecordingClicks; }
-    void setCaptureRecordingClicks(bool value);
-    QString captureLastPinHotkeyError() const { return m_captureLastPinHotkeyError; }
-    void setCaptureLastPinHotkeyError(const QString& error);
-    bool captureEnabled() const { return m_settings.captureEnabled; }
-    void setCaptureEnabled(bool on);
-    QString captureHotkey() const { return m_settings.captureHotkey; }
-    void setCaptureHotkey(const QString& hotkey);
-    QString captureHotkeyError() const { return m_captureHotkeyError; }
-    void setCaptureHotkeyError(const QString& error);
-    bool capturePrintScreen() const { return m_settings.capturePrintScreen; }
-    void setCapturePrintScreen(bool on);
-    bool captureCopyOnSelect() const { return m_settings.captureCopyOnSelect; }
-    void setCaptureCopyOnSelect(bool on);
-    bool captureMagnifier() const { return m_settings.captureMagnifier; }
-    void setCaptureMagnifier(bool on);
-    bool capturePinOnCopy() const { return m_settings.capturePinOnCopy; }
-    void setCapturePinOnCopy(bool on);
-    // What the mouse buttons do after a selection (Settings::captureMouse*).
-    QString captureMouseDoubleLeft() const { return m_settings.captureMouseDoubleLeft; }
-    void setCaptureMouseDoubleLeft(const QString& action) { setCaptureMouse(m_settings.captureMouseDoubleLeft, action, false); }
-    QString captureMouseRight() const { return m_settings.captureMouseRight; }
-    void setCaptureMouseRight(const QString& action) { setCaptureMouse(m_settings.captureMouseRight, action, true); }
-    QString captureMouseMiddle() const { return m_settings.captureMouseMiddle; }
-    void setCaptureMouseMiddle(const QString& action) { setCaptureMouse(m_settings.captureMouseMiddle, action, false); }
-    QString captureMouseBack() const { return m_settings.captureMouseBack; }
-    void setCaptureMouseBack(const QString& action) { setCaptureMouse(m_settings.captureMouseBack, action, false); }
-    QString captureMouseForward() const { return m_settings.captureMouseForward; }
-    void setCaptureMouseForward(const QString& action) { setCaptureMouse(m_settings.captureMouseForward, action, false); }
-    QString captureToolbarHidden() const { return m_settings.captureToolbarHidden; }
-    void setCaptureToolbarHidden(const QString& ids);
-    bool captureCursor() const { return m_settings.captureCursor; }
-    void setCaptureCursor(bool on);
-    bool captureHdrFile() const { return m_settings.captureHdrFile; }
-    void setCaptureHdrFile(bool on);
-    bool captureControlsUia() const { return m_settings.captureControlsUia; }
-    void setCaptureControlsUia(bool on);
-    int captureDelay() const { return m_settings.captureDelay; }
-    void setCaptureDelay(int seconds);
-    QString capturePinDoubleClick() const { return m_settings.capturePinDoubleClick; }
-    void setCapturePinDoubleClick(const QString& action);
-    QString capturePinsHotkey() const { return m_settings.capturePinsHotkey; }
-    void setCapturePinsHotkey(const QString& hotkey);
-    QString capturePinsRestoreHotkey() const { return m_settings.capturePinsRestoreHotkey; }
-    void setCapturePinsRestoreHotkey(const QString& hotkey);
-    QString capturePinsHotkeyError() const { return m_capturePinsHotkeyError; }
-    QString capturePinsRestoreHotkeyError() const { return m_capturePinsRestoreHotkeyError; }
-    void setCapturePinsHotkeyError(const QString& error);
-    void setCapturePinsRestoreHotkeyError(const QString& error);
-    bool captureSmartPrescan() const { return m_settings.captureSmartPrescan; }
-    void setCaptureSmartPrescan(bool on);
-    bool captureSmartIpMac() const { return m_settings.captureSmartIpMac; }
-    void setCaptureSmartIpMac(bool on);
-    bool captureSmartAllText() const { return m_settings.captureSmartAllText; }
-    void setCaptureSmartAllText(bool on);
-    QString captureSmartWords() const { return m_settings.captureSmartWords; }
-    void setCaptureSmartWords(const QString& words);
-    QString captureNote() const { return m_captureNote; }
-    void setCaptureNote(const QString& note);
     QString captureKeyword() const { return m_settings.captureKeyword; }
+    bool screenshotInstalled() const { return m_screenshotInstalled; }
+    bool screenshotHistory() const { return m_screenshotHistory; }
+    QStringList screenshotHotkeys() const { return m_screenshotHotkeys; }
+    void setScreenshotPlugin(bool installed, bool on, const QStringList& hotkeys);
     bool pasteFileEnabled() const { return m_settings.pasteFileEnabled; }
     void setPasteFileEnabled(bool on);
     bool pasteFileCtrlV() const { return m_settings.pasteFileCtrlV; }
@@ -494,7 +467,7 @@ public:
     // Saved if no web search or favorite has it (they keep theirs; a
     // plugin's alike gives way): empty, else what is wrong.
     Q_INVOKABLE QString saveCaptureKeyword(const QString& keyword);
-    // The keyword is the screenshot history's (the capture on): what a web
+    // The keyword is the screenshot history's (the plugin on): what a web
     // search or a favorite given it is told; empty when it is free.
     QString captureKeywordTaken(const QString& keyword) const;
     Q_INVOKABLE void refreshFileManagers();
@@ -601,6 +574,9 @@ public:
     void setContentInLowPriority(bool on);
     bool contentDocuments() const { return m_settings.contentDocuments; }
     void setContentDocuments(bool on);
+    HealthMonitor* monitor() const { return m_monitor; }
+    void setMonitor(HealthMonitor* monitor);
+    Q_INVOKABLE void giveMemoryBack() { emit giveBackMemoryRequested(); }
     QString contentIndexStatus() const { return m_contentIndexStatus; }
     void setContentIndexStatus(const QString& status); // "已收录 … 个文件"; set by the app
     QString renderer() const { return m_settings.renderer; }
@@ -617,14 +593,26 @@ public:
     void setLanguage(const QString& language);
     QString transparency() const { return m_settings.transparency; }
     void setTransparency(const QString& transparency);
+    int glassTransparency() const { return m_settings.glassTransparency; }
+    int glassClarity() const { return m_settings.glassClarity; }
+    void setGlassTransparency(int value);
+    void setGlassClarity(int value);
+    Q_INVOKABLE void previewGlassAppearance(int transparency, int clarity);
+    Q_INVOKABLE void resetGlassAppearance();
     QString taskbarIcon() const { return m_settings.taskbarIcon; }
     void setTaskbarIcon(const QString& style);
-    bool searchLogo() const { return m_settings.searchLogo; }
-    void setSearchLogo(bool on);
     QString uiSize() const { return m_settings.uiSize; }
+    QString uiFont() const { return m_settings.uiFont; }
+    QStringList uiFonts() const;
+    bool uiFontAvailable() const;
+    QString uiFontPreview() const;
+    bool fontRestartRequired() const;
+    void setUiFont(const QString& family);
     void setUiSize(const QString& size);
     QString corners() const { return m_settings.corners; }
     void setCorners(const QString& corners);
+    QString uiStyle() const { return m_settings.uiStyle; }
+    void setUiStyle(const QString& style);
     bool autoUpdate() const { return m_settings.autoUpdate; }
     QString backupFolder() const { return QDir::toNativeSeparators(m_settings.backupFolder); }
     void setAutoUpdate(bool on);
@@ -674,10 +662,16 @@ public:
     void setClipboardImages(bool on);
     bool clipboardClickToPaste() const { return m_settings.clipboardClickToPaste; }
     void setClipboardClickToPaste(bool on);
+    QString clipboardUiSize() const { return m_settings.clipboardUiSize; }
+    void setClipboardUiSize(const QString& size);
     bool clipboardLargePictures() const { return m_settings.clipboardLargePictures; }
     void setClipboardLargePictures(bool on);
     bool clipboardKeepPlace() const { return m_settings.clipboardKeepPlace; }
     void setClipboardKeepPlace(bool on);
+    bool clipboardAtPointer() const { return m_settings.clipboardAtPointer; }
+    bool clipboardPauseInFullScreen() const { return m_settings.clipboardPauseInFullScreen; }
+    void setClipboardPauseInFullScreen(bool on);
+    void setClipboardAtPointer(bool on);
     bool clipboardFlipAbove() const { return m_settings.clipboardFlipAbove; }
     void setClipboardFlipAbove(bool on);
     bool clipboardHoldToStep() const { return m_settings.clipboardHoldToStep; }
@@ -711,6 +705,12 @@ public:
     void setDoubleClickToOpen(bool on);
     bool tabEntersFavoriteFolder() const { return m_settings.tabEntersFavoriteFolder; }
     void setTabEntersFavoriteFolder(bool on);
+    bool searchApps() const { return m_settings.searchApps; }
+    void setSearchApps(bool on);
+    bool searchSystem() const { return m_settings.searchSystem; }
+    void setSearchSystem(bool on);
+    bool regexMode() const { return m_settings.regexMode; }
+    void setRegexMode(bool on);
     bool thumbnails() const { return m_settings.thumbnails; }
     void setThumbnails(bool on);
     bool webSuggestions() const { return m_settings.webSuggestions; }
@@ -719,15 +719,32 @@ public:
     void setSort(const QString& sort);
     QString startList() const { return m_settings.startList; }
     void setStartList(const QString& list);
+    int recentItems() const { return m_settings.recentItems; }
+    void setRecentItems(int count);
+    bool favoritesOnStart() const { return m_settings.favoritesOnStart; }
+    void setFavoritesOnStart(bool on);
     bool clearOnOpen() const { return m_settings.clearOnOpen; }
     void setClearOnOpen(bool on);
+    bool englishOnOpen() const { return m_settings.englishOnOpen; }
+    void setEnglishOnOpen(bool on);
     QString numberKeys() const { return m_settings.numberKeys; }
     void setNumberKeys(const QString& keys);
     QString numberHints() const { return m_settings.numberHints; }
     void setNumberHints(const QString& hints);
+    bool shortcutHelp() const { return m_settings.shortcutHelp; }
+    void setShortcutHelp(bool on);
+    bool footerHints() const { return m_settings.footerHints; }
+    void setFooterHints(bool on);
+    bool pureSearch() const { return m_settings.pureSearch; }
+    void setPureSearch(bool on);
     QString numberKeysNote() const { return m_numberKeysNote; }
     QString previewWith() const { return m_settings.previewWith; }
     void setPreviewWith(const QString& with);
+    QString previewHotkey() const { return m_settings.previewHotkey; }
+    void setPreviewHotkey(const QString& shortcut);
+    QString previewHotkeyError() const;
+    bool previewFollowsPointer() const { return m_settings.previewFollowsPointer; }
+    void setPreviewFollowsPointer(bool on);
     // Looks again at which number keys are taken (as the window comes to the
     // front: a program may have been started or closed meanwhile).
     Q_INVOKABLE void refreshNumberKeys();
@@ -782,6 +799,7 @@ public:
     void setShareStatuses(std::vector<ShareIndexer::Status> statuses); // set by the app
     void setShareContentStatuses(std::vector<remotecontent::Indexer::Status> statuses); // set by the app
     Q_INVOKABLE void setShareContent(int index, bool on); // its files' contents indexed too (GitHub #114)
+    Q_INVOKABLE void setShareScan(int index, bool scheduled, const QString& from, const QString& until, int depth);
     // "\\host", "\\host\": a server, whose shares can be listed; its name, else empty.
     Q_INVOKABLE QString serverOf(const QString& text) const;
     // Adds a share typed or chosen ("\\host\share[\folder]", or a mapped "Z:\...").
@@ -910,22 +928,57 @@ public:
     Q_INVOKABLE void removeMcpExcludedPath(int index);
     QString mcpStatus() const { return m_mcpStatus; }
     void setMcpStatus(const QString& status); // set by the app: who is connected
+    QString cliTally() const { return m_cliTally; }
+    // Set by the app: how often ws was run and when last. Not part of mcpStatus: that is a
+    // row's text, and a line that comes with the first run pushes the rows below it down.
+    void setCliTally(const QString& tally);
     QVariantList mcpClients() const { return m_mcpClients; }
     QString mcpRelayPath() const { return m_mcpRelayPath; }
-    Q_INVOKABLE void refreshMcpClients(); // looks again (as the window comes to the front)
+    Q_INVOKABLE void refreshMcpClients(); // looks again (the window opens); it walks the PATH for `claude`, which a dead share stalls
+    // Only whether Claude Code's Skill file is there (one path): for the window coming to the front
+    // and the page showing, where refreshMcpClients() would stall the GUI thread on that PATH.
+    Q_INVOKABLE void refreshSkillState();
+
+    // The window is kept while hidden (App::showSettings): what may change
+    // outside Win顺 meanwhile is read again as it comes back.
+    // The window activated (SettingsWindow.onActiveChanged): the taskbar,
+    // file managers, number keys, double Ctrl clash, Opus, ws on the PATH.
+    // Skipped while it opens: finishOpening() reads them after the first frame.
+    Q_INVOKABLE void windowActivated();
+    void beginOpening() { m_opening = true; }
+    // After the first frame of an opening: all of windowActivated()'s, and
+    // the AI clients and the shares, WSL and known folders offered.
+    void finishOpening();
+    bool opening() const { return m_opening; }
+    // Hidden: the lines about how the last action went (诊断包, 导入, AI
+    // client, plugin, favorite, ws), gone as with a window made anew; not
+    // while that action still runs.
+    Q_INVOKABLE void forgetMessages();
     Q_INVOKABLE void connectMcpClient(const QString& id); // writes Win顺 into its configuration; mcpMessage says how it went
     Q_INVOKABLE void copyMcpSnippet(const QString& id); // its configuration (or command) to the clipboard; "": the generic JSON
+    Q_INVOKABLE void installMcpSkill(const QString& id); // Claude Code's Skill for ws; mcpMessage says how it went
+    CliSetup* cli() const { return m_cli; }
     QString mcpMessage() const { return m_mcpMessage; }
+    bool mcpSkillBusy() const { return m_mcpSkillBusy; }
     Q_INVOKABLE void clearMcpMessage() { setMcpMessage({}); }
     Q_INVOKABLE void openMcpLog(); // mcp.log, or the data folder while there is none
 
     // 插件 page
     PluginSettings* plugins() const { return m_plugins; }
+    bool pluginBuiltinsExpanded() const { return m_settings.pluginBuiltinsExpanded; }
+    bool mergeFileScope() const { return m_settings.mergeFileScope; }
+    QString queryHistoryKeys() const { return m_settings.queryHistoryKeys; }
+    void setMergeFileScope(bool merged);
+    void setQueryHistoryKeys(const QString& keys);
+    void setPluginBuiltinsExpanded(bool expanded);
+    OcrPackage* ocrPackage() const { return m_ocrPackage; }
+    void useOcrPackage(OcrPackage* package); // before the settings window is created
 
     // 收藏夹 page
     FavoritesSettings* favorites() const { return m_favorites; }
 
 signals:
+    void screenshotPluginChanged();
     void diagnosticsChanged();
     void diagnosticsExportRequested();
     void historyCountChanged();
@@ -935,6 +988,8 @@ signals:
     void changed();
     void hotkeyErrorChanged();
     void contentIndexStatusChanged();
+    void monitorChanged();
+    void giveBackMemoryRequested();
     void indexFolderChanged();
     void recordingHotkeyChanged(); // the app suspends its hotkeys meanwhile
     void autostartChanged();
@@ -947,6 +1002,7 @@ signals:
     void clipboardCountChanged();
     void numberKeysNoteChanged();
     void doubleCtrlClashChanged();
+    void doubleTapActionsChanged();
     void opusFolderMenuChanged();
     void opusRestarted(); // setOpusFolderMenu started Opus again: it came to the front
     void clipboardClearRequested();
@@ -969,6 +1025,7 @@ signals:
     void signInRequested(const QString& path); // a share, or "\\host"
     void signedIn(const QString& path, const QString& problem); // empty problem: connected
     void mcpStatusChanged();
+    void cliTallyChanged();
     void mcpClientsChanged();
     void mcpMessageChanged();
     void indexAccessStateChanged();
@@ -979,7 +1036,8 @@ private:
     friend class PluginSettings; // edits m_settings' plugin sections and commits
     friend class FavoritesSettings; // reads the web shortcuts' keywords and the window
     void commit();
-    void setCaptureMouse(QString& field, const QString& action, bool allowBack);
+    void refreshKnownPlaces(); // m_knownShares, m_knownWsl, m_knownFolders read again; told when they changed
+    void refreshOnReturn(); // windowActivated()'s
     void noteFoldersEdited(); // foldersChanged() when the chosen folders (or the shares) are others now
     // m_settings.indexFolders as IndexService has them (Settings::indexFolderPath),
     // worked out when they change, not each time the cards are: no disk is read for those.
@@ -991,16 +1049,17 @@ private:
     Settings m_settings;
     QString m_runningRenderer; // resolved: never "auto"
     QString m_hotkeyError;
+    QString m_panelHotkeyError;
+    QString m_previewHotkeyError;
     QString m_numberKeysNote;
     QString m_clipboardNumberKeysNote;
     QString m_clipboardQuickPasteError;
     QString m_doubleCtrlClash;
+    QVariantList m_doubleTapPluginActions;
     QString m_folderMenuHotkeyError;
-    QString m_captureLastPinHotkeyError;
-    QString m_captureHotkeyError;
-    QString m_capturePinsHotkeyError;
-    QString m_capturePinsRestoreHotkeyError;
-    QString m_captureNote;
+    bool m_screenshotInstalled = false;
+    bool m_screenshotHistory = false;
+    QStringList m_screenshotHotkeys;
     QString m_opusFolderMenu = QStringLiteral("manual");
     QString m_opusFolderMenuTaken;
     QString m_opusFolderMenuProblem;
@@ -1009,6 +1068,7 @@ private:
     bool m_launcherWidthSet = false;
     int m_siteIconsArrived = 0;
     QString m_contentIndexStatus;
+    HealthMonitor* m_monitor = nullptr; // App's
     IndexFolderState m_indexFolderState;
     IndexAccessState m_indexAccessState;
     QStringList m_fileManagers {QStringLiteral("explorer")};
@@ -1030,12 +1090,12 @@ private:
     bool m_diagnosticsBusy = false;
     std::vector<ShareIndexer::Status> m_shareStatuses;
     std::vector<remotecontent::Indexer::Status> m_shareContentStatuses;
-    std::vector<unc::Known> m_knownShares; // read once, with the window
+    std::vector<unc::Known> m_knownShares; // read with the window, again as it opens (refreshKnownPlaces)
     std::vector<wsl::Distribution> m_knownWsl;
     QStringList m_wslStarting;
     QHash<QString, QString> m_wslStartProblems;
     std::vector<IndexService::FolderStatus> m_folderStatuses;
-    std::vector<Settings::KnownFolder> m_knownFolders; // read once, with the window
+    std::vector<Settings::KnownFolder> m_knownFolders; // read with the window, again as it opens (refreshKnownPlaces)
     QStringList m_foldersAnnounced; // as foldersChanged() last had them
     QList<NetworkShare> m_sharesAnnounced;
     mutable QStringList m_folderKeysOf; // folderKeys(): of these
@@ -1045,11 +1105,18 @@ private:
     struct TaskbarWatch; // the taskbar's pinned programs and Windows' search box setting
     std::unique_ptr<TaskbarWatch> m_taskbarWatch;
     QString m_mcpStatus;
+    QString m_cliTally;
     QVariantList m_mcpClients;
     QString m_mcpRelayPath;
     QString m_mcpMessage;
+    bool m_mcpSkillBusy = false; // installMcpSkill is waiting for ws
+    bool m_autostart = false;
+    bool m_opening = false; // shown, its first frame not drawn yet (beginOpening)
+    bool m_knownPlacesFresh = true; // read by the constructor, for the first opening
     PluginSettings* m_plugins = nullptr; // a child
+    OcrPackage* m_ocrPackage = nullptr;
     FavoritesSettings* m_favorites = nullptr; // a child
+    CliSetup* m_cli = nullptr; // a child
 };
 
 } // namespace ws

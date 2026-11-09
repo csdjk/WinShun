@@ -11,6 +11,7 @@
 #include <QRectF>
 #include <QSet>
 #include <QVariantList>
+#include <QWindow>
 #include <QtQml/qqmlregistration.h>
 
 #include <windows.h>
@@ -21,17 +22,18 @@
 #include <memory>
 #include <string>
 
-class QWindow;
-
 namespace ws {
 
 class Favorites;
+class AppCatalog;
+class SystemCatalog;
 class History;
 class KeyRouter;
 
 // A double click on the blank space of a File Explorer folder or of the
-// desktop brings up a menu of folders to go to, as Listary's does (GitHub
-// #22): the favorite folders, the recent ones, those open in other windows;
+// desktop brings up a menu of favorites and folders, as Listary's does
+// (GitHub #22, #156): all favorite kinds, recent and open folders, grouped
+// into pages with names and icons;
 // then "search here" and adding this folder to the favorites. Chosen in a
 // File Explorer window, the same tab goes there; on the desktop, the file
 // manager opens it.
@@ -66,7 +68,7 @@ class FolderMenu : public QObject {
     Q_OBJECT
     QML_ELEMENT
     QML_UNCREATABLE("Provided by the application")
-    // {text, detail, glyph} or {separator: true}
+    // {text, detail, glyph, icon, tooltip, action}, {children: [...]} or a separator.
     Q_PROPERTY(QVariantList entries READ entries NOTIFY entriesChanged FINAL)
     Q_PROPERTY(bool open READ isOpen NOTIFY openChanged FINAL)
 
@@ -76,12 +78,20 @@ public:
 
     void setWindow(QWindow* window); // FolderMenuWindow
     void setRecordHistory(bool on);
+    void setCatalogs(AppCatalog* apps, SystemCatalog* places) { m_apps = apps; m_places = places; }
     // auto | on (Settings::folderMenu); Explorer and the desktop each on or off.
     void setOptions(bool yieldToListary, bool explorer, bool desktop);
     // Which groups it lists (GitHub #51); one left out is not even gathered.
     void setGroups(bool favorites, bool recent, bool windows);
+    void setInlineCounts(int recent, int windows);
+    // Pure menu presentation: keeps action IDs intact across the direct rows and More page.
+    static QVariantList groupEntries(const QString& title, const QString& glyph, const QVariantList& children, int inlineCount = 0);
+    // Which actions it offers under the lists (GitHub #200).
+    void setItems(bool search, bool copyPath, bool cmd, bool powerShell, bool favorite, bool settings);
     // Whether something else has the keys now (the clipboard over File
     // Explorer): the menu does not come, the double click only closes that.
+    // Where Copy path writes the text: the system clipboard unless a test says otherwise.
+    void setClipboardWriter(std::function<void(const QString&)> writer) { m_clipboardWriter = std::move(writer); }
     void setBlocked(std::function<bool()> blocked) { m_blocked = std::move(blocked); }
     // Takes an Open or Save dialog to a folder, in order with the app's
     // other moves of it (DialogJump::go); false: not able to, the menu
@@ -105,6 +115,13 @@ public:
     bool isOpen() const noexcept { return m_open.load(); }
 
     QVariantList entries() const { return m_entries; }
+    // The off-screen preview (Preview.cpp, --style-windows): these entries,
+    // as a popup lists them; nothing to act on, nothing shown.
+    void previewEntries(QVariantList entries)
+    {
+        m_entries = std::move(entries);
+        emit entriesChanged();
+    }
 
     Q_INVOKABLE QRectF screenArea(QPointF globalPos) const;
     Q_INVOKABLE void prepareMenuWindow(QWindow* menu) const;
@@ -117,13 +134,16 @@ signals:
     void hideRequested();
     void keyPressed(int key, const QString& text); // taken on its way to File Explorer
     void searchRequested(const QString& folder); // 在此搜索
+    void settingsRequested();
+    void notice(const QString& text);
     void openChanged(bool open);
 
 private:
-    enum class Kind { Folder, Search, AddFavorite, RemoveFavorite };
+    enum class Kind { Folder, Search, AddFavorite, RemoveFavorite, Terminal, PowerShell, Favorite, Settings, CopyPath };
     struct Entry {
         Kind kind = Kind::Folder;
         QString path;
+        QString title;
     };
     struct Found; // what the worker gathered
 
@@ -141,8 +161,11 @@ private:
 
     History* m_history;
     Favorites* m_favorites;
+    AppCatalog* m_apps = nullptr;
+    SystemCatalog* m_places = nullptr;
     QPointer<QWindow> m_window;
     std::function<bool()> m_blocked;
+    std::function<void(const QString&)> m_clipboardWriter;
     std::function<bool(HWND, const QString&)> m_dialogGo;
     std::function<HWND(HWND)> m_dialogOf;
     menuhotkey::Toggle m_toggle; // GUI thread: what a hotkey press means now
@@ -153,10 +176,18 @@ private:
     std::atomic<bool> m_listFavorites {true};
     std::atomic<bool> m_listRecent {true};
     std::atomic<bool> m_listWindows {true};
+    int m_recentInline = 0;
+    int m_windowsInline = 0;
+    std::atomic<bool> m_itemSearch {true};
+    std::atomic<bool> m_itemCopyPath {true};
+    std::atomic<bool> m_itemCmd {true};
+    std::atomic<bool> m_itemPowerShell {true};
+    std::atomic<bool> m_itemFavorite {true};
+    std::atomic<bool> m_itemSettings {true};
     std::atomic<bool> m_open {false};
     std::atomic<int> m_asks {0}; // the latest double click's number: older answers are dropped
     folderview::Hit m_hit; // where the menu is up
-    QString m_folder; // the folder that tab shows; empty on the desktop, Home, This PC
+    QString m_folder; // the tab's folder or Desktop directory; empty in Home / This PC
     QVariantList m_entries;
     std::vector<Entry> m_actions; // by entry
     std::unique_ptr<KeyRouter> m_router;

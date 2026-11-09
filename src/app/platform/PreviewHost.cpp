@@ -338,6 +338,17 @@ struct PreviewHost::Worker {
         HRESULT hr = handler->SetWindow(hwnd, &client);
         if (SUCCEEDED(hr))
             hr = handler->DoPreview();
+        // Word's handler, started as another goes that showed the file at its
+        // own size (the preview window's, handed to the search panel's 预览
+        // tab), may lay the page out for that one's: its top cut off (GitHub
+        // #224). A size it did not have makes it lay out for this one; the
+        // popup is still hidden.
+        if (SUCCEEDED(hr)) {
+            RECT other = client;
+            ++other.bottom;
+            handler->SetRect(&other);
+            handler->SetRect(&client);
+        }
         busy = false;
         return SUCCEEDED(hr);
     }
@@ -627,6 +638,14 @@ void PreviewHost::hide()
     if (const HWND hwnd = m_worker->popup.load())
         ::ShowWindowAsync(hwnd, SW_HIDE); // at once, whatever the thread is doing
     m_worker->post(kHide);
+}
+
+std::optional<QRect> PreviewHost::visibleRect() const
+{
+    const HWND popup = m_worker ? m_worker->popup.load() : nullptr;
+    RECT rect {};
+    if (!popup || !::IsWindowVisible(popup) || !::GetWindowRect(popup, &rect)) return {};
+    return QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
 }
 
 bool PreviewHost::owns(HWND window) const

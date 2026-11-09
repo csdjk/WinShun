@@ -229,7 +229,7 @@ std::size_t pruneOutside(FileIndex& index, EntryId root, const std::vector<Entry
         const EntryId dir = pending.back();
         pending.pop_back();
         children.clear();
-        for (EntryId c = index.entry(dir).firstChild; c != kNoEntry; c = index.entry(c).nextSibling)
+        for (EntryId c = index.entry(dir).firstChild(); c != kNoEntry; c = index.entry(c).nextSibling)
             children.push_back(c);
         for (const EntryId c : children) {
             if (containsId(keep, c))
@@ -251,9 +251,9 @@ std::size_t countBelow(const FileIndex& index, EntryId id)
     while (!pending.empty()) {
         const EntryId dir = pending.back();
         pending.pop_back();
-        for (EntryId c = index.entry(dir).firstChild; c != kNoEntry; c = index.entry(c).nextSibling) {
+        for (EntryId c = index.entry(dir).firstChild(); c != kNoEntry; c = index.entry(c).nextSibling) {
             ++count;
-            if (index.entry(c).firstChild != kNoEntry)
+            if (index.entry(c).firstChild() != kNoEntry)
                 pending.push_back(c);
         }
     }
@@ -277,7 +277,7 @@ EntryId findFolder(const FileIndex& index, std::wstring_view path)
         if (name.empty())
             continue;
         EntryId next = index.findChild(e, toUtf8(name));
-        for (EntryId c = index.entry(e).firstChild; next == kNoEntry && c != kNoEntry; c = index.entry(c).nextSibling) {
+        for (EntryId c = index.entry(e).firstChild(); next == kNoEntry && c != kNoEntry; c = index.entry(c).nextSibling) {
             decoded.clear();
             wtf8::decodeAppend(decoded, index.name(c));
             if (win32::equalsIgnoreCase(wtf8::wview(decoded), name))
@@ -659,6 +659,8 @@ IndexService::IndexService(QString folder, Options options, QObject* parent)
     // for 15 minutes (after an upgrade that rebuilds the content index).
     source.ready = [this] { return state() == State::Ready && !m_refreshing.load() && m_volumesKnown.load(); };
     m_contentIndexer = std::make_unique<ContentIndexer>(m_content, std::move(source), m_options.content);
+    m_contentIndexer->setActivityCallback(
+        [this] { QMetaObject::invokeMethod(this, [this] { emit activityChanged(); }, Qt::QueuedConnection); });
 
     // Shares go in once the local index is there: loaded, or read the first time.
     ShareIndexer::Source shareSource;
@@ -687,10 +689,7 @@ IndexService::IndexService(QString folder, Options options, QObject* parent)
     contentSource.index = [this] { return m_index.load(); };
     contentSource.indexer = m_contentIndexer.get();
     contentSource.online = [this](const std::wstring& path) {
-        const std::vector<ShareIndexer::Status> statuses = m_shares->statuses();
-        return std::ranges::any_of(statuses, [&](const ShareIndexer::Status& s) {
-            return s.state == ShareIndexer::State::Online && unc::equal(s.path, path);
-        });
+        return m_shares->contentAllowed(path);
     };
     remotecontent::Indexer::Callbacks contentCallbacks;
     contentCallbacks.changed = [this] {
@@ -1946,8 +1945,8 @@ bool IndexService::syncWithDisk(std::stop_token stop, const std::vector<std::siz
         auto lock = index->writeLock();
         for (const std::wstring& path : m_removedExtra) {
             if (const EntryId id = findFolder(*index, path); id != kNoEntry) {
-                while (index->entry(id).firstChild != kNoEntry)
-                    index->remove(index->entry(id).firstChild);
+                while (index->entry(id).firstChild() != kNoEntry)
+                    index->remove(index->entry(id).firstChild());
                 m_dirty = true;
             }
         }
@@ -2398,6 +2397,16 @@ void IndexService::saveSnapshot(bool wait)
         return;
     }
     std::vector<std::uint64_t> segments;
+    m_saving = true;
+    const struct Saving {
+        IndexService* self;
+        ~Saving()
+        {
+            self->m_saving = false;
+            QMetaObject::invokeMethod(self, [self = self] { emit self->activityChanged(); }, Qt::QueuedConnection);
+        }
+    } saving {this};
+    QMetaObject::invokeMethod(this, [this] { emit activityChanged(); }, Qt::QueuedConnection);
     if (writeSnapshot(indexfolder::snapshotPath(m_folder), segments) == Save::Written) {
         m_lastSave = std::chrono::steady_clock::now();
         m_content->saved(segments);

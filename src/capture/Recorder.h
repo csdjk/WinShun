@@ -35,6 +35,7 @@ class Recorder : public QObject {
     Q_PROPERTY(QString folder READ folder NOTIFY changed FINAL)
     Q_PROPERTY(QString fileName READ fileName NOTIFY changed FINAL)
     Q_PROPERTY(QString dimensions READ dimensions NOTIFY changed FINAL)
+    Q_PROPERTY(bool fullScreen READ fullScreen WRITE setFullScreen NOTIFY changed FINAL)
     Q_PROPERTY(bool systemAudio READ systemAudio WRITE setSystemAudio NOTIFY changed FINAL)
     Q_PROPERTY(bool microphone READ microphone WRITE setMicrophone NOTIFY changed FINAL)
     Q_PROPERTY(Quality quality READ quality WRITE setQuality NOTIFY changed FINAL)
@@ -91,6 +92,8 @@ public:
     QString folder() const;
     QString fileName() const;
     QString dimensions() const;
+    QRect region() const { return m_region; } // physical pixels on the virtual desktop
+    bool fullScreen() const { return m_fullScreen; }
     bool systemAudio() const { return m_preferences.systemAudio; }
     bool microphone() const { return m_preferences.microphone; }
     Quality quality() const { return m_preferences.quality; }
@@ -109,6 +112,7 @@ public:
     void setClickHighlights(bool on);
     void setKeys(KeyDisplay value);
     void setMouseButtons(bool on);
+    void setFullScreen(bool on);
 
     Q_INVOKABLE void start();
     Q_INVOKABLE void skipCountdown();
@@ -130,6 +134,8 @@ private:
     void completed(const recording::Result& result);
     void remember();
     void createPanel();
+    void keepPanelVisible();
+    void updatePanelExclusion();
     void releaseClicks();
     void releaseKeys();
 
@@ -138,6 +144,8 @@ private:
     QPointer<QQuickWindow> m_panel;
     std::unique_ptr<Border> m_border;
     QRect m_region;
+    QRect m_selectedRegion; // restored when leaving full-screen mode
+    bool m_fullScreen = false;
     HMONITOR m_monitor = nullptr;
     double m_dpr = 1;
     Preferences m_preferences;
@@ -152,6 +160,7 @@ private:
     bool m_clicksActive = false;
     std::unique_ptr<recording::KeyHook> m_keyHook; // while recording with keycaps
     bool m_exporting = false;
+    bool m_compatibilityFallback = false;
 };
 
 } // namespace ws::capture

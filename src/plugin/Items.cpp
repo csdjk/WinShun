@@ -169,6 +169,7 @@ Item parseItem(const QJsonObject& o)
         item.previewText = preview.toString();
     item.actions = parseActions(o.value(u"actions"_s));
     item.valid = o.value(u"valid"_s).toBool(true);
+    item.details = o.value(u"details"_s).toBool();
     item.data = o.value(u"data"_s);
     const QJsonValue search = o.value(u"search"_s);
     if (search.isString())
@@ -191,7 +192,7 @@ QueryResult parseResult(const QJsonValue& value)
         const QJsonObject o = value.toObject();
         items = o.value(u"items"_s).toArray();
         result.rerun = std::max(0.0, o.value(u"rerun"_s).toDouble());
-        result.cacheSeconds = std::max(0, static_cast<int>(o.value(u"cache"_s).toDouble()));
+        result.cacheSeconds = static_cast<int>(std::clamp(o.value(u"cache"_s).toDouble(), 0.0, 86400.0));
     } else
         return result;
     for (const QJsonValue& v : items) {
@@ -270,6 +271,12 @@ Effects parseEffects(const QJsonValue& value)
             effect.open = parseOpen(o);
             if (effect.open.kind == Open::Kind::None)
                 continue;
+        } else if (type == u"reveal") {
+            effect.kind = Effect::Kind::Reveal;
+            effect.open.kind = Open::Kind::Path;
+            effect.open.target = o.value(u"path"_s).toString();
+            if (effect.open.target.isEmpty())
+                continue;
         } else if (type == u"replace") {
             effect.kind = Effect::Kind::Replace;
             effect.items = parseResult(o.value(u"items"_s)).items;
@@ -310,6 +317,8 @@ QJsonObject itemToJson(const Item& item)
         o.insert(u"copy"_s, item.copy);
     if (!item.valid)
         o.insert(u"valid"_s, false);
+    if (item.details)
+        o.insert(u"details"_s, true);
     if (!item.data.isUndefined() && !item.data.isNull())
         o.insert(u"data"_s, item.data);
     return o;

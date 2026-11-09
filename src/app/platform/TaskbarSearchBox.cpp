@@ -55,7 +55,7 @@ constexpr double kPadding = 12; // inside, at either end
 constexpr double kIconSize = 16;
 constexpr double kIconGap = 10;
 constexpr float kFontSize = 14;
-constexpr double kMargin = 6; // round the box in its window: for its glow
+constexpr double kMargin = 6; // round the box in its window
 // Its icon alone is a taskbar button, as Windows' own search icon is
 // (measured 2026-10-16 at 150%, dark taskbar: a slot 44 DIPs wide, the plate
 // 40 × 40 with 4 DIP corners, 4 from the taskbar's top and bottom and 2 from
@@ -193,6 +193,15 @@ D2D1_COLOR_F gray(float level, float alpha) { return D2D1::ColorF(level, level, 
 D2D1_COLOR_F colorOf(COLORREF color, float alpha = 1)
 {
     return D2D1::ColorF(GetRValue(color) / 255.0f, GetGValue(color) / 255.0f, GetBValue(color) / 255.0f, alpha);
+}
+
+// 0xAARRGGBB; none for alpha 0 (Look::selection, caret: the box's own then).
+std::optional<D2D1_COLOR_F> argbOf(std::uint32_t argb)
+{
+    if ((argb >> 24) == 0)
+        return std::nullopt;
+    const auto channel = [argb](int shift) { return static_cast<float>((argb >> shift) & 0xFF) / 255.0f; };
+    return D2D1::ColorF(channel(16), channel(8), channel(0), channel(24));
 }
 
 D2D1_COLOR_F mix(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t)
@@ -687,11 +696,9 @@ struct SearchBox::Impl {
     bool hover = false;
     Tween hoverT;
     Tween activeT;
-    Tween glowT; // 0 to 1 once, as it becomes active
     Tween shownT;
     Tween placeholderT;
     Spring pressS; // 1 held down
-    Spring iconS; // the icon's scale
     bool caretOn = true;
     float scroll = 0; // the text, moved left to keep the caret in view
     bool selecting = false; // the button held down in the text
@@ -716,8 +723,8 @@ struct SearchBox::Impl {
     ComPtr<ID2D1Bitmap> icon;
     UINT iconDpi = 0;
     std::optional<COLORREF> iconInk; // one colour (monoIcon): this one; else its own colours
-    ComPtr<ID2D1Bitmap> searchIcon; // the magnifier, for the icon alone (the pinned button's, search.ico)
-    int searchIconPx = 0; // its size (buttonGlyph)
+    ComPtr<ID2D1Bitmap> buttonIcon; // the program logo at the icon-only button's size
+    int buttonIconPx = 0; // its size (buttonGlyph)
     HDC memory = nullptr;
     HBITMAP bitmap = nullptr;
     HGDIOBJ oldBitmap = nullptr;
@@ -806,7 +813,6 @@ struct SearchBox::Impl {
             drawnLook = look;
             drawnText = text;
         }
-        iconS.snap(1);
         readTheme();
         startAttaching();
         loop();
@@ -844,8 +850,7 @@ struct SearchBox::Impl {
 
     bool animating() const
     {
-        return hoverT.running || activeT.running || glowT.running || shownT.running || placeholderT.running
-            || pressS.moving || iconS.moving;
+        return hoverT.running || activeT.running || shownT.running || placeholderT.running || pressS.moving;
     }
 
     void tick()
@@ -853,10 +858,9 @@ struct SearchBox::Impl {
         const double now = nowMs();
         const double ms = now - lastTick;
         lastTick = now;
-        for (Tween* t : {&hoverT, &activeT, &glowT, &shownT, &placeholderT})
+        for (Tween* t : {&hoverT, &activeT, &shownT, &placeholderT})
             t->step(now);
         pressS.step(ms);
-        iconS.step(ms);
         if (hiding && !shownT.running) {
             finishHiding();
             return;
@@ -1477,13 +1481,7 @@ struct SearchBox::Impl {
         if (next.active != drawnText.active) {
             scroll = 0;
             if (animations) {
-                activeT.go(next.active ? 1 : 0, now, next.active ? 250 : 167, kFastIn);
-                if (next.active) {
-                    glowT.snap(0);
-                    glowT.go(1, now, 600, kLinear);
-                    iconS.velocity += 2.4; // a little hop
-                    iconS.to(1, 16, 0.42);
-                }
+                activeT.go(next.active ? 1 : 0, now, next.active ? 250 : 167, kFastIn); // its fill and line alone: no ring, no hop
             } else {
                 activeT.snap(next.active ? 1 : 0);
             }
@@ -1524,7 +1522,7 @@ struct SearchBox::Impl {
         if (on)
             pressS.to(1, 45, 0.9); // in quickly
         else
-            pressS.to(0, 22, 0.5); // back with a little bounce
+            pressS.to(0, 22, 1); // back, no bounce
     }
 
     // ---- the pointer ----
@@ -1602,16 +1600,34 @@ struct SearchBox::Impl {
             return {window, window, window, window, ink, highlight, ink, colorOf(::GetSysColor(COLOR_GRAYTEXT)),
                 highlight, ink, gray(0, 0), gray(0, 0), gray(0, 0)};
         }
+        // On the taskbar, the taskbar's light or dark (not Win顺's), its
+        // translucent fills, as Windows' own search box. What stands for the
+        // launcher's field while typing follows the 界面风格 where it has a
+        // colour of its own: the selection and the caret (Look::selection, caret).
         D2D1_COLOR_F selection = accent;
-        if (dark) {
-            selection.a = 0.45f;
-            return {gray(1, 0.06f), gray(1, 0.11f), gray(1, 0.03f), gray(0.11f, 0.94f), gray(1, 0.09f),
-                gray(0x6A / 255.0f, 1), gray(1, 1), gray(1, 0.66f), selection, gray(1, 1), gray(1, 0.058f), gray(1, 0.039f),
-                gray(1, 0.045f)};
+        selection.a = dark ? 0.45f : 0.32f;
+        if (const std::optional<D2D1_COLOR_F> styled = argbOf(drawnLook.selection))
+            selection = *styled;
+        Palette p = dark
+            ? Palette {gray(1, 0.06f), gray(1, 0.11f), gray(1, 0.03f), gray(0.11f, 0.94f), gray(1, 0.09f),
+                  gray(0x6A / 255.0f, 1), gray(1, 1), gray(1, 0.66f), selection, gray(1, 1), gray(1, 0.058f), gray(1, 0.039f),
+                  gray(1, 0.045f)}
+            : Palette {gray(1, 0.6f), gray(1, 0.82f), gray(1, 0.42f), gray(1, 0.98f), gray(0, 0.08f), gray(0xB4 / 255.0f, 1),
+                  gray(0, 0.9f), gray(0, 0.6f), selection, gray(0, 0.9f), gray(0, 0.037f), gray(0, 0.024f), gray(0, 0)};
+        if (const std::optional<D2D1_COLOR_F> caret = argbOf(drawnLook.caret))
+            p.caret = *caret;
+        // The style's field (brand's white box, tactile's slot), on a taskbar
+        // of the same light or dark: hover and press a step towards the ink;
+        // the line while typing stays our windows' grey (p.edge).
+        if (const std::optional<D2D1_COLOR_F> fill = argbOf(drawnLook.fill); fill && drawnLook.styleDark == dark) {
+            p.fill = *fill;
+            p.hoverFill = mix(*fill, p.text, 0.04f);
+            p.pressedFill = mix(*fill, p.text, 0.08f);
+            p.activeFill = *fill;
+            if (const std::optional<D2D1_COLOR_F> edge = argbOf(drawnLook.edge))
+                p.border = *edge;
         }
-        selection.a = 0.32f;
-        return {gray(1, 0.6f), gray(1, 0.82f), gray(1, 0.42f), gray(1, 0.98f), gray(0, 0.08f), gray(0xB4 / 255.0f, 1),
-            gray(0, 0.9f), gray(0, 0.6f), selection, gray(0, 0.9f), gray(0, 0.037f), gray(0, 0.024f), gray(0, 0)};
+        return p;
     }
 
     // The words in the box: the placeholder (or what to search, while typing
@@ -1633,7 +1649,7 @@ struct SearchBox::Impl {
     {
         renderTarget.Reset();
         icon.Reset();
-        searchIcon.Reset();
+        buttonIcon.Reset();
         if (memory) {
             ::SelectObject(memory, oldBitmap);
             ::DeleteDC(std::exchange(memory, nullptr));
@@ -1697,39 +1713,40 @@ struct SearchBox::Impl {
         return highContrast ? ::GetSysColor(COLOR_WINDOWTEXT) : dark ? RGB(0xFF, 0xFF, 0xFF) : RGB(0x1B, 0x1B, 0x1B);
     }
 
-    // Win顺's icon at its exact size (the .ico has 16 to 48 in steps), or
-    // drawn in one colour; the magnifier the same, in one colour its own
-    // shape filled with the ink (its glass stays faint, as Windows' is).
+    // The same program identity in every form, at each form's exact size.
     void ensureIcon()
     {
         const std::optional<COLORREF> ink = wantedInk();
         const int glyph = buttonGlyph();
-        if (icon && searchIcon && iconDpi == dpi && iconInk == ink && searchIconPx == glyph)
+        if (icon && buttonIcon && iconDpi == dpi && iconInk == ink && buttonIconPx == glyph)
             return;
         icon.Reset();
-        searchIcon.Reset();
+        buttonIcon.Reset();
         iconDpi = dpi;
         iconInk = ink;
-        const int px = static_cast<int>(std::lround(kIconSize * dpi / 96.0));
-        if (ink) {
-            const QImage image = monologo::image(px, QColor(GetRValue(*ink), GetGValue(*ink), GetBValue(*ink)));
-            renderTarget->CreateBitmap(D2D1::SizeU(px, px), image.constBits(), static_cast<UINT32>(image.bytesPerLine()),
-                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
-                &icon);
-        } else {
-            icon = iconBitmap(L"IDI_ICON1", px, std::nullopt);
-        }
-        searchIconPx = glyph;
-        searchIcon = iconBitmap(L"IDI_SEARCH", glyph, ink);
+        icon = logoBitmap(static_cast<int>(std::lround(kIconSize * dpi / 96.0)), ink);
+        buttonIconPx = glyph;
+        buttonIcon = logoBitmap(glyph, ink);
     }
 
-    // An icon of the exe's at px (Windows picks the nearest size it has and
-    // scales it), premultiplied; with an ink, its alpha in that colour.
-    ComPtr<ID2D1Bitmap> iconBitmap(const wchar_t* name, int px, std::optional<COLORREF> ink)
+    ComPtr<ID2D1Bitmap> logoBitmap(int px, std::optional<COLORREF> ink)
+    {
+        if (!ink)
+            return iconBitmap(px);
+        ComPtr<ID2D1Bitmap> result;
+        const QImage image = monologo::image(px, QColor(GetRValue(*ink), GetGValue(*ink), GetBValue(*ink)));
+        renderTarget->CreateBitmap(D2D1::SizeU(px, px), image.constBits(), static_cast<UINT32>(image.bytesPerLine()),
+            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
+            &result);
+        return result;
+    }
+
+    // The program's colour icon at px, converted to premultiplied alpha.
+    ComPtr<ID2D1Bitmap> iconBitmap(int px)
     {
         ComPtr<ID2D1Bitmap> result;
         const auto handle
-            = static_cast<HICON>(::LoadImageW(::GetModuleHandleW(nullptr), name, IMAGE_ICON, px, px, LR_DEFAULTCOLOR));
+            = static_cast<HICON>(::LoadImageW(::GetModuleHandleW(nullptr), L"IDI_ICON1", IMAGE_ICON, px, px, LR_DEFAULTCOLOR));
         if (!handle)
             return result;
         ICONINFO info {};
@@ -1743,8 +1760,7 @@ struct SearchBox::Impl {
             if (read) {
                 for (std::uint32_t& p : pixels) { // straight alpha to premultiplied
                     const std::uint32_t a = p >> 24;
-                    const std::uint32_t c = ink ? (GetRValue(*ink) << 16) | (GetGValue(*ink) << 8) | GetBValue(*ink) : p;
-                    const auto channel = [&](int shift) { return (((c >> shift) & 0xFF) * a + 127) / 255 << shift; };
+                    const auto channel = [&](int shift) { return (((p >> shift) & 0xFF) * a + 127) / 255 << shift; };
                     p = (a << 24) | channel(16) | channel(8) | channel(0);
                 }
                 renderTarget->CreateBitmap(D2D1::SizeU(px, px), pixels.data(), px * 4,
@@ -1808,19 +1824,14 @@ struct SearchBox::Impl {
         ComPtr<ID2D1SolidColorBrush> brush;
         renderTarget->CreateSolidColorBrush(p.fill, &brush);
         const bool round = drawnLook.roundedCorners;
-        const float radius = round ? (button ? std::round(static_cast<float>(kButtonRadius) * s) : h / 2) : 0;
+        // The box: a pill as Windows' own, or the style's field corner (never past a pill).
+        const float boxRadius = drawnLook.radius >= 0 ? std::min(h / 2, std::round(static_cast<float>(drawnLook.radius) * s)) : h / 2;
+        const float radius = round ? (button ? std::round(static_cast<float>(kButtonRadius) * s) : boxRadius) : 0;
         const float inset = button ? std::round(static_cast<float>(kButtonSide) * s) : 0; // the plate in the slot
         const auto rounded = [&](float out) {
             return D2D1_ROUNDED_RECT {D2D1::RectF(inset - out, -out, w - inset + out, h + out),
                 round ? std::max(0.0f, radius + out) : 0, round ? std::max(0.0f, radius + out) : 0};
         };
-
-        if (glowT.running && !highContrast && whole) { // a thin ring of the edge's grey, spreading as it fades
-            const float t = glowT.value;
-            const float strength = t < 0.15f ? t / 0.15f : 1 - kFastIn((t - 0.15f) / 0.85f);
-            brush->SetColor(faded(p.edge, 0.6f * strength * activeAmount));
-            renderTarget->DrawRoundedRectangle(rounded(s * (0.5f + 3.5f * kFastIn(t))), brush.Get(), s);
-        }
 
         // The pill, with a line round it, 1 logical px as round our windows;
         // with high contrast the highlight's, thicker, while typing in it.
@@ -1865,12 +1876,12 @@ struct SearchBox::Impl {
         }
 
         renderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        const float iconSize = button ? static_cast<float>(searchIconPx) : std::round(static_cast<float>(kIconSize) * s);
+        const float iconSize = button ? static_cast<float>(buttonIconPx) : std::round(static_cast<float>(kIconSize) * s);
         const float iconX = button ? std::round((w - iconSize) / 2)
                                    : std::min(std::round(static_cast<float>(kPadding) * s), std::round((w - iconSize) / 2)); // narrow: centred
-        if (const ComPtr<ID2D1Bitmap>& glyph = button ? searchIcon : icon) {
+        if (const ComPtr<ID2D1Bitmap>& glyph = button ? buttonIcon : icon) {
             const float y = std::round((h - iconSize) / 2);
-            const float k = static_cast<float>(iconS.value) * (1 - 0.14f * std::max(0.0f, press));
+            const float k = 1 - 0.14f * std::max(0.0f, press);
             renderTarget->SetTransform(
                 D2D1::Matrix3x2F::Scale(k, k, D2D1::Point2F(iconX + iconSize / 2, y + iconSize / 2)) * base);
             renderTarget->DrawBitmap(glyph.Get(), D2D1::RectF(iconX, y, iconX + iconSize, y + iconSize), 1.0f,

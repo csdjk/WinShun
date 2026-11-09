@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -45,13 +46,17 @@ inline constexpr std::uint8_t Inherited = LowPriority | Hidden | Remote;
 #pragma pack(push, 1)
 struct Entry {
     EntryId parent = kNoEntry;
-    EntryId firstChild = kNoEntry;
+    // A directory's first child or a file's packed size: files have no
+    // children and directories have no size. Shared without a union, so
+    // traversal can safely ask firstChild() of either kind.
+    std::uint32_t childOrSize = kNoEntry;
     EntryId nextSibling = kNoEntry;
     std::uint32_t nameOffset = 0; // in the index's name storage
     std::uint8_t flags = 0;
 
     bool isDir() const noexcept { return flags & EntryFlag::Directory; }
     bool isDeleted() const noexcept { return flags & EntryFlag::Deleted; }
+    EntryId firstChild() const noexcept { return isDir() ? childOrSize : kNoEntry; }
 };
 #pragma pack(pop)
 static_assert(sizeof(Entry) == 17, "keep Entry compact: there is one per file and folder");
@@ -94,18 +99,13 @@ using FileSize = std::uint32_t;
 inline constexpr FileSize kUnknownSize = 0xFFFF'FFFFu;
 inline FileSize packSize(std::uint64_t bytes) noexcept
 {
-    const float f = static_cast<float>(bytes);
-    FileSize packed = 0;
-    static_assert(sizeof packed == sizeof f);
-    std::memcpy(&packed, &f, sizeof packed);
-    return packed;
+    return std::bit_cast<FileSize>(static_cast<float>(bytes));
 }
 inline std::uint64_t unpackSize(FileSize packed) noexcept
 {
     if (packed == kUnknownSize)
         return 0;
-    float f = 0;
-    std::memcpy(&f, &packed, sizeof f);
+    const float f = std::bit_cast<float>(packed);
     // In double: a float's integer is exact there, and the half added does
     // not round it up (16777215 + 0.5f is 16777216 as a float).
     return f <= 0 ? 0 : static_cast<std::uint64_t>(static_cast<double>(f) + 0.5);
@@ -122,10 +122,14 @@ struct EntryFilter {
     FileSize minSize = 0; // packed: at least this
     FileSize maxSize = kUnknownSize; // ... and at most this (kUnknownSize: none)
     std::vector<EntryId> folders;
+    // Only what lies directly in this folder, not deeper ("this level only"
+    // of a folder's window); kNoEntry: no such bound. A folder that is not in
+    // the index is kNoEntry - 1, which no entry has as its parent.
+    EntryId directIn = kNoEntry;
 
     bool byTime() const noexcept { return after != 0 || before != 0; }
     bool bySize() const noexcept { return minSize != 0 || maxSize != kUnknownSize; }
-    bool any() const noexcept { return byTime() || bySize() || !folders.empty(); }
+    bool any() const noexcept { return byTime() || bySize() || !folders.empty() || directIn != kNoEntry; }
     // Both filters at once: the narrower bounds.
     void merge(const EntryFilter& other)
     {
@@ -135,6 +139,8 @@ struct EntryFilter {
         maxSize = std::min(maxSize, other.maxSize);
         for (const EntryId f : other.folders)
             folders.push_back(f);
+        if (other.directIn != kNoEntry)
+            directIn = other.directIn;
     }
     // Whether an entry with these fits (folders aside); for a folder entry
     // the size is kUnknownSize.
@@ -216,12 +222,17 @@ public:
     static constexpr std::size_t kNameChunkBits = 18;
     static constexpr std::size_t kNameChunkSize = std::size_t {1} << kNameChunkBits;
 
-    FileIndex();
+    // Large indexes spill new chunks into temporary mapped files. The budget
+    // limits private chunk allocations, not the OS-managed file cache.
+    static std::size_t defaultPrivateBudget() noexcept;
+    explicit FileIndex(std::size_t privateBudget = defaultPrivateBudget());
     ~FileIndex();
     FileIndex(const FileIndex&) = delete;
     FileIndex& operator=(const FileIndex&) = delete;
 
     [[nodiscard]] std::shared_lock<std::shared_mutex> readLock() const { return std::shared_lock(m_mutex); }
+    // The same if it can be had at once (owns_lock()), else none: for a look that may skip a turn.
+    [[nodiscard]] std::shared_lock<std::shared_mutex> tryReadLock() const { return std::shared_lock(m_mutex, std::try_to_lock); }
     [[nodiscard]] std::unique_lock<std::shared_mutex> writeLock()
     {
         const std::lock_guard gate(m_writerGate);
@@ -265,8 +276,12 @@ public:
     FileTime modified(EntryId id) const noexcept { return m_times[id >> kChunkBits][id & (kChunkSize - 1)]; }
     FileTime created(EntryId id) const noexcept { return m_created[id >> kChunkBits][id & (kChunkSize - 1)]; }
     // A file's size, packed (packSize); kUnknownSize for a folder, or a file
-    // whose size was never read. Kept apart as the times are.
-    FileSize size(EntryId id) const noexcept { return m_sizes[id >> kChunkBits][id & (kChunkSize - 1)]; }
+    // whose size was never read. Stored in the entry's unused child link.
+    FileSize size(EntryId id) const noexcept
+    {
+        const Entry& e = entry(id);
+        return e.isDir() ? kUnknownSize : e.childOrSize;
+    }
 
     // Bytes held, by part (for measuring). Caller holds a read lock.
     struct MemoryUse {
@@ -278,12 +293,19 @@ public:
         std::size_t folderRecords = 0;
         std::size_t childTables = 0;
         std::size_t intern = 0;
+        std::size_t privateChunks = 0;
+        std::size_t mappedFiles = 0;
+        std::size_t mappingFailures = 0;
     };
     MemoryUse memoryUse() const noexcept;
+    // The big blocks the memoryUse() numbers are made of (entries, times,
+    // names): address and size, so how much of them is in the working set
+    // right now can be asked of Windows (memory::residentBytes). The rest
+    // (tables on the general heap) is not in the list. Caller holds a read lock.
+    std::vector<std::pair<const void*, std::size_t>> memoryBlocks() const;
 
-    // Brings the pages a name search reads (entries, times, names) back into
-    // the working set after it was emptied (IdleTrim), so the search that
-    // follows does not take them one fault at a time. Caller holds a read lock.
+    // Warms entries and names only for small, privately held indexes after
+    // IdleTrim. Large mapped indexes stay demand-paged. Caller holds a read lock.
     void warm() const noexcept;
 
     std::size_t chunkCount() const noexcept { return m_chunks.size(); }
@@ -318,7 +340,12 @@ public:
     void setFlags(EntryId id, std::uint8_t flags);
     void setModified(EntryId id, FileTime time) noexcept { m_times[id >> kChunkBits][id & (kChunkSize - 1)] = time; }
     void setCreated(EntryId id, FileTime time) noexcept { m_created[id >> kChunkBits][id & (kChunkSize - 1)] = time; }
-    void setSize(EntryId id, FileSize size) noexcept { m_sizes[id >> kChunkBits][id & (kChunkSize - 1)] = size; }
+    void setSize(EntryId id, FileSize size) noexcept
+    {
+        Entry& e = mut(id);
+        if (!e.isDir())
+            e.childOrSize = size;
+    }
 
     // While interning is on, identical names share one copy (only a third of
     // the names on a typical disk are unique: index.js, __init__.py, ...).
@@ -373,6 +400,23 @@ public:
     [[nodiscard]] IdPin pinIds() const noexcept { return IdPin(*this); }
     bool idsPinned() const noexcept { return m_pins.load() > 0; }
 
+    // ---- files changed, for the content indexer --------------------------
+    // The files added, removed, renamed or moved, or whose flags changed,
+    // since the last call: all a content pass has to look at besides the
+    // documents it knows are due (ContentIndexer::findWork), instead of every
+    // file. Recorded from the first call on. Not `complete` when that cannot
+    // be told: the first call, more than kMaxChanges of them, ids renumbered
+    // by compact(), a folder moved onto another root; every file is looked at
+    // then. Folders are never in it: what a content pass decides is per file.
+    // The caller holds a read lock (writers record under the write lock); one
+    // caller at a time.
+    struct Changes {
+        std::vector<EntryId> files; // ascending, each once
+        bool complete = false;
+    };
+    Changes takeChanges();
+    static constexpr std::size_t kMaxChanges = std::size_t {1} << 19; // 2 MB of ids
+
     // Name storage, for bulk readers that collect names before adding the
     // entries (the MFT reader). Offsets stay valid until compact().
     //
@@ -420,7 +464,7 @@ private:
         const char* p = nameRecord(m_names, offset);
         return static_cast<unsigned char>(p[static_cast<unsigned char>(p[0]) < 0x80 ? 1 : 2]);
     }
-    static const char* nameRecord(const std::vector<std::unique_ptr<char[]>>& names, std::uint32_t offset) noexcept
+    static const char* nameRecord(const std::vector<std::shared_ptr<char[]>>& names, std::uint32_t offset) noexcept
     {
         return names[offset >> kNameChunkBits].get() + (offset & (kNameChunkSize - 1));
     }
@@ -455,14 +499,30 @@ private:
     void internInsert(std::uint64_t slot, std::size_t hash) noexcept;
     void link(EntryId parent, EntryId child);
     void unlink(EntryId child);
+    EntryId rootOf(EntryId id) const noexcept;
+    void noteChanged(EntryId file)
+    {
+        if (!m_tracking || m_changesLost)
+            return;
+        if (m_changes.size() >= kMaxChanges)
+            loseChanges();
+        else
+            m_changes.push_back(file);
+    }
+    void loseChanges() noexcept
+    {
+        m_changesLost = true;
+        std::vector<EntryId>().swap(m_changes);
+    }
 
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_writerGate; // see longReadLock()
-    std::vector<std::unique_ptr<Entry[]>> m_chunks;
-    std::vector<std::unique_ptr<FileTime[]>> m_times; // parallel to m_chunks
-    std::vector<std::unique_ptr<FileTime[]>> m_created;
-    std::vector<std::unique_ptr<FileSize[]>> m_sizes; // likewise; kUnknownSize until set
-    std::vector<std::unique_ptr<char[]>> m_names;
+    struct Storage;
+    std::unique_ptr<Storage> m_storage;
+    std::vector<std::shared_ptr<Entry[]>> m_chunks;
+    std::vector<std::shared_ptr<FileTime[]>> m_times; // parallel to m_chunks
+    std::vector<std::shared_ptr<FileTime[]>> m_created;
+    std::vector<std::shared_ptr<char[]>> m_names;
     std::size_t m_count = 0;
     std::size_t m_nameUsed = kNameChunkSize; // forces allocation on first use
     std::atomic<std::size_t> m_live {0};
@@ -473,6 +533,11 @@ private:
     std::size_t m_internCount = 0;
     std::vector<std::pair<EntryId, RecordTable>> m_folderRecords; // by volume root
     std::unordered_map<EntryId, ChildTable> m_childTables; // by folder; compact() drops them all
+    // takeChanges(): written under the write lock, taken under a read lock.
+    std::vector<EntryId> m_changes;
+    bool m_tracking = false; // since the first takeChanges()
+    bool m_changesLost = false;
+    std::mutex m_changesTaking; // one caller at a time
 };
 
 std::uint8_t extensionLength(std::string_view name, bool isDir) noexcept;

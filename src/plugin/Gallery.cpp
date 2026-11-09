@@ -153,7 +153,19 @@ std::optional<Index> parse(const QByteArray& json, const QString& source, QStrin
                 item.permissions.push_back(name);
         }
         item.program = programOf(o.value(u"runtime"_s));
+        const QJsonValue review = o.value(u"review"_s);
+        if (review == u"official"_s)
+            item.review = Review::Official;
+        else if (review == u"reviewed"_s)
+            item.review = Review::Reviewed;
+        else if (review == u"unreviewed-native"_s)
+            item.review = Review::UnreviewedNative;
+        else if (!review.isUndefined()) {
+            ++index.skipped;
+            continue;
+        }
         item.minWinShun = o.value(u"minWinShun"_s).toString();
+        item.bundled = o.value(u"bundled"_s).toBool();
         index.items.push_back(std::move(item));
     }
     return index;
@@ -181,43 +193,6 @@ State stateOf(const Item& item, const Local& local, QStringView appVersion)
     if (local.bundled)
         return State::Bundled;
     return newerApp ? State::NeedsNewerApp : State::Install;
-}
-
-Fetched fetch(const QString& source, qint64 maxBytes, const Fetcher& web, const Progress& progress)
-{
-    if (isWeb(source)) {
-        if (!web)
-            return Fetched {0, {}, ERROR_NOT_SUPPORTED};
-        return web(source, maxBytes, progress);
-    }
-    Fetched f;
-    QFile file(localPath(source));
-    if (!file.open(QIODevice::ReadOnly)) {
-        f.error = file.exists() ? ERROR_ACCESS_DENIED : ERROR_FILE_NOT_FOUND;
-        return f;
-    }
-    // In pieces, as from the web: the progress heard, a stop obeyed.
-    constexpr qint64 kPiece = 64 * 1024;
-    while (maxBytes <= 0 || f.body.size() < maxBytes) {
-        const qint64 wanted = maxBytes > 0 ? std::min(kPiece, maxBytes - f.body.size()) : kPiece;
-        const QByteArray piece = file.read(wanted);
-        if (piece.isEmpty()) {
-            if (file.error() != QFileDevice::NoError) {
-                f.body.clear();
-                f.error = ERROR_READ_FAULT;
-                return f;
-            }
-            break;
-        }
-        f.body += piece;
-        if (progress && !progress(f.body.size())) {
-            f.body.clear();
-            f.error = ERROR_CANCELLED;
-            return f;
-        }
-    }
-    f.status = 200;
-    return f;
 }
 
 Problem check(const Item& item, const QByteArray& package)

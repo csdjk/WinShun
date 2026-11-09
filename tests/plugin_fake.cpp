@@ -23,7 +23,8 @@
 //       first answer followed MS later by K winshun/refresh (1 without
 //       --refresh-burst), or preceded by one with --refresh-first), cancel
 //       (counted), action (the files and trigger of a `files` one in its
-//       notify), settingsChanged (remembered), shutdown.
+//       notify), settingsChanged (remembered), appearance (remembered and
+//       counted: data.appearance, data.looks), shutdown.
 //   --probe
 //       A once plugin whose one item carries the facts about its process
 //       (token, job, mitigations, may it start a process, read the
@@ -44,6 +45,7 @@
 #include <vector>
 
 using namespace ws::plugin;
+using lite::Handle;
 
 namespace {
 
@@ -98,11 +100,38 @@ json::Value facts()
     const std::wstring profile = lite::environmentVariable(L"USERPROFILE");
     if (!profile.empty())
         options.writeDirs.push_back(profile);
+    const std::wstring temp = lite::environmentVariable(L"TEMP"); // SQLite and others spill here
+    if (!temp.empty())
+        options.writeDirs.push_back(temp);
     return sandbox::collectFacts(options);
 }
 
 int onceMain()
 {
+    if (has(L"--whoami")) { // its own token, said in the row (the elevated plugins' live check)
+        HANDLE raw = nullptr;
+        ::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw);
+        const Handle token(raw);
+        const DWORD rid = sandbox::integrityRid(token.get());
+        const bool elevated = sandbox::tokenElevated(token.get());
+        const char* level = rid >= SECURITY_MANDATORY_SYSTEM_RID ? "System" : rid >= SECURITY_MANDATORY_HIGH_RID ? "High"
+            : rid >= SECURITY_MANDATORY_MEDIUM_RID ? "Medium" : "Low";
+        char title[160];
+        std::snprintf(title, sizeof title, "elevated=%s integrity=%s (0x%lx)", elevated ? "yes" : "no", level, rid);
+        json::Value::Object one = item("whoami", title, lite::utf8(lite::ownPath()));
+        one["data"] = json::Value(json::Value::Object {{"elevated", elevated}, {"integrity", static_cast<unsigned long>(rid)},
+            {"self", lite::utf8(lite::ownPath())}, {"pluginDir", env(L"WS_PLUGIN_DIR")}, {"temp", env(L"TEMP")},
+            {"path", env(L"PATH")}, {"hkcuProbe", env(L"WS_HKCU_PROBE")}, {"components", env(L"WS_COMPONENTS_DIR")}});
+        out(json::write(json::Value(json::Value::Object {{"items", json::Value::Array {json::Value(std::move(one))}}})));
+        return 0;
+    }
+    if (has(L"--many-lines")) {
+        const int count = _wtoi(value(L"--many-lines").c_str());
+        const std::string line(4096, 'x');
+        for (int i = 0; i < count; ++i)
+            out(line);
+        return 0;
+    }
     if (has(L"--slow"))
         ::Sleep(static_cast<DWORD>(std::wcstoul(value(L"--slow").c_str(), nullptr, 10)));
     if (has(L"--fail")) {
@@ -145,7 +174,7 @@ int onceMain()
         data["self"] = lite::utf8(lite::ownPath());
         for (const wchar_t* name : {L"WS_QUERY", L"WS_TEXT", L"WS_COMMAND", L"WS_TRIGGER", L"WS_KEYWORD", L"WS_MATCH", L"WS_PLUGIN_DIR",
                  L"WS_DATA_DIR", L"WS_SETTINGS", L"WS_FILTERS", L"WS_LOCALE", L"WS_THEME", L"WS_VERSION", L"PYTHONIOENCODING", L"FAKE_EXTRA",
-                 L"__PYVENV_LAUNCHER__"})
+                 L"__PYVENV_LAUNCHER__", L"TEMP", L"WS_COMPONENTS_DIR"})
             data[lite::utf8(name)] = env(name);
         json::Value::Object one = item("env", "env", "");
         one["data"] = json::Value(std::move(data));
@@ -171,12 +200,15 @@ int onceMain()
         json::Value::Object one = item("once-" + std::to_string(i), "once: " + query + (n > 1 ? " #" + std::to_string(i) : ""),
             env(L"WS_COMMAND") + "/" + env(L"WS_TRIGGER"));
         one["score"] = 70;
+        if (has(L"--payload"))
+            one["subtitle"] = std::string(static_cast<std::size_t>(_wtoi(value(L"--payload").c_str())), 'x');
         one["open"] = json::Value::Object {{"url", "https://example.com/?q=" + query}};
         items.push_back(json::Value(std::move(one)));
     }
     err("once plugin answered 已回答");
     const double rerun = has(L"--rerun") ? std::wcstod(value(L"--rerun").c_str(), nullptr) : 0.0;
-    out(json::write(json::Value(json::Value::Object {{"items", std::move(items)}, {"rerun", rerun}})));
+    const int cache = has(L"--cache") ? _wtoi(value(L"--cache").c_str()) : 0;
+    out(json::write(json::Value(json::Value::Object {{"items", std::move(items)}, {"rerun", rerun}, {"cache", cache}})));
     return 0;
 }
 
@@ -194,6 +226,10 @@ struct Server {
     int queries = 0;
     int cancelled = 0;
     json::Value settings;
+    json::Value appearance;
+    int looks = 0; // appearance notifications
+    bool detailsHost = false; // initialize said capabilities.details
+    std::string dataDir;
     long long nextId = 1;
     lite::LineReader reader {::GetStdHandle(STD_INPUT_HANDLE)};
 
@@ -245,7 +281,12 @@ struct Server {
             const json::Value params = m["params"];
             if (method == "initialize") {
                 settings = params["settings"];
+                appearance = params["appearance"];
+                detailsHost = params["capabilities"]["details"].toBool();
+                dataDir = params["dataDir"].toString();
                 respond(id, json::Value::Object {{"protocolVersion", params["protocolVersion"].toString()}, {"name", "fake"}});
+                if (has(L"--hotkeys"))
+                    notify("winshun/hotkeys", {{"keys", json::Value::Array {"Ctrl+Shift+9"}}});
             } else if (method == "query") {
                 ++queries;
                 if (has(L"--crash") && queries == _wtoi(value(L"--crash").c_str())) {
@@ -293,7 +334,7 @@ struct Server {
                 if (!text.empty() && text[0] == '#') // a colour (a regex trigger's push): shown as a swatch
                     one["icon"] = "color:" + text;
                 one["data"] = json::Value::Object {{"cancelled", cancelled}, {"settings", settings}, {"filters", params["filters"]},
-                    {"pid", static_cast<unsigned long>(::GetCurrentProcessId())}};
+                    {"pid", static_cast<unsigned long>(::GetCurrentProcessId())}, {"appearance", appearance}, {"looks", looks}};
                 if (has(L"--toast")) {
                     // A click asking for everything: Win顺 keeps only its own
                     // list ("fk "), the local folder and (with clipboard:write) the copy.
@@ -310,6 +351,8 @@ struct Server {
                     one["data"] = json::Value::Object {{"n", queries}};
                     result["rerun"] = std::wcstod(value(L"--rerun").c_str(), nullptr);
                 }
+                if (has(L"--cache"))
+                    result["cache"] = _wtoi(value(L"--cache").c_str());
                 result["items"] = json::Value::Array {json::Value(std::move(one))};
                 const bool refreshing = has(L"--refresh") && queries == 1;
                 if (refreshing && has(L"--refresh-first"))
@@ -324,6 +367,8 @@ struct Server {
             } else if (method == "cancel") {
                 ++cancelled;
             } else if (method == "action") {
+                if (has(L"--hang-action"))
+                    continue;
                 const std::string action = params["action"].toString();
                 const std::string title = params["item"]["title"].toString();
                 std::string said = "did " + action + " on " + title;
@@ -335,8 +380,21 @@ struct Server {
                 respond(id, json::Value::Object {{"effects",
                     json::Value::Array {json::Value(json::Value::Object {{"type", "notify"}, {"text", said}}),
                         json::Value(json::Value::Object {{"type", "hide"}})}}});
+            } else if (method == "details") { // GitHub #202
+                if (has(L"--hang-details"))
+                    continue;
+                const std::string title = params["item"]["title"].toString();
+                if (has(L"--details-file")) // a name in the data folder, or a path as it is
+                    respond(id, json::Value::Object {{"file", has(L"--details-outside") ? lite::utf8(value(L"--details-file"))
+                        : dataDir + "\\" + lite::utf8(value(L"--details-file"))}});
+                else
+                    respond(id, json::Value::Object {{"text", std::string("From: fake\nSubject: ") + title + "\n\n" + params["text"].toString()
+                        + (detailsHost ? "\nhost knows details" : "")}});
             } else if (method == "settingsChanged") {
                 settings = params["settings"];
+            } else if (method == "appearance") {
+                appearance = params;
+                ++looks;
             } else if (method == "shutdown") {
                 respond(id, json::Value::Object {});
                 return 0;

@@ -18,6 +18,8 @@ Rectangle {
     required property string pluginId
     required property string name
     required property string description
+    required property string reviewLabel
+    required property bool unreviewed
     required property string author
     required property string version
     required property string icon
@@ -32,9 +34,12 @@ Rectangle {
     required property real progress
     required property string problem
     required property bool shown
+    required property string staged // a newer version kept aside for the next start
+    required property string morePermissions // what the list's version asks for besides, named
 
     readonly property real dpr: Screen.devicePixelRatio
     readonly property bool installable: stage === "install" || stage === "update"
+    readonly property bool waiting: stage === "update" && staged.length > 0 && !busy // put in place at the next start, or now
 
     signal showInstalled() // 查看
 
@@ -42,8 +47,14 @@ Rectangle {
     implicitHeight: Theme.snapUp(body.implicitHeight + 2 * body.y, dpr)
     radius: Theme.controlRadius
     color: "transparent"
-    border.width: 1
-    border.color: Theme.cardBorder
+
+    Hook { // the style's card (Theme.cardPart), a plate inside the section's
+        anchors.fill: parent
+        part: Theme.cardPart
+        corner: Theme.controlRadius
+        extra: ({ inset: true })
+        dpr: entry.dpr
+    }
 
     // Offsets, gaps and the heights of the lines of text on whole device
     // pixels, so that the keycaps, the button and the progress line below
@@ -99,7 +110,7 @@ Rectangle {
                         textFormat: Text.PlainText
                         color: Theme.text
                         font.pixelSize: Theme.fontBody
-                        font.weight: Font.DemiBold
+                        font.weight: Theme.fontStrong
                         elide: Text.ElideRight
                         width: Math.min(implicitWidth, parent.width - versionText.width - 8)
                         height: Theme.snapUp(implicitHeight, entry.dpr)
@@ -112,6 +123,15 @@ Rectangle {
                         color: Theme.faint
                         font.pixelSize: Theme.fontCaption
                     }
+                }
+                Text {
+                    objectName: "pluginReviewLabel"
+                    width: parent.width
+                    text: entry.reviewLabel
+                    textFormat: Text.PlainText
+                    color: entry.unreviewed ? Theme.caution : Theme.subtext
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
                 }
                 Text { // what it does
                     width: parent.width
@@ -140,22 +160,27 @@ Rectangle {
                     Repeater {
                         model: entry.keywords
 
-                        delegate: Rectangle { // as keys to press (PluginCard's)
+                        delegate: Item { // as keys to press (PluginCard's)
                             id: keycap
 
                             required property string modelData
 
                             width: Theme.snapUp(Math.max(28, keycapText.implicitWidth + 14), entry.dpr)
                             height: 24
-                            radius: Theme.controlRadius
-                            color: Theme.keycap
 
+                            Hook { // the style's key cap (Theme.keyHint): it only tells
+                                id: keycapPart
+                                anchors.fill: parent
+                                part: Theme.keyHint
+                                dpr: entry.dpr
+                            }
                             Text {
                                 id: keycapText
                                 anchors.centerIn: parent
+                                anchors.verticalCenterOffset: keycapPart.out("contentOffsetY", 0)
                                 text: keycap.modelData
                                 textFormat: Text.PlainText
-                                color: Theme.text
+                                color: keycapPart.out("foreground", Theme.text)
                                 font.pixelSize: Theme.fontCaption
                             }
                         }
@@ -170,47 +195,7 @@ Rectangle {
                         font.pixelSize: Theme.fontCaption
                     }
                 }
-                Flow { // what it may do
-                    width: parent.width
-                    spacing: 12
 
-                    Text {
-                        width: Theme.snapUp(implicitWidth, entry.dpr)
-                        height: 20
-                        verticalAlignment: Text.AlignVCenter
-                        text: entry.permissions.length > 0 ? qsTr("权限") : qsTr("不需要额外的权限")
-                        color: Theme.faint
-                        font.pixelSize: Theme.fontCaption
-                    }
-                    Repeater {
-                        model: entry.permissions
-
-                        delegate: Row { // the riskiest with a warning, in the caution colour
-                            id: permission
-
-                            required property var modelData
-
-                            height: 20
-                            spacing: 4
-
-                            Glyph {
-                                anchors.verticalCenter: parent.verticalCenter
-                                visible: permission.modelData.risky
-                                glyph: "" // Warning
-                                size: 12
-                                color: Theme.caution
-                            }
-                            Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                width: Theme.snapUp(implicitWidth, entry.dpr)
-                                text: permission.modelData.text
-                                textFormat: Text.PlainText
-                                color: permission.modelData.risky ? Theme.caution : Theme.subtext
-                                font.pixelSize: Theme.fontCaption
-                            }
-                        }
-                    }
-                }
             }
 
             Row { // what it is here, and what can be done
@@ -221,7 +206,8 @@ Rectangle {
                 Text {
                     y: Theme.snap((32 - height) / 2, entry.dpr) // across from the button, there or not
                     visible: text.length > 0
-                    text: entry.busy ? "" : entry.stage === "installed" ? qsTr("已安装 %1").arg(entry.installedVersion)
+                    text: entry.busy ? "" : entry.waiting ? qsTr("重启 Win顺 后更新到 %1").arg(entry.staged)
+                                        : entry.stage === "installed" ? qsTr("已安装 %1").arg(entry.installedVersion)
                                         : entry.stage === "bundled" ? qsTr("随 Win顺 自带")
                                         : entry.stage === "update" ? qsTr("已装 %1").arg(entry.installedVersion)
                                         : ""
@@ -230,23 +216,79 @@ Rectangle {
                     font.pixelSize: Theme.fontCaption
                 }
                 FlatButton {
+                    dpr: entry.dpr
+                    objectName: "installPlugin-" + entry.pluginId
                     visible: entry.busy || entry.stage !== "bundled" // nothing to do with one that comes with Win顺
                     implicitHeight: 32
                     text: entry.busy ? qsTr("取消")
-                        : entry.stage === "install" ? qsTr("安装")
+                        : entry.waiting ? qsTr("立即更新")
+                        : entry.stage === "install" ? qsTr("安装并启用")
                         : entry.stage === "update" ? qsTr("更新到 %1").arg(entry.version)
                         : entry.stage === "app" ? qsTr("需要更新 Win顺")
                         : qsTr("查看")
-                    highlighted: entry.installable && !entry.busy
+                    highlighted: entry.installable && !entry.busy && !entry.waiting
                     // One download at a time; a newer Win顺 first.
                     enabled: entry.busy || (entry.installable ? !entry.gallery.downloading : entry.stage !== "app")
                     onClicked: {
                         if (entry.busy)
                             entry.gallery.cancel(entry.pluginId)
+                        else if (entry.waiting)
+                            entry.gallery.applyNow(entry.pluginId)
+                        else if (entry.stage === "install")
+                            entry.gallery.installAndEnable(entry.pluginId)
                         else if (entry.installable)
                             entry.gallery.install(entry.pluginId)
                         else
                             entry.showInstalled()
+                    }
+                }
+            }
+        }
+
+        Flow { // what it may do
+            id: permissionsFlow
+            x: texts.x
+            width: body.width - x
+            spacing: 12
+
+            Text {
+                width: Math.min(Theme.snapUp(implicitWidth, entry.dpr), permissionsFlow.width)
+                height: Math.max(20, Theme.snapUp(implicitHeight, entry.dpr))
+                verticalAlignment: Text.AlignVCenter
+                text: entry.permissions.length > 0 ? qsTr("权限") : qsTr("不需要额外的权限")
+                color: Theme.faint
+                font.pixelSize: Theme.fontCaption
+                wrapMode: Text.Wrap
+            }
+            Repeater {
+                model: entry.permissions
+
+                delegate: Row { // the riskiest with a warning, in the caution colour
+                    id: permission
+
+                    required property var modelData
+
+                    height: Math.max(20, permissionText.implicitHeight)
+                    spacing: 4
+
+                    Glyph {
+                        id: permissionWarning
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: permission.modelData.risky
+                        glyph: "" // Warning
+                        size: 12
+                        color: Theme.caution
+                    }
+                    Text {
+                        id: permissionText
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Math.min(Theme.snapUp(implicitWidth, entry.dpr),
+                            Math.max(0, permissionsFlow.width - (permission.modelData.risky ? permissionWarning.width + permission.spacing : 0)))
+                        text: permission.modelData.text
+                        textFormat: Text.PlainText
+                        color: permission.modelData.risky ? Theme.caution : Theme.subtext
+                        font.pixelSize: Theme.fontCaption
+                        wrapMode: Text.Wrap
                     }
                 }
             }
@@ -285,6 +327,7 @@ Rectangle {
             width: parent.width
             text: entry.problem.length > 0 ? entry.problem
                 : entry.stage === "app" ? qsTr("要 Win顺 %1 或更新的版本，可以在“高级”里检查更新").arg(entry.minWinShun)
+                : entry.stage === "update" && entry.morePermissions.length > 0 ? qsTr("新版本要更多权限：%1，更新时会问你").arg(entry.morePermissions)
                 : ""
             textFormat: Text.PlainText
             color: entry.problem.length > 0 ? Theme.danger : Theme.caution

@@ -13,11 +13,17 @@ Item {
     property string kind // permissions | install | uninstall
     property var info: ({})
     property bool open: false
+    readonly property real dpr: Screen.devicePixelRatio
     property bool animated: true // false: shown at once (the offscreen preview, which renders no frames between)
+    property bool fitToWindow: false // the first-run window can be shorter than the permissions list
+    // 更新并允许: an upgrade of a plugin that is on, whose new version asks for more (the permissions shown, the new ones marked).
+    readonly property bool allowing: kind === "install" && info.allow === true
+    readonly property bool listsPermissions: kind === "permissions" || allowing
 
     function ask(what, details) {
         kind = what
         info = details
+        dialogScroll.contentY = 0
         open = true
         card.forceActiveFocus()
     }
@@ -37,7 +43,7 @@ Item {
         if (kind === "permissions")
             plugins.declineEnable(info.id)
         else if (kind === "install")
-            plugins.cancelInstall()
+            plugins.declineInstall()
         close()
     }
 
@@ -54,7 +60,7 @@ Item {
 
     Rectangle { // dims the window; clicks stay out of it
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, Theme.dark ? 0.5 : 0.3)
+        color: Theme.tok("scrim", Qt.rgba(0, 0, 0, Theme.dark ? 0.5 : 0.3))
 
         MouseArea {
             anchors.fill: parent
@@ -64,16 +70,13 @@ Item {
         }
     }
 
-    Rectangle {
+    Item {
         id: card
+        objectName: "pluginDialogCard"
 
         anchors.centerIn: parent
         width: Math.min(560, parent.width - 48)
-        height: content.implicitHeight + 48
-        radius: Theme.largeCardRadius
-        color: Theme.menuBackground
-        border.width: 1
-        border.color: Theme.windowEdge
+        height: dialog.fitToWindow || dialog.info.unreviewed === true ? Math.min(content.implicitHeight + 48, dialog.height - 32) : content.implicitHeight + 48
         scale: dialog.open ? 1 : 0.96
         Behavior on scale { enabled: dialog.animated; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
@@ -89,185 +92,266 @@ Item {
                 primary.clicked()
         }
 
+        Hook { // the style's floating box (Theme.menuFrame)
+            anchors.fill: parent
+            part: Theme.menuFrame
+            dpr: dialog.dpr
+        }
+
         MouseArea { anchors.fill: parent } // a click on the card does not reach the dimmer
 
-        Column {
-            id: content
+        Flickable {
+            id: dialogScroll
+            objectName: "pluginDialogScroll"
             x: 24
             y: 24
             width: parent.width - 48
-            spacing: 14
+            height: parent.height - 48
+            contentWidth: width
+            contentHeight: content.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.VerticalFlick
 
-            Text {
-                width: parent.width
-                text: dialog.kind === "permissions"
-                      ? (dialog.info.more ? qsTr("“%1” 的新版本要更多权限").arg(dialog.info.name) : qsTr("打开“%1”？").arg(dialog.info.name))
-                    : dialog.kind === "install"
-                      ? (dialog.info.same ? qsTr("重新安装“%1”？").arg(dialog.info.name)
-                       : dialog.info.downgrade ? qsTr("把“%1”换成旧版本？").arg(dialog.info.name)
-                       : qsTr("升级“%1”？").arg(dialog.info.name))
-                    : qsTr("卸载“%1”？").arg(dialog.info.name)
-                textFormat: Text.PlainText
-                color: Theme.text
-                font.pixelSize: Theme.fontTitle
-                font.weight: Font.DemiBold
-                wrapMode: Text.Wrap
-            }
+            Column {
+                id: content
+                width: dialogScroll.width
+                spacing: 14
 
-            Text { // who made it, where it came from
-                visible: dialog.kind === "permissions"
-                width: parent.width
-                text: [dialog.info.version ? qsTr("版本 %1").arg(dialog.info.version) : "",
-                       dialog.info.author ? qsTr("作者 %1").arg(dialog.info.author) : "",
-                       dialog.info.source ?? ""].filter(s => s.length > 0).join(" · ")
-                      + (dialog.info.homepage ? "\n" + dialog.info.homepage : "")
-                textFormat: Text.PlainText
-                color: Theme.subtext
-                font.pixelSize: Theme.fontCaption
-                wrapMode: Text.Wrap
-            }
+                Text {
+                    width: parent.width
+                    text: dialog.kind === "permissions"
+                          ? (dialog.info.more ? qsTr("“%1” 的新版本要更多权限").arg(dialog.info.name) : qsTr("打开“%1”？").arg(dialog.info.name))
+                        : dialog.allowing ? qsTr("“%1” 的新版本要更多权限").arg(dialog.info.name)
+                        : dialog.kind === "install"
+                          ? (dialog.info.newInstall ? qsTr("安装“%1”？").arg(dialog.info.name)
+                           : dialog.info.same ? qsTr("重新安装“%1”？").arg(dialog.info.name)
+                           : dialog.info.downgrade ? qsTr("把“%1”换成旧版本？").arg(dialog.info.name)
+                           : qsTr("升级“%1”？").arg(dialog.info.name))
+                        : qsTr("卸载“%1”？").arg(dialog.info.name)
+                    textFormat: Text.PlainText
+                    color: Theme.text
+                    font.pixelSize: Theme.fontTitle
+                    font.weight: Theme.fontStrong
+                    wrapMode: Text.Wrap
+                }
 
-            Text {
-                visible: dialog.kind === "install"
-                width: parent.width
-                text: qsTr("已装的是 %1，要装的是 %2。它的设置和关键字保留；装好后如果它要的权限变多，打开时会再问一次。")
-                      .arg(dialog.info.installedVersion ?? "").arg(dialog.info.newVersion ?? "")
-                color: Theme.subtext
-                font.pixelSize: Theme.fontCaption
-                wrapMode: Text.Wrap
-                lineHeight: 1.15
-            }
+                Text { // who made it, where it came from
+                    visible: dialog.kind === "permissions"
+                    width: parent.width
+                    text: [dialog.info.version ? qsTr("版本 %1").arg(dialog.info.version) : "",
+                           dialog.info.author ? qsTr("作者 %1").arg(dialog.info.author) : "",
+                           dialog.info.source ?? ""].filter(s => s.length > 0).join(" · ")
+                          + (dialog.info.homepage ? "\n" + dialog.info.homepage : "")
+                    textFormat: Text.PlainText
+                    color: Theme.subtext
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
+                }
 
-            Text {
-                visible: dialog.kind === "uninstall"
-                width: parent.width
-                text: dialog.info.hasData
-                      ? qsTr("它的文件夹、设置和保存的密码会删掉。它自己的数据（%1.data）也一起删吗？").arg(dialog.info.id ?? "")
-                      : qsTr("它的文件夹、设置和保存的密码会删掉。")
-                color: Theme.subtext
-                font.pixelSize: Theme.fontCaption
-                wrapMode: Text.Wrap
-                lineHeight: 1.15
-            }
+                Text {
+                    visible: dialog.kind === "install"
+                    width: parent.width
+                    text: dialog.info.newInstall ? qsTr("将安装 %1；启用前仍需确认它申请的权限。").arg(dialog.info.newVersion ?? "")
+                        : dialog.allowing
+                          ? qsTr("已装的是 %1，要装的是 %2。新版本还要下面标出的权限；不同意的话，已装的版本照常用。")
+                              .arg(dialog.info.installedVersion ?? "").arg(dialog.info.newVersion ?? "")
+                          : qsTr("已装的是 %1，要装的是 %2。它的设置和关键字保留；装好后如果它要的权限变多，打开时会再问一次。")
+                          .arg(dialog.info.installedVersion ?? "").arg(dialog.info.newVersion ?? "")
+                    color: Theme.subtext
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
+                    lineHeight: 1.15
+                }
 
-            Rectangle { // the permissions, one per line
-                visible: dialog.kind === "permissions"
-                width: parent.width
-                height: permissionList.implicitHeight + 16
-                radius: Theme.cardRadius
-                color: Theme.hover
-                border.width: 1
-                border.color: Theme.cardBorder
+                Text {
+                    objectName: "unreviewedPluginWarning"
+                    visible: dialog.kind === "install" && dialog.info.unreviewed === true
+                    width: parent.width
+                    text: qsTr("这是未审核的原生插件，包含可执行程序或动态库。校验值只能核对下载是否完整，不代表代码安全。请自行查看来源并判断是否信任；此类插件每次更新都需要确认。")
+                        + (dialog.info.homepage ? "\n" + dialog.info.homepage : "")
+                    textFormat: Text.PlainText
+                    color: Theme.caution
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
+                }
 
-                Column {
-                    id: permissionList
-                    x: 12
-                    y: 8
-                    width: parent.width - 24
-                    spacing: 4
+                Text {
+                    visible: dialog.kind === "uninstall"
+                    width: parent.width
+                    text: dialog.info.keepSettings === true
+                          ? qsTr("卸载网页搜索插件后，网站、关键词和图标会保留，重新安装后可继续使用。")
+                          : dialog.info.hasData
+                          ? qsTr("它的文件夹、设置和保存的密码会删掉。它自己的数据（%1.data）也一起删吗？").arg(dialog.info.id ?? "")
+                          : qsTr("它的文件夹、设置和保存的密码会删掉。")
+                    color: Theme.subtext
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
+                    lineHeight: 1.15
+                }
 
-                    Repeater {
-                        model: dialog.kind === "permissions" ? (dialog.info.permissions ?? []) : []
+                Rectangle { // the permissions, one per line
+                    visible: dialog.listsPermissions
+                    width: parent.width
+                    height: permissionList.implicitHeight + 16
+                    radius: Theme.cardRadius
+                    color: Theme.hover
+                    border.width: 1
+                    border.color: Theme.cardBorder
 
-                        delegate: Item {
-                            id: permissionRow
+                    Column {
+                        id: permissionList
+                        x: 12
+                        y: 8
+                        width: parent.width - 24
+                        spacing: 4
 
-                            required property var modelData
-                            readonly property bool isNew: (dialog.info.newNames ?? []).indexOf(modelData.name) >= 0 && dialog.info.more === true
+                        Repeater {
+                            model: dialog.listsPermissions ? (dialog.info.permissions ?? []) : []
 
-                            // A line of 26; a long sentence (the sandbox's) wraps, the
-                            // tick or tag staying on its first line.
-                            width: parent.width
-                            height: Math.max(26, permissionText.implicitHeight + 8)
+                            delegate: Item {
+                                id: permissionRow
 
-                            Glyph { // enforced by Windows: a tick
-                                x: 14
-                                y: Math.round((26 - height) / 2)
-                                visible: permissionRow.modelData.enforced
-                                glyph: "" // CheckMark
-                                size: 12
-                                color: Theme.success
-                            }
-                            Rectangle { // declared only: Win顺 cannot hold the plugin to it
-                                id: declaredTag
-                                x: 2
-                                y: 4
-                                visible: !permissionRow.modelData.enforced
-                                width: declaredText.implicitWidth + 10
-                                height: 18
-                                radius: Theme.smallControlRadius
-                                color: "transparent"
-                                border.width: 1
-                                border.color: Theme.controlBorder
+                                required property var modelData
+                                readonly property bool isNew: (dialog.info.newNames ?? []).indexOf(modelData.name) >= 0 && dialog.info.more === true
 
-                                Text {
-                                    id: declaredText
-                                    anchors.centerIn: parent
-                                    text: qsTr("仅声明")
-                                    color: Theme.subtext
-                                    font.pixelSize: 11
+                                // A line of 26; a long sentence (the sandbox's) wraps, the
+                                // tick or tag staying on its first line.
+                                width: parent.width
+                                height: Math.max(26, permissionText.implicitHeight + 8)
+
+                                Glyph { // enforced by Windows: a tick
+                                    x: 14
+                                    y: Math.round((26 - height) / 2)
+                                    visible: permissionRow.modelData.enforced
+                                    glyph: "" // CheckMark
+                                    size: 12
+                                    color: Theme.success
                                 }
-                            }
-                            Text {
-                                id: permissionText
-                                anchors.left: parent.left
-                                // After the tag when it is wider than the usual margin (English).
-                                anchors.leftMargin: declaredTag.visible ? Math.max(60, declaredTag.x + declaredTag.width + 8) : 60
-                                anchors.right: parent.right
-                                y: 4
-                                text: permissionRow.modelData.text
-                                      + (permissionRow.modelData.note.length > 0 ? "（" + permissionRow.modelData.note + "）" : "")
-                                      + (permissionRow.isNew ? qsTr("（新增）") : "")
-                                textFormat: Text.PlainText
-                                color: permissionRow.isNew ? Theme.accent : Theme.text
-                                font.pixelSize: Theme.fontCaption
-                                wrapMode: Text.Wrap
-                                lineHeight: 1.15
+                                Rectangle { // declared only: Win顺 cannot hold the plugin to it
+                                    id: declaredTag
+                                    x: 2
+                                    y: 4
+                                    visible: !permissionRow.modelData.enforced
+                                    width: declaredText.implicitWidth + 10
+                                    height: 18
+                                    radius: Theme.smallControlRadius
+                                    color: "transparent"
+                                    border.width: 1
+                                    border.color: Theme.controlBorder
+
+                                    Text {
+                                        id: declaredText
+                                        anchors.centerIn: parent
+                                        text: qsTr("仅声明")
+                                        color: Theme.subtext
+                                        font.pixelSize: 11
+                                    }
+                                }
+                                Text {
+                                    id: permissionText
+                                    anchors.left: parent.left
+                                    // After the tag when it is wider than the usual margin (English).
+                                    anchors.leftMargin: declaredTag.visible ? Math.max(60, declaredTag.x + declaredTag.width + 8) : 60
+                                    anchors.right: parent.right
+                                    y: 4
+                                    text: permissionRow.modelData.text
+                                          + (permissionRow.modelData.note.length > 0 ? "（" + permissionRow.modelData.note + "）" : "")
+                                          + (permissionRow.isNew ? qsTr("（新增）") : "")
+                                    textFormat: Text.PlainText
+                                    color: permissionRow.isNew ? Theme.accent : Theme.text
+                                    font.pixelSize: Theme.fontCaption
+                                    wrapMode: Text.Wrap
+                                    lineHeight: 1.15
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            Text { // the plugin design, §3.3: what is enforced and what is only said
-                visible: dialog.kind === "permissions"
-                width: parent.width
-                text: dialog.plugins.permissionsNote()
-                color: Theme.subtext
-                font.pixelSize: Theme.fontCaption
-                wrapMode: Text.Wrap
-                lineHeight: 1.15
-            }
-
-            Item {
-                width: parent.width
-                height: primary.implicitHeight
-
-                FlatButton { // uninstall: the plugin alone, its data kept
-                    visible: dialog.kind === "uninstall" && dialog.info.hasData === true
-                    anchors.left: parent.left
-                    flat: true
-                    text: qsTr("只删插件，留下数据")
-                    onClicked: dialog.accept(false)
+                Text { // the plugin design, §3.3: what is enforced and what is only said
+                    visible: dialog.listsPermissions
+                    width: parent.width
+                    text: dialog.plugins.permissionsNote()
+                    color: Theme.subtext
+                    font.pixelSize: Theme.fontCaption
+                    wrapMode: Text.Wrap
+                    lineHeight: 1.15
                 }
 
-                Row {
-                    anchors.right: parent.right
-                    spacing: 8
+                Item {
+                    width: parent.width
+                    height: primary.implicitHeight
 
                     FlatButton {
-                        text: qsTr("取消")
-                        onClicked: dialog.reject()
+                        objectName: "pluginInstallSource"
+                        dpr: dialog.dpr
+                        visible: dialog.kind === "install" && dialog.info.unreviewed === true && dialog.info.sourceAvailable === true
+                        anchors.left: parent.left
+                        role: "dialog"
+                        flat: true
+                        text: qsTr("查看来源")
+                        onClicked: dialog.plugins.openInstallSource()
                     }
-                    FlatButton {
-                        id: primary
-                        highlighted: true
-                        text: dialog.kind === "permissions" ? qsTr("打开")
-                            : dialog.kind === "install" ? qsTr("安装")
-                            : dialog.info.hasData === true ? qsTr("连数据一起删") : qsTr("卸载")
-                        onClicked: dialog.accept(true)
+
+                    FlatButton { // uninstall: the plugin alone, its data kept
+                        dpr: dialog.dpr
+                        visible: dialog.kind === "uninstall" && dialog.info.hasData === true && dialog.info.keepSettings !== true
+                        anchors.left: parent.left
+                        role: "dialog"
+                        flat: true
+                        text: qsTr("只删插件，留下数据")
+                        onClicked: dialog.accept(false)
+                    }
+
+                    Row {
+                        anchors.right: parent.right
+                        spacing: 8
+
+                        FlatButton {
+                            dpr: dialog.dpr
+                            role: "dialog"
+                            text: qsTr("取消")
+                            onClicked: dialog.reject()
+                        }
+                        FlatButton {
+                            dpr: dialog.dpr
+                            id: primary
+                            objectName: "pluginDialogAccept"
+                            role: "dialog"
+                            highlighted: true
+                            text: dialog.kind === "permissions" ? qsTr("打开")
+                                : dialog.allowing ? qsTr("更新并允许")
+                                : dialog.kind === "install" ? (dialog.info.unreviewed === true ? qsTr("仍要安装") : qsTr("安装"))
+                                : dialog.info.hasData === true && dialog.info.keepSettings !== true ? qsTr("连数据一起删") : qsTr("卸载")
+                            onClicked: dialog.accept(dialog.info.keepSettings !== true)
+                        }
                     }
                 }
+            }
+        }
+        ListScrollBar {
+            dpr: dialog.dpr
+            visible: (dialog.fitToWindow || dialog.info.unreviewed === true) && dialogScroll.contentHeight > dialogScroll.height
+            x: parent.width - width - 3
+            y: 24
+            height: dialogScroll.height
+            flickable: dialogScroll
+        }
+        Connections {
+            target: dialog.Window.window
+            function onActiveFocusItemChanged() {
+                const item = dialog.Window.window.activeFocusItem
+                let owner = item
+                while (owner && owner !== content)
+                    owner = owner.parent
+                if (owner !== content)
+                    return
+                const point = item.mapToItem(content, 0, 0)
+                if (point.y < dialogScroll.contentY)
+                    dialogScroll.contentY = Math.max(0, point.y - 8)
+                else if (point.y + item.height > dialogScroll.contentY + dialogScroll.height)
+                    dialogScroll.contentY = Math.min(Math.max(0, dialogScroll.contentHeight - dialogScroll.height), point.y + item.height - dialogScroll.height + 8)
             }
         }
     }

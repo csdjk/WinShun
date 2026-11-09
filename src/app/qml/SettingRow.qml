@@ -12,8 +12,10 @@ Item {
 
     property string title
     property string description
+    property bool sub: false
+    property string tip: ""
     // Long segmented choices go below the explanation when they would squeeze it.
-    property bool stackControl: false
+    property bool stackControl: trailingRow.implicitWidth > content.width * 0.66
     default property alias trailing: trailingRow.data
     property alias body: bodyColumn.data
     property bool bodyShown: true // false: no room is kept for a body with nothing to show now
@@ -21,8 +23,8 @@ Item {
     // away, or on a Windows without it. Not `visible`, which the row decides
     // while searching.
     property bool shown: true
-    property var keywords: [] // other words people look for it by
-    property var values: [] // what the user filled in, so that it can be found by that too
+    property list<string> keywords // other words people look for it by
+    property list<string> values // what the user filled in, so that it can be found by that too
     // Rows that show only while this one is on: found while it is off, they
     // bring this one up instead.
     property list<Item> unlocks
@@ -33,8 +35,11 @@ Item {
     readonly property SettingsSearch search: section ? section.search : null
     readonly property bool searching: search !== null && search.active
     // The labels on the controls: the choices of a ScopeTabs, the words on
-    // buttons.
+    // buttons. Read only while searching ([] otherwise: not worked out for
+    // every row as it is made).
     readonly property var options: {
+        if (!searching)
+            return []
         const labels = []
         for (let i = 0; i < trailingRow.children.length; ++i) {
             const control = trailingRow.children[i]
@@ -45,9 +50,9 @@ Item {
         }
         return labels
     }
-    // Its page's title and other words for the page, its section's title.
+    // Its page's title and other words for the page, its section's title (only while searching).
     readonly property var context: {
-        if (!section)
+        if (!section || !searching)
             return []
         const page = section.pageInfo
         const words = page ? [page.title].concat(section.pageKeywords) : []
@@ -59,7 +64,7 @@ Item {
     readonly property var hit: searching
                                ? search.match(search.revision, {
                                      title: row.title,
-                                     description: row.description,
+                                     description: row.tip.length > 0 ? (row.description.length > 0 ? row.description + " · " + row.tip : row.tip) : row.description,
                                      keywords: row.keywords,
                                      options: row.options,
                                      context: row.context,
@@ -83,10 +88,10 @@ Item {
     readonly property int score: !searching || !shown ? -1 : found ? hit.score : unlocked.length > 0 ? 1 : -1
 
     // Whether `value` (one of `values`) has a word typed in it.
-    function valueFound(value) { return found && hit.values.indexOf(value) >= 0 }
+    function valueFound(value: string): bool { return found && hit.values.indexOf(value) >= 0 }
 
     // Where it stands among the rows: by section, then within its section.
-    function orderKey() {
+    function orderKey(): int {
         // A list property is no array: Array.prototype.indexOf finds nothing in it.
         const indexIn = (list, item) => {
             for (let i = 0; i < list.length; ++i) {
@@ -128,34 +133,50 @@ Item {
     onScoreChanged: if (search) search.report(row, section, section.page, score)
 
     width: parent ? parent.width : 0
+    // The section's (the window's, SettingsWindow.dpr), not a Screen attached
+    // object per item: each one is work on every move to another monitor
+    // (GitHub #111; docs/pitfalls.md).
+    readonly property real dpr: section ? section.dpr : Screen.devicePixelRatio
     // On whole device pixels, so that the rows below, and the card's bottom edge, stay on them.
-    readonly property real edge: Theme.edge(Screen.devicePixelRatio)
-    implicitHeight: Theme.snap(content.implicitHeight + 28, Screen.devicePixelRatio)
+    readonly property real edge: Theme.edge(row.dpr)
+    readonly property int leftInset: row.sub ? 36 : 18
+    implicitHeight: Theme.snap(content.implicitHeight + (row.sub ? 22 : 28), row.dpr)
     visible: shown && (!searching || score >= 0)
 
-    Rectangle { // separates rows inside a card
-        visible: row.y > 0
-        x: row.edge // inside the card's border, not over it
-        width: parent.width - 2 * row.edge
+    Hook { // separates rows inside a card (Theme.separator); the first row has none above it
+        x: row.sub ? row.leftInset : row.edge
+        width: parent.width - x - row.edge
         height: row.edge
-        color: Theme.cardBorder
+        part: row.y > 0 ? Theme.separator : null
+        extra: ({ card: true })
+        orientation: Qt.Horizontal
+        dpr: row.dpr
     }
 
-    Rectangle { // the option Enter goes to, while searching
-        visible: row.searching && row.search.current === row
+    HoverHandler { id: rowHover }
+    readonly property bool hovered: rowHover.hovered // for controls shown only then
+
+    // Under the pointer, or the option Enter goes to while searching: the
+    // style's highlight (Theme.rowHighlight), made on the first need only.
+    readonly property bool current: searching && search.current === row
+    Hook {
         anchors.fill: parent
         anchors.margins: row.edge
-        radius: Theme.insetCardRadius
-        color: Theme.selection
+        part: rowHover.hovered || row.current ? Theme.rowHighlight : null
+        hovered: rowHover.hovered
+        selected: row.current
+        role: "panel"
+        dpr: row.dpr
+    }
 
-        Rectangle {
-            x: 3
-            y: content.y + texts.y + (titleText.height - height) / 2 // by the title
-            width: 3
-            height: 16
-            radius: Theme.smallRadius
-            color: Theme.accent
-        }
+    Rectangle {
+        visible: row.sub
+        x: 20
+        y: Theme.snap(8, row.dpr)
+        width: 2
+        height: Theme.snap(Math.max(0, parent.height - 2 * y), row.dpr)
+        radius: Theme.lineRadius
+        color: Theme.tok("subRowBar", Qt.alpha(Theme.accent, Theme.dark ? 0.40 : 0.32)) // a style may keep it neutral
     }
 
     Rectangle { // see flash()
@@ -183,9 +204,9 @@ Item {
 
     Column {
         id: content
-        x: 18
-        y: 14
-        width: parent.width - 36
+        x: row.leftInset
+        y: row.sub ? 11 : 14
+        width: parent.width - row.leftInset - 18
         spacing: 12
 
         Item {
@@ -193,26 +214,66 @@ Item {
             width: parent.width
             height: Theme.snapUp(row.stackControl
                     ? texts.implicitHeight + (trailingRow.implicitHeight > 0 ? trailingRow.implicitHeight + 12 : 0)
-                    : Math.max(texts.implicitHeight, trailingRow.implicitHeight), Screen.devicePixelRatio)
+                    : Math.max(texts.implicitHeight, trailingRow.implicitHeight), row.dpr)
 
             Column {
                 id: texts
                 anchors.left: parent.left
                 anchors.right: row.stackControl ? parent.right : trailingRow.left
-                anchors.rightMargin: row.stackControl ? 0 : 16
-                y: row.stackControl ? 0 : Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio)
+                anchors.rightMargin: row.stackControl || trailingRow.width === 0 ? 0 : Theme.snap(Math.max(24, 88 - trailingRow.width), row.dpr)
+                y: row.stackControl ? 0 : Theme.snap((parent.height - height) / 2, row.dpr)
                 spacing: 3
 
-                Text {
-                    id: titleText
+                Row {
+                    id: titleRow
                     width: parent.width
-                    text: row.found ? row.hit.title : row.title
-                    textFormat: row.found ? Text.StyledText : Text.AutoText
-                    color: Theme.text
-                    font.pixelSize: Theme.fontBody
-                    wrapMode: Text.Wrap
+                    spacing: 6
+
+                    Text {
+                        id: titleText
+                        width: Math.min(implicitWidth, parent.width - (tipBadge.visible ? tipBadge.width + parent.spacing : 0))
+                        text: row.found ? row.hit.title : row.title
+                        textFormat: row.found ? Text.StyledText : Text.AutoText
+                        color: Theme.text
+                        font.pixelSize: Theme.fontBody
+                        wrapMode: Text.Wrap
+                    }
+
+                    Loader { // made on the few rows with a tip only, not on every row
+                        id: tipBadge
+                        active: row.tip.length > 0
+                        visible: row.tip.length > 0 && !row.searching
+                        width: 20
+                        height: 20
+                        anchors.verticalCenter: titleText.lineCount <= 1 ? titleText.verticalCenter : undefined
+                        y: titleText.lineCount > 1 ? 2 : 0
+
+                        sourceComponent: Item {
+                            Glyph {
+                                anchors.centerIn: parent
+                                glyph: "\uE946"
+                                size: 13
+                                color: tipArea.containsMouse ? Theme.accent : Theme.subtext
+                            }
+
+                            MouseArea {
+                                id: tipArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                            }
+
+                            HoverTip {
+                                target: tipArea.containsMouse ? tipBadge : null
+                                text: row.tip
+                                delay: 150
+                            }
+                        }
+                    }
                 }
+
                 Text {
+                    id: descriptionText
                     width: parent.width
                     visible: text.length > 0
                     text: row.found ? row.hit.description : row.description
@@ -234,9 +295,11 @@ Item {
 
             Row {
                 id: trailingRow
-                anchors.left: row.stackControl ? parent.left : undefined
-                anchors.right: row.stackControl ? undefined : parent.right
-                y: row.stackControl ? texts.implicitHeight + 12 : Theme.snap((parent.height - height) / 2, Screen.devicePixelRatio)
+                // Placed by x, not by switching anchors: for a moment both
+                // anchors would hold, which sets the Row's width for good
+                // (then wider than its controls, squeezing the texts).
+                x: row.stackControl ? 0 : parent.width - width
+                y: row.stackControl ? texts.implicitHeight + 12 : Theme.snap((parent.height - height) / 2, row.dpr)
                 spacing: 8
             }
         }

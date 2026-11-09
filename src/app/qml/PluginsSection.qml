@@ -11,19 +11,19 @@ import WinShun
 // install or removal shows over the cards.
 SettingsSection {
     id: pluginsSection
+    objectName: "pluginsSection"
 
     required property PluginSettings plugins
     // Rows on the 开发者 tab shown only in developer mode (PluginDevSection.lockedRows).
     property var lockedElsewhere: []
-    // The built-in features drawn as cards here (CaptureCard); null in a
-    // preview without one.
+    // The built-in features drawn as cards here (PasteFileCard, BuiltinCard);
+    // null in a preview without one.
     property SettingsEditor editor: null
-    // A built-in card records a hotkey (SettingsWindow stops the app's hotkeys meanwhile).
-    readonly property bool recordingHotkey: captureCard.item ? captureCard.item.recordingHotkey : false
+    property bool builtinRevealed: false // search navigation may reveal a card without changing the saved preference
 
     // The cards unfolded, by plugin id: here, not in the cards, for the list
-    // is reset (the cards made again) when a plugin comes or goes. For as
-    // long as the window lives; not saved. Assigned whole, for the bindings.
+    // is reset (the cards made again) when a plugin comes or goes. Until the
+    // window is closed (resetForReopen); not saved. Assigned whole, for the bindings.
     property var expandedIds: []
     function setExpanded(pluginId, on) {
         const ids = expandedIds.filter(id => id !== pluginId)
@@ -40,6 +40,7 @@ SettingsSection {
             setExpanded(card.pluginId, true)
     }
 
+    readonly property Item captureCardItem: cardOf("winshun.capture")
     // The card of a plugin, or null (SettingsWindow.showPluginPage).
     function cardOf(pluginId) {
         for (let i = 0; i < cardsRepeater.count; ++i) {
@@ -62,6 +63,19 @@ SettingsSection {
         onTriggered: pluginsSection.revealed = ""
     }
 
+    // The settings window hidden (SettingsWindow.resetForReopen): every card
+    // folded, as in a window made anew; the menus are closed by the window.
+    function resetForReopen() {
+        builtinRevealed = false
+        expandedIds = []
+        revealTimer.stop()
+        revealed = ""
+        for (const loader of pasteCard.parent.children) {
+            if (loader.item && loader.item.expanded === true)
+                loader.item.expanded = false
+        }
+    }
+
     // Counts the cards' changes (a keyword changed, a plugin added), for
     // what the search reads of them to be read again.
     property int listRevision: 0
@@ -73,7 +87,71 @@ SettingsSection {
         function onDataChanged() { pluginsSection.listRevision++ }
     }
 
-    note: qsTr("插件给搜索框加关键字命令，结果混进列表。它们只用你的普通权限；新装的默认关着，打开时会先列出它要的权限。")
+    note: qsTr("插件给搜索框加关键字命令，结果混进列表。它们用你的普通权限（要跟随 Win顺 管理员权限的，权限里会写明）；启用前会先列出权限，由你决定是否开启。")
+
+    SettingRow { // what the number beside 插件 in the list on the left counts: newer versions waiting for a yes
+        objectName: "pluginUpdatesRow"
+        // While 全部更新 runs the count drops one by one (down to 0 before the last one is done): no number then.
+        readonly property bool updating: pluginsSection.plugins.gallery.updatingAll
+        readonly property string explanation: updating || pluginsSection.plugins.gallery.updateStatus.length > 0
+            ? pluginsSection.plugins.gallery.updateStatus
+            : pluginsSection.plugins.gallery.automaticUpdates ? qsTr("需要新权限的更新，会先请你确认。")
+                                                              : qsTr("自动更新已关，新版本等你点更新。")
+        title: updating ? qsTr("正在更新插件…") : qsTr("%n 个插件有新版本", "", pluginsSection.plugins.gallery.updateCount)
+        description: explanation
+        shown: pluginsSection.plugins.gallery.updateCount > 0 || pluginsSection.plugins.gallery.updatingAll
+        onShownChanged: if (shown) pluginsSection.plugins.gallery.readList()
+        Component.onCompleted: if (shown) pluginsSection.plugins.gallery.readList()
+
+        FlatButton {
+            dpr: pluginsSection.dpr
+            objectName: "viewPluginUpdates"
+            text: qsTr("查看")
+            onClicked: {
+                pluginsSection.plugins.gallery.filter = ""
+                pluginsSection.plugins.gallery.updatesOnly = true
+                pluginsSection.column.openPage(pluginsSection.page, 1) // 插件库
+            }
+        }
+        FlatButton {
+            dpr: pluginsSection.dpr
+            objectName: "updateAllFromNotice"
+            visible: pluginsSection.plugins.gallery.updatableCount > 0 || pluginsSection.plugins.gallery.updatingAll
+            highlighted: true
+            text: qsTr("全部更新")
+            enabled: !pluginsSection.plugins.gallery.downloading && !pluginsSection.plugins.gallery.updatingAll
+            onClicked: pluginsSection.plugins.gallery.updateAll()
+        }
+    }
+
+    SettingRow {
+        objectName: "pluginRecoveryRow"
+        title: qsTr("恢复升级前的功能")
+        keywords: qsTr("升级;迁移;恢复;重试;离线;upgrade;restore;retry;offline").split(";")
+        description: pluginsSection.plugins.recoveryMessage
+        shown: pluginsSection.plugins.recoveryMessage.length > 0
+
+        FlatButton {
+            dpr: pluginsSection.dpr
+            objectName: "retryPluginRecovery"
+            text: pluginsSection.plugins.recovering ? qsTr("正在恢复…") : qsTr("重试恢复")
+            enabled: !pluginsSection.plugins.recovering
+            onClicked: pluginsSection.plugins.retryRecovery()
+        }
+
+        body: Flow {
+            width: parent.width
+            spacing: 8
+
+            FlatButton {
+                dpr: pluginsSection.dpr
+                objectName: "installRecoveryArchive"
+                text: qsTr("从本地安装插件包…")
+                enabled: !pluginsSection.plugins.recovering
+                onClicked: pluginsSection.plugins.installFromArchive()
+            }
+        }
+    }
 
     SettingRow { // the plugins cannot see what Explorer signed in to (Runner::TokenSource::Restricted)
         title: qsTr("插件看不到你在资源管理器里登录的网络位置")
@@ -95,6 +173,7 @@ SettingsSection {
         shown: pluginsSection.plugins.message.length > 0
 
         FlatButton {
+            dpr: pluginsSection.dpr
             text: qsTr("知道了")
             flat: true
             onClicked: pluginsSection.plugins.clearMessage()
@@ -104,9 +183,10 @@ SettingsSection {
     // 内置功能 asks for one of the settings of a feature drawn here whose
     // options are on another page: SettingsWindow goes to that row.
     signal settingRequested(string which)
+    signal editWebShortcut(int index, Item button)
 
     // What comes with Win顺 and stays out of the way until wanted, each a
-    // card: the screen capture, 粘贴为文件, and features of other pages
+    // card: 粘贴为文件, and features of other pages
     // whose switch is here too (the same setting). The search finds the
     // row by any card's words, marks the cards they fit and leaves the
     // others out meanwhile (all stay when only the row's own words fit).
@@ -114,10 +194,11 @@ SettingsSection {
     // open_settings does), the row on the feature's own page comes first.
     SettingRow {
         id: builtinRow
+        objectName: "pluginBuiltinsRow"
+        readonly property bool expanded: searching || pluginsSection.builtinRevealed || (pluginsSection.editor?.pluginBuiltinsExpanded ?? false)
+        bodyShown: expanded
 
         // The names and words of the cards, and whether the words searched fit each.
-        readonly property var captureTerms: qsTr("截图;截屏;屏幕截图;PrtScn;Print Screen;放大镜;取色;鼠标;中键;右键;侧键;双击;贴图;识别文字;框选;screenshot;capture;mouse").split(";")
-                                            .concat(captureCard.item ? captureCard.item.searchTerms : [])
         readonly property var pasteTerms: pasteCard.item ? pasteCard.item.searchTerms : []
         readonly property string folderMenuTitle: qsTr("文件夹菜单")
         readonly property var folderMenuTerms: qsTr("双击空白处;收藏的文件夹;最近的文件夹;Listary;folder menu").split(";")
@@ -129,14 +210,13 @@ SettingsSection {
         readonly property var opusTypingTerms: qsTr("Opus;DOpus;直接打字;双栏;type to search").split(";")
         readonly property string dropPieTitle: qsTr("收藏圆盘")
         readonly property var dropPieTerms: qsTr("拖放;拖文件;drag;drop;pie").split(";")
-        readonly property bool captureFound: fits(qsTr("截图"), captureTerms)
         readonly property bool pasteFound: fits(qsTr("粘贴为文件"), pasteTerms)
         readonly property bool folderMenuFound: fits(folderMenuTitle, folderMenuTerms)
         readonly property bool dialogBarFound: fits(dialogBarTitle, dialogBarTerms)
         readonly property bool explorerTypingFound: fits(explorerTypingTitle, explorerTypingTerms)
         readonly property bool opusTypingFound: fits(opusTypingTitle, opusTypingTerms)
         readonly property bool dropPieFound: fits(dropPieTitle, dropPieTerms)
-        readonly property bool anyFound: captureFound || pasteFound || folderMenuFound || dialogBarFound
+        readonly property bool anyFound: pasteFound || folderMenuFound || dialogBarFound
                                          || explorerTypingFound || opusTypingFound || dropPieFound
         function fits(name, terms) {
             return searching && !!search.match(search.revision, { title: name, keywords: terms })
@@ -147,46 +227,50 @@ SettingsSection {
         readonly property real buttonSlot: Math.max(foldMeasure.implicitWidth, linkMeasure.implicitWidth)
 
         title: qsTr("内置功能")
-        keywords: captureTerms.concat(pasteTerms, [folderMenuTitle, dialogBarTitle, explorerTypingTitle, opusTypingTitle, dropPieTitle],
+        keywords: pasteTerms.concat([folderMenuTitle, dialogBarTitle, explorerTypingTitle, opusTypingTitle, dropPieTitle],
                                       folderMenuTerms, dialogBarTerms, explorerTypingTerms, opusTypingTerms, dropPieTerms)
-        values: pluginsSection.editor ? [pluginsSection.editor.captureHotkey] : []
         description: qsTr("随 Win顺 一起提供，用到哪个开哪个；关闭后停止对应功能，暂不支持单独卸载")
         shown: pluginsSection.editor !== null
         onRevealRequested: {
-            if (captureFound && captureCard.item)
-                captureCard.item.revealGroup(captureCard.item.matchedGroup)
+            pluginsSection.builtinRevealed = true
             if (pasteFound && pasteCard.item && pluginsSection.editor.pasteFileEnabled)
                 pasteCard.item.expanded = true
         }
 
+        FlatButton {
+            objectName: "pluginBuiltinsToggle"
+            dpr: pluginsSection.dpr
+            flat: true
+            text: builtinRow.expanded ? qsTr("收起") : qsTr("展开")
+            trailingGlyph: builtinRow.expanded ? "\uE70E" : "\uE70D"
+            enabled: !builtinRow.searching
+            Accessible.name: builtinRow.expanded ? qsTr("收起内置功能") : qsTr("展开内置功能")
+            onClicked: {
+                const expand = !builtinRow.expanded
+                pluginsSection.builtinRevealed = false
+                pluginsSection.editor.pluginBuiltinsExpanded = expand
+            }
+        }
+
         body: Column {
+            objectName: "pluginBuiltinCards"
+            visible: builtinRow.expanded
             width: parent.width
             spacing: 8
 
             FlatButton {
+                dpr: pluginsSection.dpr
                 id: foldMeasure
                 visible: false
                 text: qsTr("收起设置")
                 trailingGlyph: String.fromCharCode(0xE70E)
             }
             FlatButton {
+                dpr: pluginsSection.dpr
                 id: linkMeasure
                 visible: false
                 text: qsTr("更多设置")
                 trailingGlyph: String.fromCharCode(0xE76C)
-            }
-
-            Loader {
-                id: captureCard
-                width: parent.width
-                active: pluginsSection.editor !== null
-                visible: builtinRow.kept(builtinRow.captureFound)
-                sourceComponent: CaptureCard {
-                    editor: pluginsSection.editor
-                    marked: builtinRow.captureFound
-                    search: builtinRow.search
-                    buttonSlot: builtinRow.buttonSlot
-                }
             }
 
             Loader {
@@ -272,10 +356,8 @@ SettingsSection {
                     buttonSlot: builtinRow.buttonSlot
                     glyph: String.fromCharCode(0xE734) // FavoriteStar
                     title: builtinRow.dropPieTitle
-                    description: pluginsSection.editor.isElevated ? qsTr("Win顺 以管理员身份运行时用不了")
-                                 : qsTr("按住文件时按数字 1 左边那个键，收藏的文件夹围着指针弹出，朝哪个拖就放进哪个")
-                    checked: pluginsSection.editor.dropPie && !pluginsSection.editor.isElevated
-                    available: !pluginsSection.editor.isElevated
+                    description: qsTr("按住文件时按数字 1 左边那个键，收藏的文件夹围着指针弹出，朝哪个拖就放进哪个")
+                    checked: pluginsSection.editor.dropPie
                     marked: builtinRow.dropPieFound
                     onToggled: (on) => pluginsSection.editor.dropPie = on
                 }
@@ -285,32 +367,24 @@ SettingsSection {
 
     SettingRow {
         id: listRow
+        objectName: "installedPluginsRow"
 
         title: qsTr("已安装的插件")
         keywords: qsTr("插件;扩展;关键字;命令;安装;plugin;extension").split(";")
         // What the cards hold, to be found by: the names, the commands and
         // their keywords, the titles of the plugins' settings, 给 AI 用.
-        // Read from the model's roles (PluginListModel::Role: NameRole is
-        // UserRole + 2, KeywordsRole + 15, SettingsRole + 17, AiExposeRole + 20).
         values: {
             pluginsSection.listRevision // read again as the cards change
-            const list = pluginsSection.plugins.list
+            if (pluginsSection.editor)
+                pluginsSection.editor.webShortcuts // C++ search terms include the editable sites.
             const found = []
             const add = (value) => {
                 if (value && value.length > 0 && found.indexOf(value) < 0)
                     found.push(value)
             }
             for (let i = 0; i < pluginsSection.plugins.count; ++i) {
-                const index = list.index(i, 0)
-                add(list.data(index, Qt.UserRole + 2))
-                for (const k of list.data(index, Qt.UserRole + 15) ?? []) {
-                    add(k.title)
-                    add(k.keyword)
-                }
-                for (const s of list.data(index, Qt.UserRole + 17) ?? [])
-                    add(s.title)
-                if (list.data(index, Qt.UserRole + 20))
-                    add(qsTr("给 AI 用"))
+                for (const term of pluginsSection.plugins.searchTerms(i))
+                    add(term)
             }
             return found
         }
@@ -319,6 +393,7 @@ SettingsSection {
                      : qsTr("还没有插件：点“添加插件”，或把插件文件夹、.zip / .wsplugin 拖到这里")
 
         FlatButton {
+            dpr: pluginsSection.dpr
             id: addButton
             text: qsTr("添加插件")
             glyph: "" // Add
@@ -365,9 +440,13 @@ SettingsSection {
                         readonly property bool foundInside: listRow.searching
                             && (keywords.some(k => listRow.valueFound(k.title) || listRow.valueFound(k.keyword))
                                 || settings.some(s => listRow.valueFound(s.title))
+                                || (webSearch && pluginsSection.editor && pluginsSection.editor.webShortcuts.some(
+                                    site => listRow.valueFound(site.name) || listRow.valueFound(site.keyword) || listRow.valueFound(site.shownUrl)))
                                 || (aiExpose && listRow.valueFound(qsTr("给 AI 用"))))
 
                         width: cards.width
+                        editor: pluginsSection.editor
+                        onEditWebShortcut: (index, button) => pluginsSection.editWebShortcut(index, button)
                         plugins: pluginsSection.plugins
                         animated: !pluginsSection.plugins.preview
                         expanded: pluginsSection.expandedIds.indexOf(pluginId) >= 0 || foundInside
@@ -417,6 +496,7 @@ SettingsSection {
         description: pluginsSection.plugins.userDir
 
         FlatButton {
+            dpr: pluginsSection.dpr
             text: qsTr("打开")
             glyph: "" // FolderOpen
             onClicked: pluginsSection.plugins.openUserDir()

@@ -107,6 +107,7 @@ public:
         // Ctrl+S, F3 and 完成 on a pin also put the picture in the history.
         std::function<void(const QImage&, const QByteArray& project)> record;
         std::function<void(const QImage&, const QString& path)> save;
+        std::function<QString(QQuickWindow*)> chooseSavePath; // empty path: keep editing
         // F3: a pin of its own, its picture at `origin` (physical).
         std::function<void(const QImage&, const QByteArray& project, QPoint origin)> pin;
         std::function<void(const QImage&, double dpr, const QRect& where)> ocr;
@@ -210,8 +211,19 @@ public:
     Q_INVOKABLE void mouseDoubleClicked(qreal x, qreal y);
     Q_INVOKABLE void wheeled(qreal x, qreal y, int angleDeltaY, int angleDeltaX, int modifiers);
     Q_INVOKABLE bool keyPressed(int key, int modifiers);
+    // The save and pin keys (#187); the text box asks the model, which gets them too.
+    void setKeys(const CaptureKeys& keys)
+    {
+        m_keys = keys;
+        m_model.setKeys(keys);
+    }
+    const CaptureKeys& keys() const { return m_keys; }
     Q_INVOKABLE void spaceHeld(bool held);
-    // The toolbar's buttons: a CaptureSession::Action (Copy 0, Save 1, Cancel 2, Pin 3, Ocr 4).
+    // A save folder was chosen ([Capture] SaveFolder): Save goes straight into it (#194).
+    void setSaveDirect(bool on) { m_model.setSaveDirect(on); }
+    // The toolbar's buttons: a CaptureSession::Action; Save asks for a path
+    // unless a save folder was chosen, SavePrevious uses the configured
+    // folder without a picker, SaveAs always asks.
     Q_INVOKABLE void act(int action);
 
     // ---- the zoom ----
@@ -271,10 +283,12 @@ private:
     QScreen* targetScreen() const;
 
     AnnotationModel m_model;
+    CaptureKeys m_keys;
     Hooks m_hooks;
     PinTarget m_pin;
     QPointer<QQuickWindow> m_window;
     bool m_open = false;
+    bool m_choosingSave = false;
     bool m_ocrAvailable = false;
     Origin m_origin = Origin::Fresh;
     qint64 m_clipId = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CaptureKeys.h"
 #include "Geometry.h"
 #include "PinTools.h"
 #include "SmartRedact.h"
@@ -39,7 +40,7 @@ namespace ws::capture {
 // zoomSteps() (no larger than kZoomBudget pixels of window); a corner dragged
 // zooms freely, the aspect ratio kept; Ctrl+wheel changes the opacity; a
 // double click goes back to 100%; the arrow keys move it a pixel (Shift: ten).
-// R and Shift+R turn it, H and V flip it. T picks text out of it (the words
+// R and Shift+R turn it, H and V flip it (these keys are the user's to change). T picks text out of it (the words
 // are read once, then a drag takes the lines it touches and copies them).
 // Space, or the middle button, collapses it to a small tile; the menu also
 // collapses it to a tab on the top edge of its monitor's work area. While
@@ -56,6 +57,10 @@ public:
         std::function<void(PinWindow*)> save; // Ctrl+S
         std::function<bool()> dark; // the border's grey
         std::function<QColor()> accent; // a fill that carries white words
+        // The 界面风格's (Theme.windowEdge, Theme.controlRadius in logical px);
+        // empty or invalid: the grey by `dark`, 4.
+        std::function<QColor()> edge;
+        std::function<qreal()> pillRadius;
         std::function<void(const QString&)> copyText; // the text picked
         // Reads the lines of the picture (their corners and characters' places,
         // in its pixels); `done` is called on the GUI thread, once, or never.
@@ -102,6 +107,7 @@ public:
     void setShown(bool shown);
     // Out of sight for 隐藏全部贴图, and back; independent of setShown.
     void setAllHidden(bool hidden);
+    void restyle(); // PinManager::restyle
     bool visibleNow() const { return m_shown && !m_allHidden; }
 
     void setTopmost(bool on);
@@ -111,6 +117,8 @@ public:
     void setClickThrough(bool on);
     // What a double click does while it is in full and no text is picked.
     void setDoubleClick(PinDoubleClick action) { m_doubleClick = action; }
+    // The keys the window answers to (#187); the arrows and + / - stay fixed.
+    void setKeys(const CaptureKeys& keys) { m_keys = keys; }
     // The owner's watcher calls this while any pin is click-through: a pin
     // set to click through takes the mouse while `ctrlDown` with `cursor`
     // (physical) over its picture, and lets it go again after (not while it
@@ -163,6 +171,9 @@ private:
     double shownZoom() const { return m_form == PinForm::Full ? m_zoom : 1.0; }
     QRect workArea() const; // of the monitor nearest to the picture
     void drawTextLayer(QImage& canvas, const QRect& picture);
+    void drawHint(QImage& canvas, const QRect& picture); // the zoom or opacity, a moment after it changes
+    void showHint(const QString& text); // (re)starts the moment
+    void hintTick(); // the moment's timer: fades the hint out
     void updatePicked(QPoint cursor);
     void finishEncode(const EncodeJob* job);
     QPoint toImage(QPoint screen) const; // a screen point in the picture's pixels
@@ -187,12 +198,17 @@ private:
     bool m_dragging = false;
     QPoint m_grab; // the cursor less m_origin at the press
     int m_wheel = 0; // wheel delta not yet a whole notch (touchpads)
+    // "150%" in a pill on the picture for a moment after a zoom (#164).
+    QString m_hint;
+    qint64 m_hintSince = 0; // steady clock, ms
+    int m_hintAlpha = 0; // 0: not drawn
     // Dragging a corner: which, and the picture as it was at the press.
     Corner m_corner = Corner::None;
     QRect m_resizeStart;
     // Collapsed: its form, the thumbnail, where it was in full, the encode.
     PinForm m_form = PinForm::Full;
     PinDoubleClick m_doubleClick = PinDoubleClick::Reset;
+    CaptureKeys m_keys;
     bool m_clickOpened = false; // this click opened a tile or tab: its double click does nothing more
     bool m_swallowUp = false; // a double click collapsed it: its button up must not open it again
     QImage m_thumb;

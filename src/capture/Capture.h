@@ -2,6 +2,7 @@
 
 #include "AnnotationFormat.h"
 #include "CaptureDiagnostics.h"
+#include "CaptureHistory.h"
 #include "CaptureSession.h"
 #include "CaptureTools.h"
 #include "CountdownWindow.h"
@@ -23,6 +24,7 @@
 #include <windows.h>
 
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <set>
@@ -45,6 +47,9 @@ void saveImage(std::jthread& thread, QObject* context, const QImage& image, cons
     std::function<void(const QString& path, const QString& error)> done, const QString& folder = {},
     std::shared_ptr<const HdrPixels> hdr = {});
 
+// Native Save As, with an automatically named PNG. Empty means cancelled.
+QString chooseScreenshotSavePath(QQuickWindow* owner);
+
 // The screen capture (docs/design-capture.md; docs/architecture.md, 截图):
 // exists while it is turned on in the settings, and holds everything it
 // needs warm meanwhile, so a hotkey shows the frozen screens in a few
@@ -60,8 +65,9 @@ class Capture : public QObject {
 public:
     struct Callbacks {
         // Enter, a double click, the toolbar. `project`: the annotated
-        // picture's editable form (empty: it has no annotations).
-        std::function<void(const QImage&, const QByteArray& project)> copy;
+        // picture's editable form (empty: it has no annotations). `origin`
+        // identifies this regular capture; a long picture passes an empty id.
+        std::function<void(const QImage&, const QByteArray& project, const QString& origin)> copy;
         // Ctrl+S and F3 also put the picture in the screenshot history,
         // leaving the system clipboard alone.
         std::function<void(const QImage&, const QByteArray& project)> record;
@@ -79,6 +85,12 @@ public:
         // 识别文字并复制 / 搜索 / 网页搜索 (the mouse buttons' choices): read, then go
         // on at once with `then` (OcrCopy, OcrSearch or OcrWeb) without the window.
         std::function<void(const QImage&, double dpr, const QRect& where, CaptureSession::Action then)> ocrThen;
+        // 识别屏幕文字 (triggerOcr, #198): the region picked, to be read and its
+        // words copied; it is in no history and is not the last capture.
+        std::function<void(const QImage&, double dpr, const QRect& where)> readText;
+        // The screens are about to be frozen: what of the app's own is on
+        // them and should not be in the picture goes now.
+        std::function<void()> starting;
         // How the annotation reads the selection's text and what it hides
         // (SmartRedact.h): 智能打码 and its pre-scan.
         Recorder::Hooks recording;
@@ -96,8 +108,13 @@ public:
         std::function<void(const QStringList&, const QRect& where)> qr;
         // The colour format C copies in (hex, rgb, hsl), when Shift alone changes it.
         std::function<void(const QString&)> colorFormatChanged;
+        // The key hints' 不再显示 (false) or 一直显示 (true): [Capture] KeyHints.
+        std::function<void(bool)> keyHintsKept;
         // A fill that carries white words (the countdown's).
         std::function<QColor()> accent;
+        // The countdown's corner, logical px (the 界面风格's menuRadius; 0 in
+        // the 直角 setting); empty: 8.
+        std::function<qreal()> panelRadius;
         // An overlay window was made (named "capture-overlay-<i>"), before it
         // shows: the app watches its graphics (diagnostics).
         std::function<void(QQuickWindow*, const QString& name)> windowCreated;
@@ -115,6 +132,11 @@ public:
     void setPinOnCopy(bool on) { m_session.setPinOnCopy(on); }
     void setMouseActions(const CaptureSession::MouseActions& actions) { m_session.setMouseActions(actions); }
     void setHiddenButtons(const QStringList& ids) { m_session.setHiddenButtons(ids); }
+    // The shortcut hints in a corner of the capture ([Capture] KeyHints).
+    void setKeyHints(bool on) { m_session.setKeyHints(on); }
+    void setKeys(const CaptureKeys& keys) { m_session.setKeys(keys); } // the pin and save keys (#187)
+    // A save folder was chosen: Save goes straight into it, 另存为… asks (#194).
+    void setSaveDirect(bool on) { m_session.setSaveDirect(on); }
     // The mouse cursor drawn into the frozen picture ([Capture] IncludeCursor).
     void setIncludeCursor(bool on) { m_includeCursor = on; }
     // On an HDR monitor, saving writes an HDR file (.jxr) beside the PNG too
@@ -123,6 +145,14 @@ public:
     // UI Automation for the controls that are not child windows ([Capture] ControlsUia).
     void setControlDetection(bool on) { m_uiaEnabled = on; }
     void setColorFormat(ColorFormat format) { m_session.setColorFormat(format); }
+    // 截图历史: each capture taken keeps its monitors' pictures, its selection
+    // and annotations in `folder` (the last `count`; 0: none, and those kept
+    // go), for , and . in the overlay ([Capture] HistoryCount).
+    void setHistory(const QString& folder, int count)
+    {
+        m_history.setFolder(folder);
+        m_history.setLimit(count);
+    }
     // 延时截图: after 3, 5 or 10 seconds (0: the last one used), a countdown at
     // the corner of the screen and then the capture as the hotkey starts it.
     // The hotkey (or a click on the countdown) cancels it.
@@ -135,14 +165,20 @@ public:
     // under way (what a key opened, the same key closes; a long screenshot
     // is finished).
     void trigger();
+    // 识别屏幕文字 (#198): the frozen screens with only the shade, the outline
+    // and the magnifier; a drag or a click on a window reads its words
+    // (Callbacks::readText). Again while it is up: it ends. While a capture,
+    // a recording, a countdown or a long screenshot is under way: nothing.
+    void triggerOcr();
     bool busy() const { return m_state != State::Idle || m_countdown || (m_long && m_long->running()) || (m_recorder && m_recorder->active()); }
 
     // 贴上最近一次截图 (the tray menu).
     bool hasLast() const { return !m_last.isNull(); }
     void pinLast(); // the last capture taken, where it was
-    // The clipboard as it stood when that capture was taken
-    // (GetClipboardSequenceNumber): a picture copied since is the one to pin.
-    DWORD lastClipboardSeq() const { return m_lastSeq; }
+    // The clipboard before this capture's asynchronous copy, plus an identity
+    // carried with that copy's pixels when they actually reach the clipboard.
+    quint32 lastClipboardSequence() const { return m_lastClipboardSequence; }
+    QString lastClipboardId() const { return m_lastClipboardId; }
     // 找回刚放弃的标注: a capture ended with annotations on it (hotkey, Esc)
     // keeps them for kDraftMs or until the next capture; this pins their
     // picture where the capture was, with the project.
@@ -154,7 +190,7 @@ public:
     void save(const QImage& image, const QString& path = {}, std::shared_ptr<const HdrPixels> hdr = {});
 
 private:
-    enum class State { Idle, Waiting, Showing, Closing };
+    enum class State { Idle, Waiting, Showing, ChoosingSave, Closing };
     struct Overlay {
         QPointer<QScreen> screen;
         HMONITOR monitor = nullptr;
@@ -168,7 +204,7 @@ private:
     void buildOverlays();
     void destroyOverlays();
     void screensChanged(); // monitors came, went or changed: everything made again
-    void start();
+    void start(bool ocrOnly = false);
     void show();
     void frameDrawn(QQuickWindow* window);
     void finish(CaptureSession::Action action, int screen, const QRect& rect);
@@ -188,6 +224,15 @@ private:
     void watchTick();
     bool pointerOverOverlay(POINT at) const;
     void recordCapture(CaptureSession::Action action, const QRect& rect);
+    // , and . in the overlay: the capture before or after the one shown (the
+    // live screens are the newest), skipping those of another monitor layout.
+    void stepHistory(int step);
+    void showHistoryShot(const HistoryShot& shot);
+    void showLive();
+    void restoreLive(); // showLive without a word: the live screens, selection and annotations back
+    std::vector<QRect> shownMonitors() const; // the overlays with a picture, physical
+    void prefetchHistory(int at); // the shot at `at` read in the background
+    void forgetHistory(); // the capture ended: the live screens again next time
 
     QQmlEngine* m_engine;
     Callbacks m_callbacks;
@@ -216,8 +261,10 @@ private:
     int m_uiaLogged = 0;
     std::set<quintptr> m_uiaChromiumSkipped; // windows already logged as skipped
     int m_delay = 5;
-    bool m_delayAfter = false; // D in the overlay: the countdown begins once it is gone
+    bool m_delayAfter = false; // Ctrl+Shift+D in the overlay: countdown once it is gone
     std::unique_ptr<CountdownWindow> m_countdown;
+    bool m_quietStart = false; // start() by the countdown: no key hints by themselves
+    bool m_ocrOnly = false; // this capture is triggerOcr()'s
     QElapsedTimer m_countClock;
     QTimer m_countTimer;
     int m_countTotal = 0;
@@ -231,13 +278,26 @@ private:
     QImage m_last; // the last capture taken (copied, saved, pinned, read), for 贴上最近一次截图
     QPoint m_lastOrigin; // where it was, physical
     QByteArray m_lastProject;
-    DWORD m_lastSeq = 0; // the clipboard's sequence number as m_last was taken
+    quint32 m_lastClipboardSequence = 0;
+    QString m_lastClipboardId;
     struct Draft {
         annot::Project project; // the selection's pixels and the annotations over them
         QPoint origin; // physical, virtual desktop
     };
     std::optional<Draft> m_draft;
     QTimer m_draftTimer;
+    CaptureHistory m_history;
+    // While the overlay shows: where in the history it is (-1: the live
+    // screens, m_shots), the ids then (newest first), the one shown, what
+    // the live screens had when left (their windows, selection and
+    // annotations), and the next one being read.
+    int m_historyAt = -1;
+    QStringList m_historyIds;
+    QString m_historyShown;
+    CaptureSession::Windows m_liveWindows;
+    CaptureSession::Kept m_liveKept;
+    int m_prefetchAt = -1;
+    std::future<std::optional<HistoryShot>> m_prefetch;
     // The time between frames drawn while an annotation gesture is under way,
     // logged at the end of the capture: how smooth drawing was (nanoseconds).
     QElapsedTimer m_frameClock;

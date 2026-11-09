@@ -3,6 +3,7 @@
 #include "AnnotationModel.h"
 #include "CaptureTools.h"
 #include "Geometry.h"
+#include "KeyHintPolicy.h"
 
 #include <QElapsedTimer>
 #include <QImage>
@@ -14,6 +15,7 @@
 #include <QtQml/qqmlregistration.h>
 
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace ws::capture {
@@ -37,6 +39,8 @@ class CaptureScreen : public QObject {
     Q_PROPERTY(qreal scaleY READ scaleY NOTIFY geometryChanged FINAL)
     Q_PROPERTY(qreal dpr READ dpr NOTIFY geometryChanged FINAL)
     Q_PROPERTY(QPoint origin READ origin NOTIFY geometryChanged FINAL) // its top left, physical, virtual desktop
+    // Without the taskbar: physical, its own (the whole monitor when unknown).
+    Q_PROPERTY(QRect workArea READ workArea NOTIFY geometryChanged FINAL)
     Q_PROPERTY(QRect hover READ hover NOTIFY changed FINAL) // what a click would pick; null when none here
     Q_PROPERTY(QRect selection READ selection NOTIFY changed FINAL) // null when none here
     Q_PROPERTY(bool dimmed READ dimmed NOTIFY changed FINAL) // dim outside the hover/selection on every monitor
@@ -65,6 +69,7 @@ public:
     QRect rect() const { return m_rect; } // physical, virtual desktop
     QPoint origin() const { return m_rect.topLeft(); }
     QRect bounds() const { return QRect(QPoint(0, 0), m_rect.size()); } // physical, its own
+    QRect workArea() const;
     qreal dpr() const { return m_dpr; }
     qreal scaleX() const { return m_scaleX; }
     qreal scaleY() const { return m_scaleY; }
@@ -85,6 +90,7 @@ public:
     // Where the monitor is (physical, virtual desktop), its DPR and its
     // window's logical size, which the scale follows.
     void setGeometry(const QRect& rect, qreal dpr, QSize logicalWindow);
+    void setWorkArea(const QRect& rect); // physical, virtual desktop (the monitor's rcWork)
     void setImage(const QImage& image);
     // The format the colour is written in; the magnifier shows it at once.
     void setColorFormat(ColorFormat format);
@@ -116,6 +122,7 @@ private:
     int m_index = 0;
     QImage m_image;
     QRect m_rect;
+    QRect m_work; // physical, virtual desktop; null: the whole monitor
     qreal m_dpr = 1;
     qreal m_scaleX = 1;
     qreal m_scaleY = 1;
@@ -142,8 +149,11 @@ private:
 // the mouse and keys do. Moving over the screens highlights the window or
 // control a click picks (the wheel steps out to the window and the whole
 // screen and back); a drag draws a selection; with one, its eight handles
-// resize it and a drag inside moves it, the arrow keys move it a pixel
-// (Shift: resize). Enter or a double click copies, Ctrl+S saves, F3 pins it
+// resize it and a drag inside moves it; the arrow keys move it a physical
+// pixel (Shift: resize), and WASD moves the mouse pointer a physical pixel
+// (Shift: ten) in every phase, a held-button drag included. R recalls
+// recent regions on this picture; ? (or F1) shows or hides the key hints.
+// Enter or a double click copies, Ctrl+S saves, F3 pins it
 // to the screen; Esc or a right click drops the selection, or with none ends
 // the capture; C copies the colour under the cursor. A selection stays on
 // one monitor. With a selection, the annotation tools (AnnotationModel) draw
@@ -171,6 +181,20 @@ class CaptureSession : public QObject {
     Q_PROPERTY(QStringList hiddenButtons READ hiddenButtons NOTIFY hiddenButtonsChanged FINAL)
     // The hint about the tool keys has been shown (once per run).
     Q_PROPERTY(bool toolHintSeen READ toolHintSeen WRITE setToolHintSeen NOTIFY toolHintSeenChanged FINAL)
+    Q_PROPERTY(int selectionHistoryCount READ selectionHistoryCount NOTIFY selectionHistoryChanged FINAL)
+    // Zero-based, newest first; -1 until a remembered region is restored.
+    Q_PROPERTY(int recalledSelection READ recalledSelection NOTIFY selectionChanged FINAL)
+    // The shortcut hints in a corner (CaptureKeyHints.qml). keyHintsEnabled:
+    // the setting ([Capture] KeyHints); keyHintsShown: whether they are up
+    // now, by KeyHintPolicy's rules (timers, presses, ? and F1); keyHints:
+    // the ids of the rows for what can be done now (keyHintRows), none while
+    // a drag, a stroke or a text is under way.
+    Q_PROPERTY(bool keyHintsEnabled READ keyHintsEnabled NOTIFY keyHintsChanged FINAL)
+    Q_PROPERTY(bool keyHintsShown READ keyHintsShown NOTIFY keyHintsChanged FINAL)
+    Q_PROPERTY(QStringList keyHints READ keyHints NOTIFY keyHintsChanged FINAL)
+    // 识别屏幕文字 (#198): this capture only picks a region for its words; no
+    // toolbar, no annotations, no size label.
+    Q_PROPERTY(bool ocrOnly READ ocrOnly NOTIFY ocrOnlyChanged FINAL)
 
 public:
     // Pin: left on the screen where it was (PinWindow); Ocr: its words read (CaptureOcr);
@@ -178,10 +202,13 @@ public:
     // the launcher's search box, the default web search (the mouse buttons' choices).
     // Long: the selection scrolls into a long screenshot (Ctrl+L; LongCapture),
     // one at least kLongMinimum px each way. Qr: the QR codes in it are read
-    // (Q); Delay: this capture ends and the next begins after the countdown (D).
-    enum class Action { Copy, Save, Cancel, Pin, Ocr, OcrCopy, OcrSearch, OcrWeb, Long, Qr, Delay, CopyPin, Record };
+    // (Q); Delay: this capture ends and the next begins after the countdown (Ctrl+Shift+D).
+    // Save: into the chosen save folder, or Save As when none was chosen (#194);
+    // SavePrevious: into the folder without a picker; SaveAs: always the picker.
+    enum class Action { Copy, Save, Cancel, Pin, Ocr, OcrCopy, OcrSearch, OcrWeb, Long, Qr, Delay, CopyPin, Record, SavePrevious, SaveAs };
     Q_ENUM(Action)
     static constexpr int kLongMinimum = 48;
+    static constexpr int kSelectionHistoryLimit = 10;
 
     // The windows at the freeze: top-level ones from the top of the Z order
     // down, physical, virtual desktop; children(i) gives window i's controls.
@@ -199,6 +226,20 @@ public:
     explicit CaptureSession(QObject* parent = nullptr);
 
     void begin(std::vector<CaptureScreen*> screens, Windows windows);
+    // The screens show another capture's pictures now (, and . step through
+    // the history; the caller set them): a click picks from `windows`, and
+    // the selection is `rect` on screen `screen` (an index, as finished()
+    // gives it) with `doc`'s annotations over it, or (screen -1) there is
+    // none. What there was goes; kept() first keeps it.
+    void replaceShot(Windows windows, int screen, const QRect& rect, const std::optional<annot::Document>& doc);
+    struct Kept {
+        int screen = -1;
+        QRect rect;
+        std::optional<annot::Document> doc; // annotations, on the screen's whole picture
+    };
+    // The selection and its annotations now (put down with Esc too).
+    Kept kept() const;
+    void notify(const QString& text) { showNotice(text); } // by the selection, for a few seconds
     // The Start menu (or a shell flyout) in the picture: over every window
     // listed, without controls (physical, virtual desktop). EnumWindows
     // does not list it (another band of the Z order); found from the
@@ -214,10 +255,11 @@ public:
     // The colour's format (C copies it, Shift alone changes it): kept between captures.
     void setColorFormat(ColorFormat format);
     ColorFormat colorFormat() const { return m_colorFormat; }
-    // The last selection a capture ended with (virtual desktop, physical), for
-    // Shift+R before there is one; set by the capture, kept between captures.
-    void setLastSelection(const QRect& rect) { m_lastSelection = rect; }
-    QRect lastSelection() const { return m_lastSelection; }
+    // Completed regions only (virtual desktop, physical), newest first,
+    // deduplicated and kept for this run. R cycles them on the frozen picture.
+    void rememberSelection(const QRect& rect);
+    int selectionHistoryCount() const { return static_cast<int>(m_selectionHistory.size()); }
+    int recalledSelection() const { return m_recalledSelection; }
     QStringList hiddenButtons() const { return m_hiddenButtons; }
     void setHiddenButtons(const QStringList& ids);
     bool active() const { return m_active; }
@@ -244,6 +286,12 @@ public:
     void setCopyOnSelect(bool on) { m_copyOnSelect = on; } // a drag or a click on a window copies at once
     void setMagnifier(bool on) { m_magnifier = on; } // takes effect with the next publish()
     void setPinOnCopy(bool on) { m_pinOnCopy = on; }
+    // 识别屏幕文字 (#198), set before begin() and gone with end(): a drag let go
+    // of, or a click on a window or control, finishes as OcrCopy at once; Esc
+    // and the right button end the capture; the keys that would take,
+    // save, pin, annotate or bring back a picture do nothing.
+    void setOcrOnly(bool on);
+    bool ocrOnly() const { return m_ocrOnly; }
 
     // What the mouse buttons do once a selection is there (issue #46), as
     // Settings keeps them: none | copy | save | pin | ocr | ocrcopy | ocrsearch |
@@ -272,6 +320,32 @@ public:
     bool toolHintSeen() const { return m_toolHintSeen; }
     void setToolHintSeen(bool seen);
 
+    // The key hints. Rows, in order (the panel words them):
+    //   choosing: wheel, wasd, recall (some remembered), history (setHistoryAvailable),
+    //             ocr (ocrAvailable), quit
+    //   selected: copy, save, pin, arrows, ocr, long, recalled (R brought it back)
+    //   tool:     shift (shapes, lines and strokes), width, undo, delete, toolOff, hide
+    // and none while busy.
+    QStringList keyHintRows() const;
+    QStringList keyHints() const { return m_keyHints; }
+    bool keyHintsEnabled() const { return m_hintPolicy.enabled(); }
+    bool keyHintsShown() const { return m_hintsShown; }
+    void setKeyHints(bool on); // the setting
+    // The pin and save keys the user chose (#187), for the text box too.
+    void setKeys(const CaptureKeys& keys);
+    const CaptureKeys& keys() const { return m_annot.keys(); }
+    // A save folder was chosen ([Capture] SaveFolder): Save needs no picker (#194).
+    void setSaveDirect(bool on) { m_annot.setSaveDirect(on); }
+    bool saveDirect() const { return m_annot.saveDirect(); }
+    // This capture was begun by the delay's countdown: no hints by themselves (after begin()).
+    void quietKeyHints();
+    // , and . have captures to bring back (Capture's history, at the start).
+    void setHistoryAvailable(bool on);
+    // The panel's button: 不再显示 (false), or 一直显示 (true) when ? showed it
+    // with the setting off. keyHintsKept tells the settings; this capture
+    // follows them at once.
+    Q_INVOKABLE void keepKeyHints(bool on);
+
     void pointerMove(int screen, QPoint p, Qt::KeyboardModifiers modifiers = {});
     void pointerPress(int screen, QPoint p, Qt::MouseButton button, Qt::KeyboardModifiers modifiers = {});
     void pointerRelease(int screen, QPoint p, Qt::MouseButton button);
@@ -290,7 +364,7 @@ public:
     // The picture lost the mouse: the toolbar above it took it, or another monitor.
     Q_INVOKABLE void mouseLeft(int screen);
     Q_INVOKABLE void wheeled(int screen, qreal x, qreal y, int angleDeltaY);
-    Q_INVOKABLE bool keyPressed(int key, int modifiers);
+    Q_INVOKABLE bool keyPressed(int key, int modifiers, bool autoRepeat = false);
     Q_INVOKABLE void keyReleased(int key); // a Shift alone, let go of: the colour's next format
     Q_INVOKABLE void act(int action); // the toolbar's buttons: an Action
 
@@ -299,14 +373,20 @@ signals:
     // coordinates); nothing for Cancel.
     void finished(ws::capture::CaptureSession::Action action, int screen, const QRect& rect);
     void colorCopied(const QString& color);
+    // , (or <): the capture before the one shown, 1; . (or >): the one after, -1.
+    void historyStep(int step);
     void colorFormatChanged(ws::capture::ColorFormat format);
-    void cursorMoveRequested(const QPoint& global); // the arrow keys with no selection: a pixel at a time
+    void cursorMoveRequested(const QPoint& global); // WASD, and the arrow keys with no selection: the pointer
     void selectionChanged();
     void activeChanged();
     void ocrAvailableChanged();
     void hiddenButtonsChanged();
     void toolbarHiddenChanged();
     void toolHintSeenChanged();
+    void selectionHistoryChanged();
+    void keyHintsChanged();
+    void keyHintsKept(bool on); // the panel's button: [Capture] KeyHints
+    void ocrOnlyChanged();
 
 private:
     // Annotating: a drawing, moving or reshaping gesture of the model's is
@@ -323,7 +403,9 @@ private:
     void updateCursor(int screen, QPoint p);
     void publish(); // the state onto the screens
     void finish(Action action);
-    void useLastSelection(); // Shift+R: the selection of the capture before
+    void recallSelection(bool previous); // R: older; Shift+R: newer
+    void nudgeSelection(int dx, int dy, bool resize);
+    void movePointer(int dx, int dy); // WASD: the mouse pointer, whatever the phase
     void back(); // Esc, right click
     enum class MouseAct { None, Copy, Save, Pin, Ocr, Cancel, Back, OcrCopy, OcrSearch, OcrWeb, CopyPin };
     static MouseAct parseMouseAct(const QString& name, MouseAct fallback);
@@ -334,6 +416,11 @@ private:
     void retireAnnotation(); // the model ended, its styles kept
     void dropParked(); // a new selection: the annotations put down with Esc are gone
     void showNotice(const QString& text);
+    // keyHints follows keyHintRows, keyHintsShown the policy (its stage, its
+    // timers); told only when either changed.
+    void refreshKeyHints();
+    void hintInput(); // a move, a key, the wheel, a tool: KeyHintPolicy::input
+    qint64 hintNow() const { return m_hintClock.elapsed(); }
     int cursorShapeAt(int screen, QPoint p) const;
     Pick hovered() const; // what a click would pick now: the hover, else the screen under the cursor
     int reach(int screen) const; // how near a handle a press takes it, physical
@@ -348,6 +435,7 @@ private:
     bool m_copyOnSelect = false;
     bool m_magnifier = true; // off: no magnifier, so no colour picking either
     bool m_pinOnCopy = false;
+    bool m_ocrOnly = false;
     MouseAct m_actDoubleLeft = MouseAct::Copy;
     MouseAct m_actRight = MouseAct::Back;
     MouseAct m_actMiddle = MouseAct::None;
@@ -385,8 +473,15 @@ private:
     Pick m_parkedSelection;
     bool m_toolbarHidden = false;
     bool m_toolHintSeen = false;
+    KeyHintPolicy m_hintPolicy;
+    QElapsedTimer m_hintClock; // the policy's clock
+    QTimer m_hintTimer; // wakes it when a hint is due
+    bool m_hintsShown = false;
+    bool m_historyAvailable = false;
+    QStringList m_keyHints;
     ColorFormat m_colorFormat = ColorFormat::Hex;
-    QRect m_lastSelection;
+    std::vector<QRect> m_selectionHistory;
+    int m_recalledSelection = -1;
     QTimer m_noticeTimer;
     QElapsedTimer m_releaseClock; // the left button's last release (diagnostics)
 };

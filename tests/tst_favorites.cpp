@@ -1,6 +1,7 @@
 #include "Favorites.h"
 
 #include "History.h"
+#include "AppCatalog.h"
 #include "IndexService.h"
 #include "SearchEngine.h"
 
@@ -43,6 +44,58 @@ class TestFavorites : public QObject {
     Q_OBJECT
 
 private slots:
+    void recentChoicesCanOutrankFavorites()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString favorite = QDir::toNativeSeparators(dir.filePath(u"Program Files"_s));
+        QVERIFY(QDir().mkpath(favorite));
+        IndexService service(dir.filePath(u"index"_s), {});
+        AppCatalog apps;
+        auto programs = std::make_shared<AppList>();
+        AppInfo app;
+        app.name = u"FluxDown"_s;
+        app.id = u"Test.FluxDown"_s;
+        app.prepare();
+        programs->push_back(app);
+        apps.setApps(programs);
+        SearchEngine engine(&service, &apps);
+        QSignalSpy spy(&engine, &SearchEngine::resultsReady);
+        History history(dir.filePath(u"history.txt"_s));
+        constexpr qint64 now = 1'800'000'000'000;
+        const auto search = [&](const QString& text, int limit = 20, qint64 when = 0) {
+            if (when == 0)
+                when = now;
+            SearchEngine::Request request;
+            request.text = text;
+            request.limit = limit;
+            request.favorites = {folder(favorite, u"Program Files"_s, u"fl"_s)};
+            request.history = history.ranked(text, when);
+            request.historyAffinity = history.affinities(text, when);
+            spy.clear();
+            engine.submit(request);
+            if (spy.isEmpty() && !spy.wait(5000))
+                return SearchResults {};
+            return spy.first().at(1).value<SearchResults>();
+        };
+        QCOMPARE(search(u"f"_s).value(0).path, favorite); // no learning: useful default
+        history.record(app.launchPath(), u"flux"_s, now - 1000);
+        QCOMPARE(search(u"f"_s).value(0).path, app.launchPath()); // another matching query
+        QCOMPARE(search(u"f"_s, 1).value(0).path, app.launchPath()); // before truncation
+        QCOMPARE(search(u"fl"_s, 1).value(0).path, favorite); // explicit shortcut stays first
+        QCOMPARE(search(u"program"_s).value(0).path, favorite); // learning cannot invent a match
+        const auto rows = search(u"f"_s);
+        QCOMPARE(rows.size(), 2);
+        QVERIFY(rows[1].favorite);
+        QCOMPARE(rows[1].path, favorite); // still present, no duplicate
+        QCOMPARE(search(u"f"_s, 1, now + 140LL * 86'400'000).value(0).path, favorite);
+        history.record(favorite, u"f"_s, now);
+        QCOMPARE(search(u"f"_s).value(0).path, favorite); // the favorite can also earn its place
+        for (int i = 0; i < 3; ++i)
+            history.record(app.launchPath(), u"f"_s, now + i);
+        QCOMPARE(search(u"f"_s, 1, now + 3).value(0).path, app.launchPath());
+    }
+
     void commandIconsTravelWithFavorites()
     {
         const QString icon = u"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="_s;
@@ -134,6 +187,68 @@ private slots:
         QVERIFY(!scopeShows(Scope::Files, command.kind));
         QVERIFY(!scopeShows(Scope::Folders, command.kind));
         QCOMPARE(favoriteOf(results.first())->command, command.command);
+    }
+
+    void hidingStartFavoritesKeepsKeywords()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        IndexService service(temporary.filePath(u"index"_s), {});
+        SearchEngine engine(&service);
+        QSignalSpy spy(&engine, &SearchEngine::resultsReady);
+        SearchEngine::Request request;
+        request.favorites = {{Favorite::Kind::Command, u"winshun-command:hidden"_s, u"编辑器"_s, u"edit"_s,
+            u"notepad.exe {query}"_s}};
+        request.favoritesOnStart = false;
+        engine.submit(request);
+        QVERIFY(spy.wait(5000));
+        QVERIFY(spy.takeFirst().at(1).value<SearchResults>().isEmpty());
+        request.text = u"edit some text"_s;
+        engine.submit(request);
+        QVERIFY(spy.wait(5000));
+        const auto typed = spy.takeFirst().at(1).value<SearchResults>();
+        QCOMPARE(typed.size(), 1);
+        QVERIFY(typed.first().isCommand());
+        QCOMPARE(typed.first().words, u"some text"_s);
+        request.text.clear();
+        request.favoritesOnStart = true;
+        engine.submit(request);
+        QVERIFY(spy.wait(5000));
+        QCOMPARE(spy.takeFirst().at(1).value<SearchResults>().size(), 1);
+    }
+
+    void recentCountRespectsVisibilityAndLimit()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        IndexService service(temporary.filePath(u"index"_s), {});
+        SearchEngine engine(&service);
+        QSignalSpy spy(&engine, &SearchEngine::resultsReady);
+        SearchEngine::Request request;
+        for (int i = 0; i < 8; ++i) {
+            const QString path = QDir::toNativeSeparators(temporary.filePath(u"recent-%1.txt"_s.arg(i)));
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            request.history.append(path);
+        }
+        request.favorites = {{Favorite::Kind::File, request.history.first(), u"收藏"_s, u"fav"_s}};
+        request.favoritesOnStart = false;
+        request.recentItems = 7;
+        const auto listed = [&] {
+            spy.clear();
+            engine.submit(request);
+            if (!spy.wait(5000))
+                return SearchResults();
+            return spy.first().at(1).value<SearchResults>();
+        };
+        const auto seven = listed();
+        QCOMPARE(seven.size(), 7);
+        QCOMPARE(seven.first().path, request.history.first()); // hidden favorites can still be recent
+        request.recentItems = 3;
+        QCOMPARE(listed().size(), 3);
+        request.recentItems = 7;
+        request.limit = 2;
+        QCOMPARE(listed().size(), 2);
     }
 
     void commandArgumentRoundTrip()

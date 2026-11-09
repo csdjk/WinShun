@@ -37,10 +37,26 @@ QString pathKey(QStringView path)
 
 bool samePath(QStringView a, QStringView b)
 {
-    if (a == b)
-        return true;
     if (a.startsWith(u"\\\\") || b.startsWith(u"\\\\"))
-        return pathKey(a) == pathKey(b);
+        return a == b || pathKey(a) == pathKey(b);
+    // Each recent item is looked for among all the rows (ws's 110 000): told
+    // apart by their lengths first (a case-insensitive comparison goes unit
+    // by unit: it never finds two lengths equal), then from the end, where
+    // paths mostly differ: from the start, it goes through all they have in
+    // common (C:\Users\...). A surrogate is left to the comparison, which
+    // reads them in pairs.
+    if (a.size() != b.size())
+        return false;
+    for (qsizetype i = a.size() - 1; i >= 0; --i) {
+        const QChar x = a[i];
+        const QChar y = b[i];
+        if (x == y)
+            continue;
+        if (x.isSurrogate() || y.isSurrogate())
+            break;
+        if (x.toCaseFolded() != y.toCaseFolded())
+            return false;
+    }
     return a.compare(b, Qt::CaseInsensitive) == 0;
 }
 
@@ -293,6 +309,28 @@ bool sameFolder(const QString& a, const QString& b)
 {
     const QString x = normalized(a);
     return !x.isEmpty() && x.compare(normalized(b), Qt::CaseInsensitive) == 0;
+}
+
+bool isDirectChild(const QString& folder, const QString& path)
+{
+    const auto plain = [](QString text) {
+        if (text.startsWith(u"\\\\?\\UNC\\"_s, Qt::CaseInsensitive))
+            text = u"\\\\"_s + text.mid(8);
+        else if (text.startsWith(u"\\\\?\\"_s))
+            text = text.mid(4);
+        return normalized(text);
+    };
+    const QString f = plain(folder);
+    const QString p = plain(path);
+    if (f.isEmpty() || p.isEmpty() || p.size() <= f.size())
+        return false;
+    // normalized() keeps a trailing backslash only on a drive's root.
+    const qsizetype cut = f.endsWith(u'\\') ? f.size() : f.size() + 1;
+    if (p.size() <= cut || (cut > f.size() && p[f.size()] != u'\\'))
+        return false;
+    if (p.indexOf(u'\\', cut) >= 0)
+        return false; // deeper
+    return pathKey(QStringView(p).left(f.size())) == pathKey(f);
 }
 
 QString folderFromTotalCommander(const QString& text)

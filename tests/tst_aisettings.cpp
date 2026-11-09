@@ -6,6 +6,7 @@
 #include "AiSettings.h"
 #include "Settings.h"
 
+#include <QDirIterator>
 #include <QJsonDocument>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -70,7 +71,7 @@ QJsonValue sampleFor(const aisettings::Entry& e, State& s, int variant)
     case Type::Number:
         return variant == 0 ? 2.5 : 0.5; // 512 KB
     case Type::Text:
-        return u"zzkw"_s;
+        return e.key == u"Results/PreviewHotkey" ? u"Space"_s : u"zzkw"_s;
     case Type::Hotkey:
         return u"Ctrl+Alt+F9"_s;
     case Type::List: {
@@ -135,6 +136,36 @@ private slots:
         // The settings window's pages are the sections'.
         for (const Section& s : sections())
             QVERIFY2(s.page >= 0 && s.page <= 10, qPrintable(s.id));
+    }
+
+    // open_settings finds a row by its title (SettingsWindow.showSetting): the
+    // title must still be one of the settings window's, or the window opens
+    // at the page and shows nothing.
+    void rowTitlesExistInTheSettingsWindow()
+    {
+        QString qml;
+        QDirIterator files(QStringLiteral(WINSHUN_QML_DIR), {u"*.qml"_s}, QDir::Files);
+        while (files.hasNext()) {
+            QFile file(files.next());
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            qml += QString::fromUtf8(file.readAll());
+        }
+        QVERIFY(!qml.isEmpty());
+        QStringList missing;
+        // Titles with the tapped key's name in them, or on tabs of one row: the
+        // search's nearest row is the one opened, not an exact title.
+        const QStringList nearest {u"Launcher/DoubleTapKey"_s, u"Launcher/DoubleCtrlKey"_s, u"Launcher/DoubleCtrlPauseInGames"_s,
+            u"Launcher/DoubleCtrlPauseInFullScreen"_s, u"Launcher/DoubleCtrlExcludedApps"_s, u"Launcher/FileManagerRevealCommand"_s,
+            u"Results/DoubleClickToOpen"_s, u"Results/TabEntersFavoriteFolder"_s, u"Capture/Keyword"_s};
+        for (const aisettings::Entry& e : catalog()) {
+            if (e.access == Access::Hidden || e.section == u"web" || e.section == u"paste_file" || nearest.contains(e.key))
+                continue;
+            const QString title = e.rowTitleText();
+            if (title.isEmpty())
+                continue;
+            if (!qml.contains(u"\"%1\""_s.arg(title))) missing << e.key + u": "_s + title;
+        }
+        QVERIFY2(missing.isEmpty(), qPrintable(missing.join(u'\n')));
     }
 
     // What AI must never write, whatever else changes: each is not writable
@@ -205,6 +236,8 @@ private slots:
                 continue;
             for (int variant = 0; variant < 2; ++variant) {
                 State state = defaultState();
+                if (e.key == u"Launcher/FolderMenuDouble") // the last way to open it cannot go off (GitHub #196)
+                    state.settings.folderMenuMiddle = true;
                 const QJsonValue value = sampleFor(e, state, variant);
                 QVERIFY2(!value.isNull() && !value.isUndefined(), qPrintable(e.key));
                 const Plan plan = makePlan(state, one(e.key, value), {});
@@ -229,6 +262,51 @@ private slots:
             }
         }
         QVERIFY(checked > 60);
+    }
+
+    // The menu keeps one way and one place on (GitHub #196), as its settings do.
+    void liquidStyleChoice()
+    {
+        State state = defaultState();
+        const Plan plan = makePlan(state, one(u"Appearance/UiStyle"_s, u"liquid"_s), {});
+        QVERIFY2(plan.problems.isEmpty(), qPrintable(problemText(plan)));
+        QCOMPARE(plan.result.settings.uiStyle, u"liquid"_s);
+        QVERIFY(plan.result.settings.saveChecked());
+        Settings restored;
+        restored.load();
+        QCOMPARE(restored.uiStyle, u"liquid"_s);
+    }
+
+    void glassChoices()
+    {
+        for (const QString& key : {u"Appearance/GlassTransparency"_s, u"Appearance/GlassClarity"_s}) {
+            for (const int value : {0, 50, 100}) {
+                State state = defaultState();
+                const Plan plan = makePlan(state, one(key, value), {});
+                QVERIFY2(plan.problems.isEmpty(), qPrintable(problemText(plan)));
+                QVERIFY(plan.result.settings.saveChecked());
+                Settings restored;
+                restored.load();
+                QCOMPARE(key.endsWith(u"Transparency") ? restored.glassTransparency : restored.glassClarity, value);
+            }
+            for (const int value : {-1, 101}) {
+                const Plan plan = makePlan(defaultState(), one(key, value), {});
+                QVERIFY(!plan.problems.isEmpty());
+            }
+        }
+    }
+
+    void folderMenuKeepsOne()
+    {
+        State state = defaultState();
+        QVERIFY(!makePlan(state, one(u"Launcher/FolderMenuDouble"_s, false), {}).problems.isEmpty());
+        QVERIFY(makePlan(state, one(u"Launcher/FolderMenuMiddle"_s, true), {}).problems.isEmpty());
+        state.settings.folderMenuDesktop = false;
+        QVERIFY(!makePlan(state, one(u"Launcher/FolderMenuExplorer"_s, false), {}).problems.isEmpty());
+        QJsonArray both;
+        both.append(QJsonObject {{u"key"_s, u"Launcher/FolderMenuDesktop"_s}, {u"value"_s, true}});
+        both.append(QJsonObject {{u"key"_s, u"Launcher/FolderMenuExplorer"_s}, {u"value"_s, false}});
+        QVERIFY2(makePlan(state, both, {}).problems.isEmpty(), "one off, the other on in the same call is fine");
     }
 
     void webShortcutsRoundTrip()
@@ -271,10 +349,12 @@ private slots:
         Env env;
         env.keywordOwner = [](const QString& k) { return k == u"zzfav" ? u"My favorite"_s : QString(); };
         QVERIFY(problemText(add({{u"keyword"_s, u"zzfav"_s}, {u"url"_s, u"https://x.org"_s}}, env)).contains(u"My favorite"));
-        State capture = state;
-        capture.settings.captureEnabled = true;
-        QVERIFY(!makePlan(capture, adding(key, QJsonObject {{u"keyword"_s, capture.settings.captureKeyword}, {u"url"_s, u"https://x.org"_s}}), {})
-                     .problems.isEmpty());
+        // The screenshot history's keyword, while the screenshot plugin is on.
+        const QJsonObject history {{u"keyword"_s, state.settings.captureKeyword}, {u"url"_s, u"https://x.org"_s}};
+        QVERIFY2(add(history).problems.isEmpty(), qPrintable(problemText(add(history))));
+        Env plugin;
+        plugin.screenshotHistory = [] { return true; };
+        QVERIFY(problemText(add(history, plugin)).contains(u"screenshot history"));
         QVERIFY(!makePlan(state, one(key, QJsonArray()), {}).problems.isEmpty()); // value: not for this one
     }
 
@@ -371,7 +451,7 @@ private slots:
         QCOMPARE(Settings::hotkeyAllowed(hotkey), accepted);
         // Whatever the app's own check says, and with none.
         for (const Env& env : {appEnv(), Env {}}) {
-            for (const char* key : {"Launcher/Hotkey", "Launcher/FolderMenuHotkey", "Clipboard/Hotkey", "Capture/Hotkey"}) {
+            for (const char* key : {"Launcher/Hotkey", "Launcher/FolderMenuHotkey", "Clipboard/Hotkey"}) {
                 const Plan plan = makePlan(defaultState(), one(QString::fromLatin1(key), hotkey), env);
                 QVERIFY2(plan.problems.isEmpty() == accepted, qPrintable(hotkey + u" for "_s + QString::fromLatin1(key) + u": "_s + problemText(plan)));
             }
@@ -406,11 +486,6 @@ private slots:
         plan = makePlan(state, QJsonArray {QJsonObject {{u"key"_s, u"Clipboard/Hotkey"_s}, {u"value"_s, u"Ctrl+Alt+Z"_s}},
                                  QJsonObject {{u"key"_s, u"Launcher/FolderMenuHotkey"_s}, {u"value"_s, u"Alt+Ctrl+Z"_s}}}, env);
         QVERIFY(!plan.problems.isEmpty());
-        // The screenshot shortcut counts while capture is on.
-        state.settings.captureHotkey = u"Ctrl+Alt+A"_s;
-        QVERIFY(makePlan(state, one(u"Clipboard/Hotkey"_s, u"Ctrl+Alt+A"_s), env).problems.isEmpty());
-        state.settings.captureEnabled = true;
-        QVERIFY(!makePlan(state, one(u"Clipboard/Hotkey"_s, u"Ctrl+Alt+A"_s), env).problems.isEmpty());
     }
 
     // The card shows all that is applied: name, address and home of a web shortcut.
@@ -535,12 +610,11 @@ private slots:
         state.settings.clipboardExcludedApps = {u"KeePass.exe"_s};
         state.settings.clipboard = false;
         state.settings.clipboardImages = false;
-        state.settings.captureEnabled = false;
         state.settings.includeRemovableDrives = false;
         state.settings.contentInLowPriority = false;
         state.settings.contentSearch = false;
         state.settings.contentDocuments = false;
-        for (const char* key : {"Clipboard/Enabled", "Clipboard/Images", "Capture/Enabled", "Index/IncludeRemovableDrives",
+        for (const char* key : {"Clipboard/Enabled", "Clipboard/Images", "Index/IncludeRemovableDrives",
                  "Content/IncludeSystemFolders", "Content/Enabled", "Content/Documents"}) {
             QVERIFY2(makePlan(state, one(QString::fromLatin1(key), true), env).askAlways(), key); // turning on
             State on = state;
@@ -691,6 +765,21 @@ private slots:
         // Leaving 'direct' restarts Win顺 too.
         state.settings.indexAccess = u"direct"_s;
         QVERIFY(!makePlan(state, one(u"Index/Access"_s, u"walk"_s), {}).problems.isEmpty());
+    }
+
+    void previewHotkey()
+    {
+        State state = defaultState();
+        const auto env = appEnv();
+        for (const QString& key : {u"Space"_s, u"Ctrl+Shift+P"_s, u"F8"_s, QString()}) {
+            const auto plan = makePlan(state, one(u"Results/PreviewHotkey"_s, key), env);
+            QVERIFY2(plan.problems.isEmpty(), qPrintable(problemText(plan)));
+            QCOMPARE(plan.result.settings.previewHotkey, key);
+        }
+        for (const QString& key : {u"P"_s, u"Ctrl+C"_s, u"Shift+Space"_s, u"Alt+F4"_s})
+            QVERIFY(!makePlan(state, one(u"Results/PreviewHotkey"_s, key), env).problems.isEmpty());
+        state.settings.hotkey = u"Ctrl+Shift+P"_s;
+        QVERIFY(!makePlan(state, one(u"Results/PreviewHotkey"_s, u"Ctrl+Shift+P"_s), env).problems.isEmpty());
     }
 
     void fileManagerNeedsTheUsersCommand()

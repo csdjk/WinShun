@@ -23,8 +23,14 @@
 #include "Server.h"
 #include "Tls.h"
 #include "Util.h"
+#include "KnownFolderOverride.h"
 
 #include <QDir>
+#include <QElapsedTimer>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QProcess>
 #include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTest>
@@ -449,6 +455,78 @@ private:
     }
 
 private slots:
+    void historyCommand()
+    {
+        // The real resident executable, the same RPC action the clipboard
+        // uses. No transfer action: receiving is off and files are test-owned.
+        QTemporaryDir profile;
+        QVERIFY(profile.isValid());
+        QProcess process;
+        process.setProgram(QString::fromUtf8(WINSHUN_LOCALSEND_EXE));
+        process.start();
+        QVERIFY(process.waitForStarted());
+        const auto cleanup = qScopeGuard([&] {
+            if (process.state() != QProcess::NotRunning) {
+                process.closeWriteChannel();
+                if (!process.waitForFinished(5000)) {
+                    process.kill(); // this test's own child only
+                    process.waitForFinished();
+                }
+            }
+            Identity::forget(native(profile.path()));
+        });
+        int id = 0;
+        const auto rpc = [&](const QString& method, const QJsonObject& params) {
+            const int request = ++id;
+            const QByteArray line = QJsonDocument(QJsonObject {{u"jsonrpc"_s, u"2.0"_s},
+                {u"id"_s, request}, {u"method"_s, method}, {u"params"_s, params}}).toJson(QJsonDocument::Compact) + '\n';
+            process.write(line);
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 15'000) {
+                while (process.canReadLine()) {
+                    const auto reply = QJsonDocument::fromJson(process.readLine()).object();
+                    if (reply.value(u"id"_s).toInt(-1) == request)
+                        return reply;
+                }
+                if (process.state() == QProcess::NotRunning)
+                    break;
+                process.waitForReadyRead(100);
+            }
+            return QJsonObject {};
+        };
+        QVERIFY(rpc(u"initialize"_s, {{u"locale"_s, u"en"_s}, {u"dataDir"_s, profile.path()},
+            {u"settings"_s, QJsonObject {{u"receive"_s, false}, {u"folder"_s, profile.filePath(u"received"_s)}}}})
+                .contains(u"result"_s));
+        const QString marker = u"History 142"_s;
+        const auto chosen = rpc(u"action"_s, {{u"command"_s, u"send"_s}, {u"action"_s, u"clipboard"_s},
+            {u"text"_s, u"  "_s + marker + u"\n"_s}});
+        const auto effects = chosen.value(u"result"_s).toObject().value(u"effects"_s).toArray();
+        QVERIFY(std::ranges::any_of(effects, [](const QJsonValue& effect) {
+            return effect.toObject().value(u"type"_s).toString() == u"setQuery";
+        }));
+        const auto query = [&] {
+            return rpc(u"query"_s, {{u"queryId"_s, id + 1}, {u"command"_s, u"send"_s},
+                {u"keyword"_s, u"ls"_s}, {u"text"_s, QString()}});
+        };
+        const QByteArray rows = QJsonDocument(query()).toJson(QJsonDocument::Compact);
+        QVERIFY2(rows.contains(marker.toUtf8()), rows.constData());
+        QVERIFY(rows.contains(QByteArray::number(marker.size() + 3) + " characters")); // spaces and final newline intact
+        QVERIFY(rows.contains("clipboard history") || rows.contains("Enter sends this text"));
+        QVERIFY(writeFile(native(profile.filePath(u"history-picture.png"_s)), "test picture"));
+        rpc(u"action"_s, {{u"command"_s, u"send"_s}, {u"action"_s, u"clipboard"_s},
+            {u"files"_s, QJsonArray {profile.filePath(u"history-picture.png"_s)}}});
+        const QByteArray files = QJsonDocument(query()).toJson(QJsonDocument::Compact);
+        QVERIFY(files.contains("history-picture.png"));
+        QVERIFY(!files.contains(marker.toUtf8()));
+        rpc(u"action"_s, {{u"command"_s, u"send"_s}, {u"action"_s, u"clearFiles"_s}});
+        QVERIFY(!QJsonDocument(query()).toJson(QJsonDocument::Compact).contains("history-picture.png"));
+        QVERIFY(rpc(u"shutdown"_s, {}).contains(u"result"_s));
+        process.closeWriteChannel();
+        QVERIFY(process.waitForFinished(5000));
+        QCOMPARE(process.exitCode(), 0);
+    }
+
     void initTestCase()
     {
         WSADATA wsa {};
@@ -1276,6 +1354,28 @@ private slots:
         QVERIFY(w.allow(t0 + 60s)); // the first is a minute old; refusals were not counted
         QVERIFY(!w.allow(t0 + 60s + 500ms));
         QVERIFY(w.allow(t0 + 62s));
+    }
+
+    void missingDefaultDownloadsCanReceive()
+    {
+        const QString destination = QDir::toNativeSeparators(m_dir.filePath(u"迁移后的下载/尚未创建"_s));
+        KnownFolderOverride folders({{&FOLDERID_Downloads, destination}});
+        QVERIFY(folders.installed());
+        QCOMPARE(qs(downloadsFolder()), destination);
+        QVERIFY(!QFileInfo::exists(destination));
+        QVERIFY(folderUsable(downloadsFolder()));
+        QVERIFY(startReceiver());
+        ReceiverConfig config = m_receiver->config();
+        config.folder = downloadsFolder();
+        m_folder = config.folder;
+        m_receiver->setConfig(config);
+        m_answer = true;
+        const Prepared request = prepare({meta("f1", "received.txt", 4)});
+        QCOMPARE(request.status, 200);
+        QCOMPARE(upload(request, "f1", "test"), 200);
+        QVERIFY(outcome());
+        QCOMPARE(readFile(m_folder + L"\\received.txt"), std::string("test"));
+        QVERIFY(marked(m_folder + L"\\received.txt"));
     }
 
     void folderChecked()

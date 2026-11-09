@@ -1,4 +1,6 @@
 #include "UpdatePackage.h"
+#include "Download.h"
+#include "ScoopInstall.h"
 
 #include "platform/Http.h"
 
@@ -73,6 +75,8 @@ bool reservedName(const QString& part)
 
 Kind installKind(const QString& appDir, bool portable)
 {
+    if (scoop::detect(appDir)) // before "portable": it has a data folder too
+        return Kind::Scoop;
     if (portable)
         return Kind::Portable;
     if (sameFolder(installLocation(HKEY_LOCAL_MACHINE, RRF_SUBKEY_WOW6464KEY), appDir)
@@ -81,6 +85,16 @@ Kind installKind(const QString& appDir, bool portable)
     if (sameFolder(installLocation(HKEY_CURRENT_USER, 0), appDir))
         return Kind::CurrentUser;
     return Kind::None;
+}
+
+bool setupInstalled()
+{
+    for (const QString& folder : {installLocation(HKEY_LOCAL_MACHINE, RRF_SUBKEY_WOW6464KEY),
+             installLocation(HKEY_LOCAL_MACHINE, RRF_SUBKEY_WOW6432KEY), installLocation(HKEY_CURRENT_USER, 0)}) {
+        if (!folder.isEmpty() && QFileInfo::exists(folder))
+            return true;
+    }
+    return false;
 }
 
 bool folderWritable(const QString& folder)
@@ -182,6 +196,11 @@ DownloadResult download(const release::Asset& asset, const QStringList& urls, co
         return result;
     }
     for (qsizetype i = 0; i < urls.size(); ++i) {
+        if (progress && !progress(0, asset.size)) {
+            QFile::remove(partial);
+            result.cancelled = true;
+            return result;
+        }
         const QString& url = urls[i];
         const bool last = i == urls.size() - 1;
         QFile::remove(partial);
@@ -204,15 +223,15 @@ DownloadResult download(const release::Asset& asset, const QStringList& urls, co
             }
             hash.addData(QByteArrayView(data, size));
             received += size;
+            if (progress && !progress(received, asset.size)) {
+                cancelled = true;
+                return false;
+            }
             // A mirror that crawls (they may throttle): the next one, while
             // there is one; GitHub, last, is waited for.
             const qint64 ms = clock.elapsed();
-            if (!last && ms > 30000 && received * 1000 / ms < 16 * 1024) {
+            if (!last && download::tooSlow(received, ms)) {
                 slow = true;
-                return false;
-            }
-            if (progress && !progress(received, asset.size)) {
-                cancelled = true;
                 return false;
             }
             return true;

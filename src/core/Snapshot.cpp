@@ -366,7 +366,7 @@ private:
 class NameNumbers {
 public:
     explicit NameNumbers(std::size_t expected)
-        : m_slots(std::bit_ceil(std::max<std::size_t>(expected, 1024)), 0)
+        : m_slots(std::bit_ceil(std::clamp<std::size_t>(expected, 1024, 65536)), 0)
     {
     }
     // The name's number, and whether it got it just now.
@@ -457,7 +457,7 @@ bool save(const FileIndex& index, const std::vector<VolumeInfo>& volumes,
                 if (e.isDeleted())
                     continue;
                 f(id, e);
-                for (EntryId c = e.firstChild; c != kNoEntry; c = index.entry(c).nextSibling)
+                for (EntryId c = e.firstChild(); c != kNoEntry; c = index.entry(c).nextSibling)
                     stack.push_back(c);
             }
         }

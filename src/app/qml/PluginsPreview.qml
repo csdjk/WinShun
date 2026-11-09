@@ -14,6 +14,7 @@ Window {
     required property PluginSettings plugins
     required property SettingsEditor editor
     property bool dialogShown: false
+    property bool allowShown: false // 更新并允许
     property bool aiPage: false
 
     width: 900
@@ -44,7 +45,7 @@ Window {
             text: preview.aiPage ? qsTr("AI 助手") : qsTr("插件")
             color: Theme.text
             font.pixelSize: Theme.fontDisplay
-            font.weight: Font.DemiBold
+            font.weight: Theme.fontStrong
         }
 
         AiAccessSection {
@@ -89,6 +90,17 @@ Window {
         if (!preview.aiPage) {
             pluginsSection.expandAt(1) // one card unfolded, its permissions with it
             pluginsSection.expandAt(4) // ... and the strict-sandbox one: its first permission wraps
+        }
+        if (preview.allowShown && !preview.aiPage) {
+            dialog.ask("install", {
+                id: "lingcore.kill", name: qsTr("结束进程"), installedVersion: "1.1.0", newVersion: "1.2.0",
+                downgrade: false, same: false, allow: true, more: true, newNames: ["processes"],
+                permissions: [
+                    { name: "", text: qsTr("以普通用户权限运行，不是管理员；内存上限 %1 MB").arg(64), enforced: true, note: "" },
+                    { name: "processes", text: qsTr("启动程序（起子进程，或打开程序、非网页链接）"), enforced: true, note: "" },
+                    { name: "network", text: qsTr("联网"), enforced: false, note: qsTr("Win顺 不能阻止它联网") }
+                ]
+            })
         }
         if (preview.dialogShown && !preview.aiPage) {
             dialog.ask("permissions", {

@@ -29,7 +29,7 @@ Item {
     property bool showModified: true
     property int hint: 0 // the number keys' modifier held: this row's number, 0 for none
     property string hintModifier: "Ctrl" // ... that modifier
-    property bool hintTaken: false // another program holds that chord as a global hotkey: shown struck through
+    property bool hintTaken: false // one of Win顺's own shortcuts has that chord: shown struck through
     property NameTip nameTip: null // the window's tip for a name or folder cut short
 
     readonly property var results: ListView.view ? ListView.view.model : null // the bar's ResultModel
@@ -76,24 +76,22 @@ Item {
     function onPixel(y) { return Math.round(y * Screen.devicePixelRatio) / Screen.devicePixelRatio }
     function upToPixel(y) { return Math.ceil(y * Screen.devicePixelRatio - 1e-6) / Screen.devicePixelRatio }
 
-    Rectangle {
+    // The style's highlight (Theme.rowHighlight). The current row's is the
+    // list's own, one for all its rows (DialogBarWindow); here only the hover.
+    // Made the first time it shows, then only hidden (docs/pitfalls.md, ClipRow).
+    readonly property real dpr: Screen.devicePixelRatio
+    Hook {
         anchors.fill: parent
-        anchors.leftMargin: 6
-        anchors.rightMargin: 6
-        anchors.topMargin: 1
-        anchors.bottomMargin: 1
-        radius: Theme.largeControlRadius
-        color: row.current ? Theme.selection : area.containsMouse ? Theme.hover : "transparent"
-    }
-
-    Rectangle { // accent pill on the current row, as in Windows 11 lists
-        visible: row.current
-        x: 7
-        anchors.verticalCenter: parent.verticalCenter
-        width: 3
-        height: 16
-        radius: Theme.smallRadius
-        color: Theme.accent
+        anchors.leftMargin: Theme.rowInset
+        anchors.rightMargin: Theme.rowInset
+        anchors.topMargin: Theme.edge(row.dpr)
+        anchors.bottomMargin: Theme.edge(row.dpr)
+        visible: !row.current && area.containsMouse
+        lazy: true
+        part: Theme.rowHighlight
+        hovered: true
+        role: "list"
+        dpr: row.dpr
     }
 
     Item {
@@ -128,6 +126,7 @@ Item {
 
     Column {
         id: textColumn
+        objectName: "dialogResultText"
         y: row.onPixel((row.height - height) / 2)
         anchors.left: iconSlot.right
         anchors.leftMargin: 12
@@ -141,15 +140,18 @@ Item {
 
             Text {
                 id: nameText
+                objectName: "dialogResultName"
                 readonly property real room: parent.width - (date.visible ? date.width + 10 : 0)
                 width: Math.min(implicitWidth, room)
                 // Shortened around its matches, its end kept (see ResultRow).
-                text: row.results ? row.results.elidedHtml(row.name, row.nameMatches, room, font, row.results.highlightColor)
+                text: row.results ? row.results.elidedHtml(row.name, row.nameMatches, room, font, row.results.highlightColor, row.results.highlightWeight)
                                   : row.nameHtml
                 textFormat: Text.StyledText
                 elide: Text.ElideRight
                 color: Theme.text
                 font.pixelSize: Theme.uiBody
+                // Keep paired lines close without reducing result hit targets.
+                font.preferTypoLineMetrics: true
             }
 
             Text { // when it was last written; left out where the bar is narrow
@@ -166,6 +168,7 @@ Item {
         }
         Text {
             id: folderText
+            objectName: "dialogResultFolder"
             width: parent.width
             text: row.folder
             textFormat: Text.PlainText
@@ -173,10 +176,12 @@ Item {
             maximumLineCount: 1
             color: Theme.subtext
             font.pixelSize: Theme.uiCaption
+            font.preferTypoLineMetrics: true
         }
     }
 
     KeyCap {
+        dpr: row.dpr
         id: keycap
         visible: row.hint > 0
         anchors.right: parent.right

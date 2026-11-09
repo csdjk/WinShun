@@ -17,6 +17,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <numbers>
 #include <utility>
 
@@ -30,15 +31,34 @@ using annot::Kind;
 
 // What [ and ] and a notch of the wheel step through, logical px (3.5): the
 // next of these above or below the value now, whatever the panel's presets.
-constexpr std::array kWidthSteps {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40};
-constexpr std::array kSizeSteps {10, 12, 14, 16, 18, 20, 24, 28, 32, 40, 48, 64};
-constexpr std::array kCellSteps {4, 6, 8, 10, 12, 16, 18, 24, 32};
+// Every value in the small range, then every 2nd or 4th (#164: the wheel is
+// meant to feel continuous, not a few presets).
+struct Band {
+    int from;
+    int step;
+};
+std::vector<int> ladder(std::initializer_list<Band> bands, int last)
+{
+    std::vector<int> values;
+    for (auto it = bands.begin(); it != bands.end(); ++it) {
+        const int to = std::next(it) == bands.end() ? last : std::next(it)->from;
+        for (int v = it->from; v < to; v += it->step)
+            values.push_back(v);
+    }
+    values.push_back(last);
+    return values;
+}
+const std::vector<int> kWidthSteps = ladder({{1, 1}, {16, 2}, {32, 4}}, 64);
+const std::vector<int> kSizeSteps = ladder({{10, 1}, {40, 2}, {80, 4}}, 120);
+const std::vector<int> kCellSteps = ladder({{3, 1}, {16, 2}, {32, 4}}, 64);
 constexpr int kMaxLogical = 500; // as StyleMemory keeps them
 constexpr int kMaxNumber = 99999;
 // A touchpad sends the wheel in small pieces: a notch is 120 of them, and
-// one notch in 200 ms at most, or a flick runs through every size (3.5).
+// one notch in 60 ms at most, or a flick runs through every size (3.5). A
+// mouse wheel sends whole notches, each of them a step at once.
 constexpr int kNotch = 120;
-constexpr qint64 kNotchMs = 200;
+constexpr qint64 kNotchMs = 60;
+constexpr int kMaxNotches = 8; // steps one event may take (a free-spinning wheel)
 
 bool usesWidth(Kind kind)
 {
@@ -56,8 +76,7 @@ bool usesSize(Kind kind)
     return kind == Kind::Text || kind == Kind::Number;
 }
 
-template <std::size_t N>
-int stepped(const std::array<int, N>& steps, int value, int direction)
+int stepped(const std::vector<int>& steps, int value, int direction)
 {
     if (direction > 0) {
         for (int step : steps) {
@@ -70,6 +89,13 @@ int stepped(const std::array<int, N>& steps, int value, int direction)
         if (*it < value)
             return *it;
     }
+    return value;
+}
+
+int steppedBy(const std::vector<int>& steps, int value, int direction, int count)
+{
+    for (; count > 0; --count)
+        value = stepped(steps, value, direction);
     return value;
 }
 
@@ -283,31 +309,41 @@ annot::Item fitLine(const annot::Item& start, annot::Item made, const QRect& roo
     return made;
 }
 
-// What a stroke growing by one point changes: the centre line is the same
-// up to the midpoint before its last point (strokeCentreline), so only the
-// last two points, the new one and the width around them are drawn again,
-// not the whole stroke at every move. None when more may have changed: a
+// A growing stroke may replace its filtered guide and live tip as well as
+// append uniformly spaced anchors.
+// The midpoint curves before the common prefix's last two points stay the
+// same, so only the changed tails and the width around them need repainting.
+// None when more may have changed: a
 // stroke still level or upright is drawn half a pixel off its points until
 // it bends (alignedPoints), and Shift makes it a line again.
 std::optional<QRectF> strokeGrowth(const annot::Item& before, const annot::Item& after)
 {
-    const qsizetype n = before.points.size();
-    if (n < 3 || after.points.size() != n + 1 || after.style != before.style)
+    if (before.points.size() < 3 || after.points.size() < 3 || after.style != before.style)
         return std::nullopt;
-    if (!std::equal(before.points.cbegin(), before.points.cend(), after.points.cbegin()))
+    const auto mismatch = std::mismatch(before.points.cbegin(), before.points.cend(), after.points.cbegin(), after.points.cend());
+    const qsizetype common = std::distance(before.points.cbegin(), mismatch.first);
+    if (common < 2)
         return std::nullopt;
-    bool level = true;
-    bool upright = true;
-    for (const QPointF& p : before.points) {
-        level = level && p.y() == before.points[0].y();
-        upright = upright && p.x() == before.points[0].x();
+    const auto axial = [](const QList<QPointF>& points) {
+        bool level = true, upright = true;
+        for (const QPointF& p : points) {
+            level = level && p.y() == points[0].y();
+            upright = upright && p.x() == points[0].x();
+        }
+        return level || upright;
+    };
+    if (axial(before.points) || axial(after.points))
+        return std::nullopt;
+    qreal x0 = before.points[common - 2].x(), x1 = x0;
+    qreal y0 = before.points[common - 2].y(), y1 = y0;
+    for (const auto* points : {&before.points, &after.points}) {
+        for (qsizetype i = common - 2; i < points->size(); ++i) {
+            x0 = std::min(x0, (*points)[i].x());
+            x1 = std::max(x1, (*points)[i].x());
+            y0 = std::min(y0, (*points)[i].y());
+            y1 = std::max(y1, (*points)[i].y());
+        }
     }
-    if (level || upright)
-        return std::nullopt;
-    const qreal x0 = std::min({before.points[n - 2].x(), before.points[n - 1].x(), after.points[n].x()});
-    const qreal x1 = std::max({before.points[n - 2].x(), before.points[n - 1].x(), after.points[n].x()});
-    const qreal y0 = std::min({before.points[n - 2].y(), before.points[n - 1].y(), after.points[n].y()});
-    const qreal y1 = std::max({before.points[n - 2].y(), before.points[n - 1].y(), after.points[n].y()});
     // Round caps and joins reach half the width past the points (bounds()),
     // and a pixel more for the antialiased edge.
     const qreal m = std::max(1, before.style.width) / 2.0 + 2;
@@ -326,6 +362,7 @@ struct AnnotationModel::Private {
     bool applied = false;
     bool dragging = false; // moved past the drag start since the press
     QList<QPointF> pathNodes; // fixed vertices; the last point in the draft follows the mouse
+    annot::StrokeSampler strokeSampler;
     QPoint pressAt;
     QPoint last;
     Qt::KeyboardModifiers modifiers;
@@ -441,6 +478,16 @@ void AnnotationModel::begin(const annot::Project& project, qreal deviceDpr, cons
     smartSchedule();
 }
 
+void AnnotationModel::begin(const QImage& base, const annot::Document& doc, const annot::StyleMemory& styles)
+{
+    begin(base, doc.dpr, styles);
+    m_document = doc;
+    m_document.canvas = base.size();
+    m_document.crop &= QRect(QPoint(0, 0), m_document.canvas);
+    emit changed(QRectF());
+    sync();
+}
+
 void AnnotationModel::setView(qreal devicePerLogical, qreal zoom)
 {
     m_devicePerLogical = devicePerLogical > 0 ? devicePerLogical : 0;
@@ -544,6 +591,16 @@ std::optional<quint32> AnnotationModel::draft() const
         return std::nullopt;
     const auto* add = static_cast<const annot::AddItems*>(d->command.get());
     if (add->items.isEmpty() || !annot::isBrush(add->items[0]))
+        return std::nullopt;
+    return add->items[0].id;
+}
+
+std::optional<quint32> AnnotationModel::drawing() const
+{
+    if (m_gesture != Gesture::Draw || !d->command || !d->applied)
+        return std::nullopt;
+    const auto* add = static_cast<const annot::AddItems*>(d->command.get());
+    if (add->items.isEmpty())
         return std::nullopt;
     return add->items[0].id;
 }
@@ -1411,6 +1468,8 @@ void AnnotationModel::startDraw(Kind kind, QPoint p, Qt::KeyboardModifiers modif
     case Kind::Text:
         return; // beginNewText()
     }
+    if (annot::isStrokeItem(item) && !annot::isBrush(item))
+        d->strokeSampler = annot::StrokeSampler(item.points.first(), 4 * factor(), 4 * factor());
     d->before = item;
     d->command = std::make_unique<annot::AddItems>(QList<annot::Item> {item});
     d->applied = false;
@@ -1528,11 +1587,22 @@ annot::Item AnnotationModel::shapeTo(QPoint p, bool constrain) const
     return made;
 }
 
-annot::Item AnnotationModel::strokeTo(const annot::Item& stroke, QPoint p, bool constrain) const
+annot::Item AnnotationModel::strokeTo(const annot::Item& stroke, QPoint p, bool constrain)
 {
     const QPoint to = clampToSelection(p);
-    const annot::Item made = annot::reshaped(stroke, int(annot::LineHandle::End), QPointF(to), constrain);
-    return constrain ? fitLine(stroke, made, room()) : made;
+    if (!constrain && !annot::isBrush(stroke)) {
+        annot::Item made = stroke;
+        // Logical screen distances, also when zooming in the editor.
+        d->strokeSampler.append(made.points, annot::pixelCentre(to));
+        return made;
+    }
+    annot::Item made = annot::reshaped(stroke, int(annot::LineHandle::End), QPointF(to), constrain);
+    if (constrain) {
+        made = fitLine(stroke, made, room());
+        if (!annot::isBrush(stroke))
+            d->strokeSampler = annot::StrokeSampler(made.points.last(), 4 * factor(), 4 * factor());
+    }
+    return made;
 }
 
 void AnnotationModel::move(QPoint p, Qt::KeyboardModifiers modifiers)
@@ -1728,7 +1798,7 @@ void AnnotationModel::finishGesture()
             touched(add->revert(m_document));
             return;
         }
-        if (annot::isStrokeItem(item)) {
+        if (annot::isBrush(item)) {
             const QList<QPointF> simple = annot::simplifyStroke(item.points);
             if (simple != item.points) {
                 annot::Change change = add->revert(m_document);
@@ -1901,12 +1971,16 @@ bool AnnotationModel::wheel(int angleDelta, qint64 nowMs)
     if (std::abs(d->wheelSum) < kNotch)
         return true;
     const int direction = d->wheelSum > 0 ? 1 : -1;
+    // Whole notches (a mouse): a step each, no waiting. Pieces that add up to
+    // one (a touchpad): one step, and not again within kNotchMs.
+    const bool whole = angleDelta % kNotch == 0;
+    const int count = whole ? std::min(std::abs(d->wheelSum) / kNotch, kMaxNotches) : 1;
     d->wheelSum = 0;
-    if (d->notched && nowMs - d->lastNotch < kNotchMs)
+    if (!whole && d->notched && nowMs - d->lastNotch < kNotchMs)
         return true;
     d->notched = true;
     d->lastNotch = nowMs;
-    stepSize(direction);
+    stepSize(direction, count);
     return true;
 }
 
@@ -2325,7 +2399,7 @@ void AnnotationModel::setPanel(const QVariantMap& change)
 
 // [ and ], a notch of the wheel: the target's width, size or cell one step
 // on, as a panel change, so an object and the tool's memory both take it.
-void AnnotationModel::stepSize(int direction)
+void AnnotationModel::stepSize(int direction, int count)
 {
     const std::optional<Target> target = styleTarget();
     if (!target)
@@ -2341,19 +2415,19 @@ void AnnotationModel::stepSize(int direction)
     if (usesWidth(kind)) {
         field = u"width"_s;
         value = remembered ? memory.width : annot::toLogicalPx(style.width, dpr);
-        next = stepped(kWidthSteps, value, direction);
+        next = steppedBy(kWidthSteps, value, direction, count);
     } else if (usesSize(kind)) {
         field = u"size"_s;
         value = remembered ? memory.size : annot::toLogicalPx(style.fontPx, dpr);
-        next = stepped(kSizeSteps, value, direction);
+        next = steppedBy(kSizeSteps, value, direction, count);
     } else if (kind == Kind::Redact && (remembered ? memory.shape : style.shape) == annot::RedactShape::Brush) {
         field = u"width"_s;
         value = remembered ? memory.width : annot::toLogicalPx(style.width, dpr);
-        next = stepped(kWidthSteps, value, direction);
+        next = steppedBy(kWidthSteps, value, direction, count);
     } else if (kind == Kind::Redact) {
         field = u"cell"_s;
         value = remembered ? memory.cell : annot::toLogicalPx(style.cell, dpr);
-        next = stepped(kCellSteps, value, direction);
+        next = steppedBy(kCellSteps, value, direction, count);
     }
     if (field.isEmpty() || next == value)
         return;

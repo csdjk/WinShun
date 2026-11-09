@@ -17,8 +17,9 @@ Window {
     property var entries: []
     property int highlighted: -1
 
-    readonly property int padding: 4
-    readonly property int itemHeight: 36
+    readonly property real padding: Theme.menuPadding
+    readonly property int itemHeight: Theme.menuItemHeight
+    readonly property real dpr: Screen.devicePixelRatio
 
     signal triggered(int row, int action)
 
@@ -90,6 +91,11 @@ Window {
 
     // Returns true when the key was for the menu.
     function handleKey(event) {
+        if (event.key === Qt.Key_O && (event.modifiers & ~Qt.KeypadModifier) === Qt.ControlModifier) {
+            if (highlighted < 0)
+                highlighted = step(-1, 1)
+            return true
+        }
         switch (event.key) {
         case Qt.Key_Down: highlighted = step(highlighted, 1); return true
         case Qt.Key_Up: highlighted = step(highlighted < 0 ? 0 : highlighted, -1); return true
@@ -105,9 +111,9 @@ Window {
             return true
         case Qt.Key_Escape:
         case Qt.Key_Menu:
+        case Qt.Key_Left:
             dismiss()
             return true
-        case Qt.Key_Left:
         case Qt.Key_Right:
         case Qt.Key_PageUp:
         case Qt.Key_PageDown:
@@ -115,6 +121,60 @@ Window {
         default:
             dismiss() // typing goes on in the search box
             return false
+        }
+    }
+
+    // The highlight under the item chosen or pointed at: one for the whole
+    // menu (the style's rowHighlight, role "menu"), jumping from item to item
+    // or sliding as the style says (Theme.rowSlide).
+    readonly property Item current: highlighted >= 0 && highlighted < repeater.count ? repeater.itemAt(highlighted) : null
+    Hook {
+        id: highlight
+        objectName: "contextMenuHighlight"
+
+        readonly property real wantedY: menu.current ? content.y + menu.current.y : 0
+        property bool placed: false // it stood under an item before: slides from there
+        property real shownY: 0
+
+        visible: menu.current !== null
+        x: content.x
+        y: shownY
+        width: menu.width - 2 * menu.padding
+        height: menu.itemHeight
+        // A part that knows the menu (declares `role`, or `inMenu` as brand's
+        // does) draws the item's fill; one that does not (a list's highlight)
+        // leaves it to the menu's own.
+        readonly property bool inMenu: item !== null && ("role" in item || "inMenu" in item)
+        part: Theme.rowHighlight
+        hovered: inMenu
+        position: shownY
+        role: "menu"
+        dpr: menu.dpr
+
+        Rectangle {
+            anchors.fill: parent
+            visible: !highlight.inMenu
+            radius: Theme.menuItemRadius
+            color: Theme.menuHover
+        }
+
+        onWantedYChanged: {
+            const had = placed
+            placed = menu.current !== null
+            if (had && placed && Theme.rowSlide > 0 && SystemTheme.animations) {
+                slide.to = wantedY
+                slide.restart()
+            } else {
+                slide.stop()
+                shownY = wantedY
+            }
+        }
+        NumberAnimation {
+            id: slide
+            target: highlight
+            property: "shownY"
+            duration: Theme.rowSlide
+            easing.type: Easing.OutCubic
         }
     }
 
@@ -129,6 +189,7 @@ Window {
 
             delegate: Item {
                 id: entry
+                objectName: "contextMenuEntry-" + index
 
                 required property var modelData
                 required property int index
@@ -139,20 +200,14 @@ Window {
                 height: separator ? 9 : menu.itemHeight
                 implicitWidth: separator ? 0 : 44 + label.implicitWidth + 40 + shortcut.implicitWidth + 14
 
-                Rectangle {
+                Hook { // the style's seam, edge to edge
                     visible: entry.separator
                     anchors.verticalCenter: parent.verticalCenter
                     x: -menu.padding
                     width: menu.width
-                    height: Theme.edge(Screen.devicePixelRatio)
-                    color: Theme.divider
-                }
-
-                Rectangle {
-                    visible: !entry.separator && !entry.disabled && menu.highlighted === entry.index
-                    anchors.fill: parent
-                    radius: Theme.controlRadius
-                    color: Theme.menuHover
+                    height: Theme.edge(menu.dpr)
+                    part: Theme.separator
+                    dpr: menu.dpr
                 }
 
                 Glyph {
@@ -172,7 +227,7 @@ Window {
                     anchors.verticalCenter: parent.verticalCenter
                     text: entry.modelData.text ?? ""
                     color: entry.disabled ? Theme.faint : Theme.text
-                    font.pixelSize: Theme.fontBody
+                    font.pixelSize: Theme.menuTextSize
                 }
 
                 Text {
@@ -183,7 +238,7 @@ Window {
                     anchors.verticalCenter: parent.verticalCenter
                     text: entry.modelData.shortcut ?? ""
                     color: Theme.faint
-                    font.pixelSize: Theme.fontCaption
+                    font.pixelSize: Theme.menuCaptionSize
                 }
 
                 MouseArea {
@@ -199,5 +254,5 @@ Window {
         }
     }
 
-    WindowEdge {}
+    WindowEdge { body: false } // the menu's colour is the window's
 }

@@ -1,5 +1,7 @@
 /build/
 /dist/
+/.worktrees/
+/*.log
 /.vs/
 /.vscode/
 /.qtcreator/

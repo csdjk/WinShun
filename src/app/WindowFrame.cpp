@@ -1,11 +1,11 @@
 #include "WindowFrame.h"
 
-#include "FileIconProvider.h"
 #include "platform/WindowEffects.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QGuiApplication>
+#include <QScreen>
 #include <QQuickWindow>
 #include <QStyleHints>
 #include <QWindow>
@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace ws {
 
@@ -27,10 +28,32 @@ namespace {
 // there, so a click on a row never sizes the window instead.
 constexpr qreal kSideEdge = 6;
 
+int resizeEdge(UINT dpi)
+{
+    return ::GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + ::GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+}
+
+bool withinDragDistance(HWND hwnd, QPoint from, QPoint to)
+{
+    const UINT dpi = ::GetDpiForWindow(hwnd);
+    return std::abs(to.x() - from.x()) < ::GetSystemMetricsForDpi(SM_CXDRAG, dpi)
+        && std::abs(to.y() - from.y()) < ::GetSystemMetricsForDpi(SM_CYDRAG, dpi);
+}
+
+// Only where it is on the screen: an ancestor that clips cuts it, as it does
+// the picture. The type strip, closed, is 0 high and its chips and + rest above
+// it, over the search bar's lower half (#162, #173): counted whole, they made
+// that half of the logo a control's, not the handle's.
 bool covers(const QPointer<QQuickItem>& item, QPointF pos)
 {
-    return item && item->isVisible()
-        && item->mapRectToScene(QRectF(0, 0, item->width(), item->height())).contains(pos);
+    if (!item || !item->isVisible())
+        return false;
+    QRectF area = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+    for (const QQuickItem* above = item->parentItem(); above && area.contains(pos); above = above->parentItem()) {
+        if (above->clip())
+            area &= above->mapRectToScene(QRectF(0, 0, above->width(), above->height()));
+    }
+    return area.contains(pos);
 }
 
 bool anyCovers(const QList<QPointer<QQuickItem>>& items, QPointF pos)
@@ -80,15 +103,18 @@ struct WindowFrame::Hook {
                     ::IntersectRect(&rect, &window, &info.rcWork);
             }
             return 0;
-        case WM_NCACTIVATE:
+        case WM_NCACTIVATE: {
             // DWM learns from the default handling whether the frame is
             // active, which the Mica backdrop depends on; Qt keeps the
             // message from it for a frameless window. -1: nothing to repaint.
             // The frame's dark mode too, in case Qt has set it back (see
-            // win::setDarkFrame). Not activated, it looks active all the same.
+            // win::setDarkFrame). Acrylic and non-activating windows keep the
+            // visual frame state only; Qt and WM_ACTIVATE retain real focus.
             ::DefSubclassProc(hwnd, message, wParam, lParam);
             win::setDarkFrame(self->m_window, QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark);
-            return ::DefWindowProcW(hwnd, message, self->m_noActivate ? TRUE : wParam, -1);
+            const LRESULT result = ::DefWindowProcW(hwnd, message, win::backdropFrameActive(hwnd, self->m_noActivate || wParam), -1);
+            return wParam ? result : TRUE; // always let another window receive activation
+        }
         case WM_MOUSEACTIVATE:
         case WM_POINTERACTIVATE: // touch and pen
             if (self->m_noActivate)
@@ -99,6 +125,9 @@ struct WindowFrame::Hook {
         // Over drag areas and the maximise button the mouse messages are
         // non-client ones: QML hears of them from here.
         case WM_NCMOUSEMOVE:
+            if (self->m_handleButton != Qt::NoButton
+                && !withinDragDistance(hwnd, self->m_handlePress, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}))
+                self->m_handleButton = Qt::NoButton;
             if (wParam == HTCAPTION || wParam == HTMAXBUTTON)
                 self->trackLeave();
             self->setPointer(wParam == HTCAPTION ? self->toWindow(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)) : QPointF(-1, -1));
@@ -110,6 +139,7 @@ struct WindowFrame::Hook {
             self->setMaximizeState(false, false);
             break;
         case WM_MOUSEMOVE: // into the client area
+            self->m_handleButton = Qt::NoButton;
             self->setPointer({-1, -1});
             self->setMaximizeState(false, false);
             break;
@@ -127,6 +157,8 @@ struct WindowFrame::Hook {
             // moving it, the program behind keeps the front.
             if (wParam == HTCAPTION && self->m_noActivate)
                 return ::DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, lParam);
+            if (self->m_noActivate && self->m_resizable && wParam >= HTLEFT && wParam <= HTBOTTOMRIGHT)
+                return ::DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_SIZE | (wParam - HTLEFT + WMSZ_LEFT), lParam);
             // A handle: dragged, it moves the window as the rest does; let go
             // before the pointer has gone the system's drag distance, a click.
             // Told apart here, before the move loop, which takes the release
@@ -147,7 +179,7 @@ struct WindowFrame::Hook {
                     break; // the move loop, as for any press on the drag area
                 }
                 if (!(::GetAsyncKeyState(VK_ESCAPE) & 0x8000)) // Esc ends it too: no click then
-                    QMetaObject::invokeMethod(self, &WindowFrame::handleClicked, Qt::QueuedConnection);
+                    QMetaObject::invokeMethod(self, [self] { emit self->handleClicked(Qt::LeftButton); }, Qt::QueuedConnection);
                 return 0;
             }
             break;
@@ -178,15 +210,42 @@ struct WindowFrame::Hook {
             }
             self->setMaximizeState(wParam == HTMAXBUTTON, false);
             break;
+        case WM_NCRBUTTONDOWN:
+        case WM_NCRBUTTONDBLCLK:
+        case WM_NCMBUTTONDOWN:
+        case WM_NCMBUTTONDBLCLK:
+            self->m_handleButton = Qt::NoButton;
+            if (wParam == HTCAPTION && self->onHandle(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
+                self->m_handleButton = message == WM_NCRBUTTONDOWN || message == WM_NCRBUTTONDBLCLK
+                    ? Qt::RightButton : Qt::MiddleButton;
+                self->m_handlePress = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                return 0;
+            }
+            break;
         case WM_NCRBUTTONUP:
+        case WM_NCMBUTTONUP: {
+            const auto button = message == WM_NCRBUTTONUP ? Qt::RightButton : Qt::MiddleButton;
+            const auto pressed = std::exchange(self->m_handleButton, Qt::NoButton);
+            const QPoint point(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (pressed == button && wParam == HTCAPTION && self->onHandle(point.x(), point.y())
+                && withinDragDistance(hwnd, self->m_handlePress, point)) {
+                QMetaObject::invokeMethod(self, [self, button] { emit self->handleClicked(button); }, Qt::QueuedConnection);
+                return 0;
+            }
             // The window menu with our own frame, nothing otherwise. Not to Qt:
             // it would take the context menu message that follows for one inside
             // the window, which all of it is.
             if (wParam == HTCAPTION) {
-                if (self->m_ownFrame)
+                if (button == Qt::RightButton && self->m_ownFrame)
                     showWindowMenu(hwnd, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
                 return 0;
             }
+            break;
+        }
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+        case WM_CANCELMODE:
+            self->m_handleButton = Qt::NoButton;
             break;
         case WM_NCDESTROY:
             ::RemoveWindowSubclass(hwnd, &Hook::proc, 0);
@@ -222,6 +281,7 @@ void WindowFrame::setWindow(QWindow* window)
     win::keepDarkFrameOnShow(window);
     connect(window, &QWindow::visibleChanged, this, [this](bool visible) {
         if (!visible) { // no leave message comes then
+            m_handleButton = Qt::NoButton;
             m_trackingLeave = false;
             setPointer({-1, -1});
             setMaximizeState(false, false);
@@ -270,7 +330,7 @@ void WindowFrame::setNoActivate(bool on)
     const LONG_PTR exStyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     ::SetWindowLongPtrW(hwnd, GWL_EXSTYLE, on ? exStyle | WS_EX_NOACTIVATE : exStyle & ~WS_EX_NOACTIVATE);
     // The frame drawn as active (see WM_NCACTIVATE above), or as it is again.
-    ::DefWindowProcW(hwnd, WM_NCACTIVATE, on || ::GetForegroundWindow() == hwnd, -1);
+    ::DefWindowProcW(hwnd, WM_NCACTIVATE, win::backdropFrameActive(hwnd, on || ::GetForegroundWindow() == hwnd), -1);
 }
 
 void WindowFrame::addDragArea(QQuickItem* item)
@@ -305,13 +365,6 @@ bool WindowFrame::onHandle(int screenX, int screenY) const
     return anyCovers(m_handles, toWindow(screenX, screenY));
 }
 
-QString WindowFrame::icon() const
-{
-    // Native separators: the shell does not parse "F:/..." and the generic
-    // program icon would come back.
-    return FileIconProvider::iconUrl(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()), false);
-}
-
 QPointF WindowFrame::toWindow(int screenX, int screenY) const
 {
     POINT point {screenX, screenY};
@@ -328,6 +381,8 @@ int WindowFrame::hitTest(int screenX, int screenY) const
         return HTCLIENT; // an open menu over a drag area or the title bar: the press is the menu's
     const bool onMaximize = m_ownFrame && covers(m_maximizeButton, pos);
     const bool onControl = onMaximize || anyCovers(m_controls, pos);
+    if (!onControl && anyCovers(m_dragHandles, pos))
+        return HTCAPTION;
     if ((m_ownFrame || m_resizable) && !::IsZoomed(hwnd)) {
         // Resize edges as thick as the system frame, inside the window.
         POINT point {screenX, screenY};
@@ -335,7 +390,7 @@ int WindowFrame::hitTest(int screenX, int screenY) const
         RECT client {};
         ::GetClientRect(hwnd, &client);
         const UINT dpi = ::GetDpiForWindow(hwnd);
-        const int edge = ::GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + ::GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        const int edge = resizeEdge(dpi);
         const bool top = point.y < edge;
         // Caption buttons reach the window's edge, as on the system's title
         // bar: beside them only the corner above resizes.
@@ -370,6 +425,19 @@ int WindowFrame::hitTest(int screenX, int screenY) const
     if (anyCovers(m_dragAreas, pos))
         return HTCAPTION;
     return HTCLIENT;
+}
+
+QRect WindowFrame::availableArea(QQuickItem* item) const
+{
+    QScreen* screen = item && item->window() ? item->window()->screen() : QGuiApplication::primaryScreen();
+    return screen ? screen->availableGeometry() : QRect();
+}
+
+qreal WindowFrame::resizeMargin(qreal devicePixelRatio) const
+{
+    const qreal dpr = std::max(qreal(1), devicePixelRatio);
+    const UINT dpi = m_hwnd ? ::GetDpiForWindow(reinterpret_cast<HWND>(m_hwnd)) : ::GetDpiForSystem();
+    return std::max(kSideEdge, resizeEdge(dpi) / dpr);
 }
 
 void WindowFrame::setResizable(bool on)

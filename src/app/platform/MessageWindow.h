@@ -31,6 +31,7 @@ public:
         // then decides what a press does (ShortcutAgain, GitHub #111).
         std::function<void(std::uint32_t time)> trayActivated; // left click
         std::function<void()> trayMenuRequested; // right click
+        std::function<void()> trayMenuSoon; // the right button pressed on the icon: the menu is coming
         std::function<void(int id, std::uint32_t time)> hotkeyPressed;
         std::function<void(const QString&)> commandReceived;
         std::function<void(const QString& folder)> searchHere; // "D:\Work", "\\nas\docs"
@@ -72,6 +73,8 @@ public:
     // The one on the screen, if any; a plugin's waiting is dropped too (it
     // goes before a screenshot or a recording).
     void hideNotification();
+    // Whether the tray icon is there: without it no notification shows.
+    bool trayVisible() const noexcept { return m_trayVisible; }
     // A plugin's held back longer than this is out of date and dropped.
     static constexpr std::uint64_t kHeldMostMs = 60000;
 

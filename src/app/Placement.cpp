@@ -1,7 +1,9 @@
 #include "Placement.h"
 
 #include "BoxSide.h"
+#include "DragBounds.h"
 #include "SystemTheme.h"
+#include "WindowAvoidance.h"
 
 #include <QEasingCurve>
 #include <QEvent>
@@ -48,9 +50,8 @@ qreal scaleOf(HMONITOR monitor, qreal fallback)
     return fallback;
 }
 
-// Where a window being moved goes instead of `rect` (physical pixels): on the
-// work area of the monitor under the pointer with `room` (logical pixels)
-// below its top.
+// A held window can span monitors. Restrict only the outer desktop bounds;
+// fitting it to the pointer's monitor here would make it jump at the seam.
 void shapeMove(RECT& rect, int width, int room, qreal fallbackScale)
 {
     POINT cursor {};
@@ -59,14 +60,22 @@ void shapeMove(RECT& rect, int width, int room, qreal fallbackScale)
     MONITORINFO info {sizeof info};
     if (!::GetMonitorInfoW(monitor, &info))
         return;
-    const RECT& area = info.rcWork;
+    const auto workArea = [](const RECT& area) {
+        return QRect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+    };
+    QList<QRect> areas {workArea(info.rcWork)};
+    for (QScreen* screen : QGuiApplication::screens()) {
+        const auto* native = screen->nativeInterface<QNativeInterface::QWindowsScreen>();
+        MONITORINFO other {sizeof other};
+        if (native && native->handle() != monitor && ::GetMonitorInfoW(native->handle(), &other))
+            areas.append(workArea(other.rcWork));
+    }
     // Sizes as they will be on that monitor once the window is over there.
     const qreal scale = scaleOf(monitor, fallbackScale);
     width = qRound(width * scale);
     room = qRound(room * scale);
-    const LONG x = std::clamp(rect.left, area.left, std::max(area.left, area.right - width));
-    const LONG y = std::clamp(rect.top, area.top, std::max(area.top, area.bottom - room));
-    ::OffsetRect(&rect, x - rect.left, y - rect.top);
+    const QPoint at = dragbounds::constrain(QPoint(int(rect.left), int(rect.top)), {width, room}, areas);
+    ::OffsetRect(&rect, at.x() - rect.left, at.y() - rect.top);
 }
 
 // A screen's work area in physical pixels, and where Qt puts a window's
@@ -106,6 +115,17 @@ NativeArea nativeArea(QScreen* screen)
     return native;
 }
 
+// Native bounds in Qt's pixels on that screen, outwards; empty: empty.
+QRect logicalOf(const NativeArea& native, const QRect& r)
+{
+    if (r.isEmpty())
+        return {};
+    const auto down = [&](int value, int origin) { return origin + int(std::floor((value - origin) / native.scale)); };
+    const auto up = [&](int value, int origin) { return origin + int(std::ceil((value - origin) / native.scale)); };
+    return QRect(QPoint(down(r.x(), native.origin.x()), down(r.y(), native.origin.y())),
+        QPoint(up(r.x() + r.width(), native.origin.x()) - 1, up(r.y() + r.height(), native.origin.y()) - 1));
+}
+
 } // namespace
 
 Placement::Placement(QString stateFile, QString group, QObject* parent)
@@ -141,6 +161,14 @@ Placement::Placement(QString stateFile, QString group, QObject* parent)
         if (w >= 400 && h >= 300 && w <= 20000 && h <= 20000)
             m_panelSize = {w, h};
     }
+    const auto dragged = [&state](const QString& group, QPointF fallback) {
+        bool xOk = false, yOk = false;
+        const double x = state.value(group + u"/DraggedCenterX"_s).toDouble(&xOk);
+        const double y = state.value(group + u"/DraggedTop"_s).toDouble(&yOk);
+        return xOk && yOk && x >= 0 && x <= 1 && y >= 0 && y <= 1 ? QPointF(x, y) : fallback;
+    };
+    m_draggedAnchor = dragged(m_group, m_anchor);
+    m_draggedPanelAnchor = dragged(u"Panel"_s, m_panelAnchor);
 
     m_glide.setDuration(kGlideMs);
     m_glide.setEasingCurve(QEasingCurve::OutCubic);
@@ -151,7 +179,6 @@ Placement::Placement(QString stateFile, QString group, QObject* parent)
 
     connect(&m_slide, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) { stepSlide(value.toInt()); });
     connect(&m_slide, &QVariantAnimation::finished, this, [this] {
-        emit slideStepped();
         if (const std::function<void()> done = std::exchange(m_slideDone, {}))
             done();
     });
@@ -166,8 +193,34 @@ struct Placement::Hook {
             self->m_glide.stop();
             self->settleSlide(); // grabbed on its way in: where it was going
             self->m_moveStart = self->m_window->position();
+            self->m_resizeStart = self->m_window->size();
             self->m_grabbed = false;
             self->setMoving(true);
+            break;
+        case WM_SIZING:
+            if (self->m_windowSizingEnabled) {
+                if (!self->m_windowSizing) {
+                    self->m_windowSizing = true;
+                    emit self->windowSizingChanged();
+                }
+                // Constrain the proposed native rectangle, before Windows applies it.
+                // Qt's minimum/maximum size handles the other sizing limits.
+                RECT& rect = *reinterpret_cast<RECT*>(lParam);
+                MONITORINFO info {sizeof info};
+                if (::GetMonitorInfoW(::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)) {
+                    rect.left = std::max(rect.left, info.rcWork.left);
+                    rect.top = std::max(rect.top, info.rcWork.top);
+                    rect.right = std::min(rect.right, info.rcWork.right);
+                    rect.bottom = std::min(rect.bottom, info.rcWork.bottom);
+                }
+                return TRUE;
+            }
+            break;
+        case WM_NCLBUTTONDBLCLK:
+            if (self->m_windowSizingEnabled && wParam >= HTLEFT && wParam <= HTBOTTOMRIGHT) {
+                emit self->sizeResetRequested();
+                return 0;
+            }
             break;
         case WM_MOVING: {
             // Windows proposes where the window was plus the pointer's step,
@@ -217,6 +270,27 @@ struct Placement::Hook {
                 self->endSizing(false);
             break;
         case WM_EXITSIZEMOVE:
+            if (self->m_windowSizing) {
+                const QSize size = self->m_window->size();
+                if (size != self->m_resizeStart) {
+                    // A deliberate resize keeps its opposite edge fixed, including
+                    // windows attached to a caret. Automatic fitting is never saved.
+                    self->m_box.reset();
+                    self->m_avoid.reset();
+                    self->setTaskbar({});
+                    self->m_dropped = true;
+                    self->m_left = self->m_window->x();
+                    if (auto* screen = self->m_window->screen())
+                        self->setRoom(screen->availableGeometry().bottom() + 1 - self->m_window->y());
+                    emit self->windowResized(self->m_resizeStart, size);
+                }
+                self->m_windowSizing = false;
+                emit self->windowSizingChanged();
+                self->setMoving(false);
+                self->m_displaySettle.stop();
+                self->m_displayRestorePending = false;
+                break;
+            }
             self->setMoving(false);
             // A completed user move/resize owns its final geometry, including
             // a drag across DPI boundaries. Do not snap it back to the old
@@ -224,8 +298,13 @@ struct Placement::Hook {
             self->m_displaySettle.stop();
             self->m_displayRestorePending = false;
             // Qt updates the window's screen on this message too, after us.
-            QMetaObject::invokeMethod(self, self->m_panel ? &Placement::savePanel : &Placement::rememberSpot,
-                Qt::QueuedConnection);
+            QMetaObject::invokeMethod(self, [self] {
+                if (!self->m_window) return;
+                if (self->m_panel) self->savePanel();
+                else self->rememberSpot();
+                if (self->m_window->position() != self->m_moveStart && !self->m_box && !self->m_avoid && !self->m_taskbar && !self->m_dropped)
+                    self->saveDraggedPosition();
+            }, Qt::QueuedConnection);
             break;
         case WM_DPICHANGED:
         case WM_DISPLAYCHANGE:
@@ -270,7 +349,7 @@ void Placement::setWindow(QWindow* window)
     // screen, and over a box its bottom stays there.
     connect(window, &QWindow::widthChanged, this, &Placement::refit);
     connect(window, &QWindow::heightChanged, this, [this] {
-        if ((m_box && m_above) || m_taskbar)
+        if ((m_box && m_above) || m_taskbar || m_avoid)
             refit();
     });
 }
@@ -326,7 +405,12 @@ void Placement::restoreDisplayGeometry()
         m_window->setGeometry(panelRect(screen));
         return;
     }
-    fitWidth(screen);
+    // Over an Opus file list (it comes here as it is shown too): narrowed to
+    // the list again, not back to the user's width (GitHub #82).
+    if (m_avoid && m_avoidInside)
+        settleAvoiding(screen, true);
+    else
+        fitWidth(screen);
     if (!m_contentSize.isEmpty())
         m_window->resize(m_contentSize);
     refit();
@@ -334,14 +418,35 @@ void Placement::restoreDisplayGeometry()
 
 void Placement::placeOn(QScreen* screen)
 {
+    avoidNative({}, screen);
+}
+
+void Placement::avoidNative(const QRect& window, QScreen* screen, bool inside, const QRect& lists, const QRect& frame,
+    const QRect& orInto)
+{
     m_glide.stop();
+    m_avoid = window.isEmpty() ? std::nullopt : std::optional {window};
+    m_avoidInside = inside;
+    m_avoidLists = lists;
+    m_avoidFrame = frame;
     m_box.reset();
     setAbove(false);
     setTaskbar({});
     m_dropped = false;
     if (m_window && screen) {
         fitWidth(screen);
-        moveWindow(settleOn(screen));
+        if (m_avoid && !inside && !orInto.isEmpty()) {
+            // As tall as settleAvoiding has it, from home as there.
+            const NativeArea native = nativeArea(screen);
+            const int height = std::max(m_roomNeeded, m_roomWanted > 0 ? m_roomWanted : m_window->height());
+            if (!windowavoidance::clearOf(screen->availableGeometry(), logicalOf(native, window), {widthNow(), height},
+                    settleOn(screen, false))) {
+                m_avoid = orInto;
+                m_avoidInside = true;
+                m_avoidLists = {};
+            }
+        }
+        moveWindow(m_avoid ? settleAvoiding(screen, true) : settleOn(screen));
     }
 }
 
@@ -350,9 +455,34 @@ void Placement::attach(const QRect& box, QScreen* screen)
     attachBy(box, screen, kBoxGap);
 }
 
+void Placement::placeDisplay(const QRect& geometry, int room, bool above)
+{
+    if (!m_window || geometry.isEmpty()) return;
+    m_glide.stop();
+    m_box.reset();
+    m_avoid.reset();
+    setTaskbar({});
+    m_dropped = true;
+    m_left = geometry.x();
+    setAbove(above);
+    setRoom(room);
+    m_place = geometry.topLeft();
+    m_window->setGeometry(geometry);
+}
+
+void Placement::adoptDisplayGeometry(const QRect& geometry)
+{
+    if (!m_window || geometry.isEmpty()) return;
+    m_moveStart = m_window->position();
+    m_window->setGeometry(geometry);
+    m_place = geometry.topLeft();
+    rememberSpot();
+}
+
 void Placement::attachBy(const QRect& box, QScreen* screen, int gap)
 {
     m_glide.stop();
+    m_avoid.reset();
     m_box = box;
     m_boxGap = gap;
     setTaskbar({});
@@ -395,6 +525,7 @@ void Placement::attachNative(const QRect& box)
 void Placement::attachTaskbar(const taskbar::Spot& spot)
 {
     m_glide.stop();
+    m_avoid.reset();
     const HMONITOR monitor = ::MonitorFromPoint(spot.anchor, MONITOR_DEFAULTTONEAREST);
     QScreen* screen = nullptr;
     for (QScreen* candidate : QGuiApplication::screens()) {
@@ -447,6 +578,7 @@ void Placement::enterPanel(QScreen* screen)
     if (!m_window || m_panel)
         return;
     m_glide.stop();
+    m_avoid.reset();
     settleSlide();
     m_box.reset();
     setAbove(false);
@@ -492,6 +624,8 @@ void Placement::setRoomNeeded(int height)
         return;
     m_roomNeeded = height;
     emit roomNeededChanged();
+    if (m_avoid)
+        refit();
 }
 
 void Placement::setRoomWanted(int height)
@@ -500,6 +634,8 @@ void Placement::setRoomWanted(int height)
         return;
     m_roomWanted = height;
     emit roomWantedChanged();
+    if (m_avoid)
+        refit();
 }
 
 void Placement::setRoomStep(int height)
@@ -551,7 +687,7 @@ void Placement::setAbove(bool above)
 // The anchor's spot on the screen's work area, moved as far as needed to keep
 // the window on it with room below for the fewest rows. More rows than fit
 // there are not shown (room), so a long list does not push the window up.
-QPoint Placement::settleOn(QScreen* screen)
+QPoint Placement::settleOn(QScreen* screen, bool updateRoom)
 {
     const QRect area = screen->availableGeometry();
     const int width = widthNow();
@@ -568,15 +704,52 @@ QPoint Placement::settleOn(QScreen* screen)
     x = native.keepInside(x, width, native.work.left(), native.work.x() + native.work.width(), native.origin.x());
     y = native.keepInside(y, m_roomNeeded, native.work.top(), native.work.y() + native.work.height(), native.origin.y());
     const int bottom = native.work.y() + native.work.height();
-    setRoom(int(std::floor((bottom - native.toNative(y, native.origin.y())) / native.scale)));
+    if (updateRoom)
+        setRoom(int(std::floor((bottom - native.toNative(y, native.origin.y())) / native.scale)));
     return {x, y};
 }
 
-// Under the box, level with its left edge (moved in to stay on the work
-// area); over it where not all of the window fits under it and more whole
-// rows fit over it (boxside::above; GitHub #38: low on the screen it stayed
-// under the caret with three rows, eight fitting over it). The side is
-// decided before the room, so that QML has both as it sizes the window.
+// The same monitor and the same width, without persisting an automatic move.
+QPoint Placement::settleAvoiding(QScreen* screen, bool fitList)
+{
+    const QPoint home = settleOn(screen, false);
+    const NativeArea native = nativeArea(screen);
+    const auto logical = [&](const QRect& r) { return logicalOf(native, r); };
+    const QRect obstacle = logical(*m_avoid);
+    const QRect area = screen->availableGeometry();
+    int height = std::max(m_roomNeeded, m_roomWanted > 0 ? m_roomWanted : m_window->height());
+    QPoint at;
+    if (m_avoidInside) {
+        // Over the list (GitHub #82). As it opens, as narrow as the list is
+        // (the user's width the most, the least width the launcher has the
+        // least: Main.qml sizes the window by boxWidth); later, as it is then.
+        const bool narrow = fitList && m_defaultWidth > 0 && !m_panel;
+        const int width = narrow ? std::min(460, widthOn(screen)) : widthNow();
+        const QRect spot = windowavoidance::inList(area, obstacle, logical(m_avoidLists), logical(m_avoidFrame),
+            {width, height}, {narrow ? std::min(320, width) : width, m_roomNeeded});
+        if (narrow && spot.width() != m_boxWidth) {
+            m_boxWidth = spot.width();
+            emit boxWidthChanged();
+        }
+        at = spot.topLeft();
+        height = spot.height();
+        // Keep the panel's bottom at the file list's bottom as the result
+        // count changes; room still describes the full result budget.
+        if (!fitList)
+            at.ry() += std::max(0, spot.height() - m_window->height());
+    } else {
+        at = windowavoidance::place(area, obstacle, {widthNow(), height}, home);
+    }
+    at.setX(native.keepInside(at.x(), widthNow(), native.work.x(), native.work.x() + native.work.width(), native.origin.x()));
+    at.setY(native.keepInside(at.y(), std::min(height, area.height()), native.work.y(), native.work.y() + native.work.height(),
+        native.origin.y()));
+    const int room = int(std::floor((native.work.y() + native.work.height() - native.toNative(at.y(), native.origin.y())) / native.scale));
+    // Over a list, its rows end above the list's bottom edge, not the work area's.
+    setRoom(m_avoidInside ? std::min(room, height) : room);
+    return at;
+}
+
+// Under the box, or above it where more whole rows fit (GitHub #38).
 QPoint Placement::settleBy(QScreen* screen)
 {
     const QRect area = screen->availableGeometry();
@@ -666,6 +839,8 @@ void Placement::refit()
         moveWindow(settleByTaskbar(m_taskbarScreen));
     } else if (m_box) {
         moveWindow(settleBy(screen));
+    } else if (m_avoid) {
+        moveWindow(settleAvoiding(screen));
     } else if (m_dropped) {
         const QRect area = screen->availableGeometry();
         const int width = widthNow();
@@ -680,7 +855,7 @@ void Placement::refit()
 
 void Placement::moveHome()
 {
-    if (!m_window || m_moving || m_box || m_taskbar || m_dropped || m_panel) // by a box: no spot to go back to
+    if (!m_window || m_moving || m_box || m_avoid || m_taskbar || m_dropped || m_panel) // temporary spot: no home to change
         return;
     m_anchor = kHome;
     save();
@@ -688,6 +863,41 @@ void Placement::moveHome()
     if (!screen)
         return;
     glideTo(settleOn(screen));
+}
+
+void Placement::centerOnScreen()
+{
+    if (!m_window || m_moving || m_sizing || m_windowSizing)
+        return;
+    QScreen* screen = m_window->screen();
+    if (!screen)
+        return;
+    const QRect area = screen->availableGeometry();
+    if (area.isEmpty())
+        return;
+    m_glide.stop();
+    settleSlide();
+    m_box.reset();
+    m_avoid.reset();
+    setTaskbar({});
+    m_taskbarSpot.reset();
+    m_taskbarScreen.clear();
+    m_dropped = false;
+    setAbove(false);
+    const QSize size = m_window->size();
+    QPoint target(area.x() + std::max(0, (area.width() - size.width()) / 2),
+        area.y() + std::max(0, (area.height() - size.height()) / 2));
+    const NativeArea native = nativeArea(screen);
+    target.setX(native.keepInside(target.x(), size.width(), native.work.left(), native.work.x() + native.work.width(), native.origin.x()));
+    target.setY(native.keepInside(target.y(), size.height(), native.work.top(), native.work.y() + native.work.height(), native.origin.y()));
+    moveWindow(target);
+    if (m_panel) {
+        savePanel();
+    } else {
+        m_anchor = {0.5, qreal(target.y() - area.y()) / area.height()};
+        save();
+        setRoom(area.y() + area.height() - target.y());
+    }
 }
 
 void Placement::setMoving(bool moving)
@@ -698,6 +908,39 @@ void Placement::setMoving(bool moving)
     emit movingChanged();
 }
 
+void Placement::saveDraggedPosition()
+{
+    QPointF& anchor = m_panel ? m_draggedPanelAnchor : m_draggedAnchor;
+    anchor = m_panel ? m_panelAnchor : m_anchor;
+    QSettings state(m_stateFile, QSettings::IniFormat);
+    const QString group = m_panel ? u"Panel"_s : m_group;
+    state.setValue(group + u"/DraggedCenterX"_s, anchor.x());
+    state.setValue(group + u"/DraggedTop"_s, anchor.y());
+}
+
+void Placement::restoreDraggedPosition()
+{
+    if (!m_window || m_moving || m_sizing || m_windowSizing) return;
+    m_glide.stop();
+    settleSlide();
+    m_box.reset();
+    m_avoid.reset();
+    setTaskbar({});
+    m_taskbarSpot.reset();
+    m_taskbarScreen.clear();
+    m_dropped = false;
+    setAbove(false);
+    if (m_panel) {
+        m_panelAnchor = m_draggedPanelAnchor;
+        if (auto* screen = m_window->screen()) moveWindow(panelRect(screen).topLeft());
+        savePanel();
+    } else {
+        m_anchor = m_draggedAnchor;
+        save();
+        if (auto* screen = m_window->screen()) glideTo(settleOn(screen));
+    }
+}
+
 void Placement::rememberSpot()
 {
     if (m_panel) {
@@ -706,9 +949,10 @@ void Placement::rememberSpot()
     }
     if (!m_window || m_window->position() == m_moveStart) // Esc, or not moved at all
         return;
-    if (m_box || m_taskbar || m_dropped) { // by a box: stays where it was let go, its spot as it was
+    if (m_box || m_avoid || m_taskbar || m_dropped) { // temporary spot: moving it does not change home
         // `above` too: the rows do not turn over in the hand that moved them.
         m_box.reset();
+        m_avoid.reset();
         setTaskbar({});
         m_dropped = true;
         m_left = m_window->x();
@@ -843,15 +1087,6 @@ const QEasingCurve& fastIn()
     return curve;
 }
 
-// Exits: under way at once, then faster and faster. Not Windows' gentle exit
-// (1, 0, 1, 1), which moves a mere 4 % in its first 70 ms: the launcher
-// seemed to close late (most of all when closed again as it opened).
-const QEasingCurve& accelerate()
-{
-    static const QEasingCurve curve = bezier(0.3, 0, 1, 1);
-    return curve;
-}
-
 } // namespace
 
 void Placement::beginSlide()
@@ -921,18 +1156,15 @@ void Placement::slideOut(std::function<void()> done)
         finish();
         return;
     }
-    // Faded out, sinking a little toward the taskbar, never onto it.
+    // Faded out where it is, briefly: closing needs no more show than that
+    // (it sank toward the taskbar as well once; too much motion, the user
+    // said). Caught while still coming in: from where that got to.
     Slide slide;
-    slide.from = m_offset;
+    slide.from = slide.to = m_offset;
     slide.opacityFrom = m_opacity;
-    slide.shiftFrom = m_contentShift;
-    slide.to = nearOffset(8);
+    slide.shiftFrom = slide.shiftTo = m_contentShift;
     slide.opacityTo = 0;
-    slide.moveMs = 167;
-    slide.fadeMs = 150;
-    slide.moveCurve = accelerate();
-    slide.shiftCurve = accelerate();
-    slide.shiftMs = slide.moveMs;
+    slide.fadeMs = 120;
     startSlide(std::move(slide), std::move(finish));
 }
 
@@ -995,7 +1227,6 @@ void Placement::stepSlide(int elapsed)
         m_contentShift = shift;
         emit contentShiftChanged();
     }
-    emit slideStepped();
 }
 
 void Placement::rememberWidth(int defaultWidth, int minimumWidth)

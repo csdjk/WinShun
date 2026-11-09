@@ -11,15 +11,21 @@ add_library(wsplugin_lite STATIC
     runner/Json.cpp runner/Json.h
     runner/Lite.h
     runner/Sandbox.cpp runner/Sandbox.h
+    # Plain Win32 (no Qt), shared with the service and wscore: the elevated
+    # environment keeps only the PATH folders ordinary users cannot write to.
+    ${PROJECT_SOURCE_DIR}/src/core/ServiceLocation.cpp ${PROJECT_SOURCE_DIR}/src/core/ServiceLocation.h
 )
-target_include_directories(wsplugin_lite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/runner)
-target_link_libraries(wsplugin_lite PUBLIC winshun_options advapi32 userenv user32)
+target_include_directories(wsplugin_lite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/runner PRIVATE ${PROJECT_SOURCE_DIR}/src/core)
+target_link_libraries(wsplugin_lite PUBLIC winshun_options advapi32 userenv user32 shell32 ole32)
 set_target_properties(wsplugin_lite PROPERTIES AUTOMOC OFF MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # WinShunPluginHost.exe: the runner (runner/main.cpp). The linker's default
 # manifest runs it as the invoker; Win顺 gives it Explorer's token.
-add_executable(WinShunPluginHost WIN32 runner/main.cpp ${PROJECT_SOURCE_DIR}/resources/WinShunPluginHost.rc)
-target_link_libraries(WinShunPluginHost PRIVATE wsplugin_lite shell32)
+# It also runs two plugins that come with Win顺 on threads of its own
+# (runner/InProcess.cpp): winshun.tools built in, winshun.switches from its DLL.
+add_executable(WinShunPluginHost WIN32 runner/main.cpp runner/InProcess.cpp runner/InProcess.h
+    ${PROJECT_SOURCE_DIR}/resources/WinShunPluginHost.rc)
+target_link_libraries(WinShunPluginHost PRIVATE wsplugin_lite wstools shell32)
 set_target_properties(WinShunPluginHost PROPERTIES AUTOMOC OFF MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 install(TARGETS WinShunPluginHost RUNTIME DESTINATION .)
@@ -29,8 +35,11 @@ install(TARGETS WinShunPluginHost RUNTIME DESTINATION .)
 qt_add_library(wsplugin STATIC
     AiBridge.cpp AiBridge.h
     Catalog.cpp Catalog.h
+    Details.cpp Details.h
+    Elevation.cpp Elevation.h
     Gallery.cpp Gallery.h
     Host.cpp Host.h
+    IndexSignature.cpp IndexSignature.h
     Install.cpp Install.h
     Items.cpp Items.h
     Manifest.cpp Manifest.h
@@ -42,11 +51,13 @@ qt_add_library(wsplugin STATIC
     Session.cpp Session.h
     ToastPolicy.cpp ToastPolicy.h
     Tools.cpp Tools.h
+    Updates.cpp Updates.h
     ZeroCode.cpp ZeroCode.h
     runner/Sandbox.cpp
 )
 target_include_directories(wsplugin PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/runner)
 # miniz: archives of plugins (Install.cpp); the Credential Manager keeps
 # their passwords (Secrets.cpp).
+# bcrypt: the plugin list's signature (IndexSignature.cpp).
 # shlwapi: AssocIsDangerous, for the open policy (OpenPolicy.cpp).
-target_link_libraries(wsplugin PUBLIC wscore wsmcp wsmcp_proto PRIVATE miniz advapi32 userenv user32 shlwapi)
+target_link_libraries(wsplugin PUBLIC wscore wsmcp wsmcp_proto PRIVATE miniz advapi32 bcrypt userenv user32 shlwapi shell32 ole32 version)

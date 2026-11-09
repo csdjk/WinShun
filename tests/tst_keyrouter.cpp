@@ -1,5 +1,6 @@
 #include "platform/HoldWatch.h"
 #include "platform/KeyRouter.h"
+#include "platform/QtKeys.h"
 #include "Diagnostics.h"
 
 #include <QCoreApplication>
@@ -49,7 +50,7 @@ LRESULT CALLBACK receiverProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     return ::DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-int receiver()
+int receiver(bool shellCompanion = false)
 {
     const HINSTANCE instance = ::GetModuleHandleW(nullptr);
     WNDCLASSW type {};
@@ -62,10 +63,22 @@ int receiver()
         WS_OVERLAPPEDWINDOW, 100, 100, 520, 220, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 2;
+    int shellLeft = 0, shellHeight = 0;
+    if (shellCompanion) {
+        shellLeft = ::GetSystemMetrics(SM_CXSCREEN) / 2 - 260;
+        shellHeight = ::GetSystemMetrics(SM_CYSCREEN) - 100;
+        ::SetWindowPos(window, nullptr, shellLeft, 50, 520, shellHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     ::ImmAssociateContextEx(window, nullptr, 0); // the fixture records raw letters, independent of the user's IME mode
     ::ShowWindow(window, SW_SHOWNORMAL);
     ::SetForegroundWindow(window);
     std::printf("window:%llu\n", static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(window)));
+    if (shellCompanion) {
+        const HWND companion = ::CreateWindowExW(WS_EX_TOOLWINDOW, type.lpszClassName, L"WinShun shell companion test",
+            WS_POPUP | WS_BORDER, shellLeft - 280, 50, 280, shellHeight, window, nullptr, instance, nullptr);
+        ::ShowWindow(companion, SW_SHOWNOACTIVATE);
+        std::printf("companion:%llu\n", static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(companion)));
+    }
     std::fflush(stdout);
     MSG message;
     while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -95,7 +108,7 @@ bool send(HWND target, WORD vk, bool up)
     input.ki.wVk = vk;
     input.ki.wScan = static_cast<WORD>(::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
     input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
-    if (vk == VK_DOWN)
+    if (vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT)
         input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     return ::SendInput(1, &input, sizeof input) == 1;
 }
@@ -106,6 +119,37 @@ class KeyRouterTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void groupSearchChordPolicy()
+    {
+        KeyRouter::Key key {.key = Qt::Key_G, .modifiers = Qt::ControlModifier, .vk = 'G'};
+        QVERIFY(KeyRouter::wantsKey(key));
+        QVERIFY(!KeyRouter::wantsKey(key, Qt::AltModifier, KeyRouter::Policy::Menu));
+        key.modifiers |= Qt::ShiftModifier;
+        QVERIFY(!KeyRouter::wantsKey(key));
+        key.modifiers = Qt::ControlModifier;
+        key.key = Qt::Key_W;
+        key.vk = 'W';
+        QVERIFY(!KeyRouter::wantsKey(key)); // unrelated app shortcuts still pass through
+    }
+
+    // The names of the keys routed, and of those TypeToSearch hands over to
+    // the launcher (GitHub #203): Qt's, as its own key events have them.
+    void qtKeyNames()
+    {
+        QCOMPARE(qtKeyOf('A', false, false), int(Qt::Key_A));
+        QCOMPARE(qtKeyOf('7', false, true), int(Qt::Key_7));
+        QCOMPARE(qtKeyOf(VK_NUMPAD3, false, false), int(Qt::Key_3));
+        QCOMPARE(qtKeyOf(VK_TAB, false, false), int(Qt::Key_Tab));
+        QCOMPARE(qtKeyOf(VK_TAB, false, true), int(Qt::Key_Backtab));
+        QCOMPARE(qtKeyOf(VK_RETURN, false, false), int(Qt::Key_Return));
+        QCOMPARE(qtKeyOf(VK_RETURN, true, false), int(Qt::Key_Enter)); // the number pad's
+        QCOMPARE(qtKeyOf(VK_BACK, false, false), int(Qt::Key_Backspace));
+        QCOMPARE(qtKeyOf(VK_ESCAPE, false, false), int(Qt::Key_Escape));
+        QCOMPARE(qtKeyOf(VK_F12, false, false), int(Qt::Key_F12));
+        QCOMPARE(qtKeyOf(VK_OEM_1, false, false), 0); // named after its character
+        QCOMPARE(qtKeyOf(0xE7, false, false), 0); // VK_PACKET: a character, likewise
+    }
+
     void refreshDoesNotActivateOrResumeDrainedRouting()
     {
         PassiveWindow passive;
@@ -286,6 +330,22 @@ private slots:
         QVERIFY(tap('E'));
         QTRY_VERIFY_WITH_TIMEOUT((output += child.readAll()).contains("down:69"), 2000);
         QCOMPARE(presses['E'].load(), 0);
+
+        output.clear();
+        std::array<std::atomic<int>, 256> menuReleases {};
+        KeyRouter menuRouter(target, passive.hwnd, {.key = [&](const KeyRouter::Key& key) {
+            if (!key.press && key.vk < menuReleases.size())
+                ++menuReleases[key.vk];
+        }}, Qt::NoModifier, 0, KeyRouter::Policy::Menu);
+        QVERIFY(menuRouter.isActive());
+        for (const WORD vk : {WORD(VK_LEFT), WORD(VK_RIGHT), WORD(VK_BACK)}) {
+            QVERIFY(tap(vk));
+            QTRY_COMPARE_WITH_TIMEOUT(menuReleases[vk].load(), 1, 2000);
+        }
+        QCOMPARE(::GetForegroundWindow(), target);
+        output += child.readAll();
+        QVERIFY2(!output.contains("down:"), output.constData());
+        QVERIFY2(!output.contains("up:"), output.constData());
     }
 };
 
@@ -293,6 +353,8 @@ int main(int argc, char** argv)
 {
     if (argc > 1 && qstrcmp(argv[1], "--key-receiver") == 0)
         return receiver();
+    if (argc > 1 && qstrcmp(argv[1], "--shell-receiver") == 0)
+        return receiver(true);
     QCoreApplication app(argc, argv);
     KeyRouterTest test;
     return QTest::qExec(&test, argc, argv);

@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QSet>
+#include <QTemporaryDir>
 #include <QUuid>
 
 #include <miniz.h>
@@ -38,19 +39,12 @@ QString entryName(const mz_zip_archive_file_stat& stat)
     return n > 0 ? QString::fromWCharArray(wide.data(), n) : QString::fromLatin1(stat.m_filename, static_cast<qsizetype>(length));
 }
 
-// Unpacks the archive at `path` into `dir` (made here). The plugin.json may
-// sit at the root or in one folder (as a zipped folder has it): the files
-// land in `dir` either way. Empty on success, else why.
-QString unpack(const QString& path, const QString& dir)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
-        return u"打不开 %1"_s.arg(QDir::toNativeSeparators(path));
-    if (file.size() > kMaxArchiveBytes)
-        return u"压缩包超过 %1 MB"_s.arg(kMaxArchiveBytes >> 20);
-    const QByteArray bytes = file.readAll();
-    file.close();
+} // namespace
 
+QString unpackArchive(const QByteArray& bytes, const QString& dir)
+{
+    if (bytes.size() > kMaxArchiveBytes)
+        return u"压缩包超过 %1 MB"_s.arg(kMaxArchiveBytes >> 20);
     mz_zip_archive zip {};
     if (!mz_zip_reader_init_mem(&zip, bytes.constData(), static_cast<size_t>(bytes.size()), 0))
         return u"不是有效的 zip 压缩包"_s;
@@ -133,6 +127,24 @@ QString unpack(const QString& path, const QString& dir)
     return {};
 }
 
+
+namespace {
+
+// Unpacks the archive at `path` into `dir` (made here). The plugin.json may
+// sit at the root or in one folder (as a zipped folder has it): the files
+// land in `dir` either way. Empty on success, else why.
+QString unpack(const QString& path, const QString& dir)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return u"打不开 %1"_s.arg(QDir::toNativeSeparators(path));
+    if (file.size() > kMaxArchiveBytes)
+        return u"压缩包超过 %1 MB"_s.arg(kMaxArchiveBytes >> 20);
+    const QByteArray bytes = file.readAll();
+    file.close();
+    return unpackArchive(bytes, dir);
+}
+
 // Copies a folder's files into `to` (made here). Empty on success.
 QString copyTree(const QString& from, const QString& to)
 {
@@ -156,14 +168,34 @@ QString copyTree(const QString& from, const QString& to)
     return {};
 }
 
-QString tempDir()
+// A new folder name under `parent` (the system's temporary folder when empty).
+QString tempDir(const QString& parent)
 {
-    return QDir::temp().filePath(u"WinShun-plugin-"_s + QUuid::createUuid().toString(QUuid::WithoutBraces).left(8));
+    const QDir base = parent.isEmpty() ? QDir::temp() : QDir(parent);
+    return base.filePath(u"WinShun-plugin-"_s + QUuid::createUuid().toString(QUuid::WithoutBraces).left(8));
+}
+
+// Reads the manifest of the plugin in `c.dir`; on failure `error` says why
+// and the candidate's temporary folder goes.
+void readManifest(Candidate& c)
+{
+    const QString manifestPath = c.dir + u"/plugin.json"_s;
+    if (!QFileInfo::exists(manifestPath)) {
+        c.error = u"这个文件夹里没有 plugin.json"_s;
+        discard(c);
+        return;
+    }
+    QString error;
+    c.manifest = Manifest::load(manifestPath, &error);
+    if (!c.manifest) {
+        c.error = error;
+        discard(c);
+    }
 }
 
 } // namespace
 
-std::optional<Candidate> inspect(const QString& path)
+std::optional<Candidate> inspect(const QString& path, const QString& unpackParent)
 {
     const QFileInfo info(path);
     if (!info.exists())
@@ -174,7 +206,7 @@ std::optional<Candidate> inspect(const QString& path)
         c.dir = info.absoluteFilePath();
     } else if (isArchive(path)) {
         c.archive = true;
-        c.dir = tempDir();
+        c.dir = tempDir(unpackParent);
         c.error = unpack(info.absoluteFilePath(), c.dir);
         if (!c.error.isEmpty()) {
             discard(c);
@@ -184,18 +216,20 @@ std::optional<Candidate> inspect(const QString& path)
         c.error = u"要的是插件文件夹，或 .zip / .wsplugin 压缩包"_s;
         return c;
     }
-    const QString manifestPath = c.dir + u"/plugin.json"_s;
-    if (!QFileInfo::exists(manifestPath)) {
-        c.error = u"这个文件夹里没有 plugin.json"_s;
-        discard(c);
-        return c;
-    }
-    QString error;
-    c.manifest = Manifest::load(manifestPath, &error);
-    if (!c.manifest) {
-        c.error = error;
-        discard(c);
-    }
+    readManifest(c);
+    return c;
+}
+
+std::optional<Candidate> adopt(const QString& dir)
+{
+    const QFileInfo info(dir);
+    if (!info.isDir())
+        return std::nullopt;
+    Candidate c;
+    c.source = QDir::toNativeSeparators(info.absoluteFilePath());
+    c.dir = info.absoluteFilePath();
+    c.archive = true; // ours to move in and to remove
+    readManifest(c);
     return c;
 }
 
@@ -214,10 +248,18 @@ QString place(const Candidate& candidate, const QString& userDir, QString* error
     const QString sourceDir = QDir::cleanPath(candidate.dir);
     if (QDir::cleanPath(target).compare(sourceDir, Qt::CaseInsensitive) == 0)
         return QDir::toNativeSeparators(target); // installing what is installed: nothing to move
+    // A link is a plugin in development: the old folder's removal after the
+    // swap must never reach what the link points to (the source code).
+    if (const QFileInfo targetInfo(target); targetInfo.isJunction() || targetInfo.isSymLink())
+        return fail(u"%1 是链接（开发中的插件？），没有替换；要更新先删掉这个链接"_s.arg(QDir::toNativeSeparators(target)));
+    if (QFileInfo::exists(target) && !QFileInfo::exists(target + u"/plugin.json"_s))
+        return fail(u"%1 不是已安装的插件文件夹，为保留其中的数据，没有覆盖"_s.arg(QDir::toNativeSeparators(target)));
     // What is there goes aside first, and comes back if the new one cannot
     // be put in place.
-    const QString aside = target + u".old"_s;
-    QDir(aside).removeRecursively();
+    QTemporaryDir backup(QDir(userDir).filePath(u".winshun-update-XXXXXX"_s));
+    if (!backup.isValid())
+        return fail(u"建不了插件更新的临时文件夹"_s);
+    const QString aside = backup.filePath(u"plugin"_s);
     const bool had = QFileInfo::exists(target);
     if (had && !QDir().rename(target, aside))
         return fail(u"换不掉原来的 %1：它的程序可能还在运行"_s.arg(QDir::toNativeSeparators(target)));
@@ -228,12 +270,12 @@ QString place(const Candidate& candidate, const QString& userDir, QString* error
         why = copyTree(candidate.dir, target);
     if (!why.isEmpty()) {
         QDir(target).removeRecursively();
-        if (had)
-            QDir().rename(aside, target);
+        if (had && !QDir().rename(aside, target)) {
+            backup.setAutoRemove(false); // retain the old version if rollback fails
+            return fail(why + u"；原来的插件保留在 %1"_s.arg(QDir::toNativeSeparators(aside)));
+        }
         return fail(why);
     }
-    if (had)
-        QDir(aside).removeRecursively();
     return QDir::toNativeSeparators(target);
 }
 
@@ -248,11 +290,13 @@ QString remove(const QString& userDir, const QString& dataRoot, const QString& i
 {
     if (!validPluginId(id))
         return u"不是插件 id"_s;
+    const QString dataDir = QDir(dataRoot.isEmpty() ? userDir : dataRoot).filePath(id + u".data"_s);
+    if (data && QFileInfo::exists(dataDir + u"/plugin.json"_s))
+        return u"数据文件夹 %1 中有另一个插件，为保留它，没有删除"_s.arg(QDir::toNativeSeparators(dataDir));
     const QString folder = QDir(userDir).filePath(id);
     if (QFileInfo::exists(folder) && !QDir(folder).removeRecursively())
         return u"删不掉 %1：它的程序可能还在运行"_s.arg(QDir::toNativeSeparators(folder));
     if (data) {
-        const QString dataDir = QDir(dataRoot.isEmpty() ? userDir : dataRoot).filePath(id + u".data"_s);
         if (QFileInfo::exists(dataDir) && !QDir(dataDir).removeRecursively())
             return u"插件已删除，它的数据 %1 删不掉"_s.arg(QDir::toNativeSeparators(dataDir));
     }

@@ -4,6 +4,7 @@
 #include "FileIconProvider.h"
 #include "Host.h"
 #include "PluginSettings.h"
+#include "PluginUpdates.h"
 #include "Programs.h"
 #include "Settings.h"
 #include "platform/Http.h"
@@ -52,11 +53,11 @@ bool darkMode()
 }
 
 // What a plugin may do that matters most: go online, take connections from
-// the network, write files, start programs.
+// the network, write files, start programs, run as administrator.
 bool risky(plugin::Permission p)
 {
     return p == plugin::Permission::Network || p == plugin::Permission::NetworkListen || p == plugin::Permission::FilesWrite
-        || p == plugin::Permission::Processes;
+        || p == plugin::Permission::Processes || p == plugin::Permission::Elevated;
 }
 
 // Every word typed is somewhere in the row.
@@ -84,6 +85,8 @@ QVariant PluginGalleryModel::data(const QModelIndex& index, int role) const
     case IdRole: return r.id;
     case NameRole: return r.name;
     case DescriptionRole: return r.description;
+    case ReviewLabelRole: return r.reviewLabel;
+    case UnreviewedRole: return r.unreviewed;
     case AuthorRole: return r.author;
     case VersionRole: return r.version;
     case IconRole: return r.icon;
@@ -98,6 +101,8 @@ QVariant PluginGalleryModel::data(const QModelIndex& index, int role) const
     case ProgressRole: return r.progress;
     case ProblemRole: return r.problem;
     case ShownRole: return r.shown;
+    case StagedRole: return r.staged;
+    case MorePermissionsRole: return r.morePermissions;
     }
     return {};
 }
@@ -108,7 +113,8 @@ QHash<int, QByteArray> PluginGalleryModel::roleNames() const
     return {{IdRole, "pluginId"}, {NameRole, "name"}, {DescriptionRole, "description"}, {AuthorRole, "author"}, {VersionRole, "version"},
         {IconRole, "icon"}, {KeywordsRole, "keywords"}, {PermissionsRole, "permissions"}, {NeedsRole, "needs"}, {NeedsMissingRole, "needsMissing"},
         {StageRole, "stage"}, {InstalledVersionRole, "installedVersion"}, {MinWinShunRole, "minWinShun"}, {BusyRole, "busy"},
-        {ProgressRole, "progress"}, {ProblemRole, "problem"}, {ShownRole, "shown"}};
+        {ProgressRole, "progress"}, {ProblemRole, "problem"}, {ShownRole, "shown"}, {StagedRole, "staged"},
+        {MorePermissionsRole, "morePermissions"}, {ReviewLabelRole, "reviewLabel"}, {UnreviewedRole, "unreviewed"}};
 }
 
 void PluginGalleryModel::setRows(std::vector<Row> rows)
@@ -133,6 +139,8 @@ void PluginGalleryModel::setRows(std::vector<Row> rows)
         };
         differs(old.name != now.name, NameRole);
         differs(old.description != now.description, DescriptionRole);
+        differs(old.reviewLabel != now.reviewLabel, ReviewLabelRole);
+        differs(old.unreviewed != now.unreviewed, UnreviewedRole);
         differs(old.author != now.author, AuthorRole);
         differs(old.version != now.version, VersionRole);
         differs(old.icon != now.icon, IconRole);
@@ -147,6 +155,8 @@ void PluginGalleryModel::setRows(std::vector<Row> rows)
         differs(old.progress != now.progress, ProgressRole);
         differs(old.problem != now.problem, ProblemRole);
         differs(old.shown != now.shown, ShownRole);
+        differs(old.staged != now.staged, StagedRole);
+        differs(old.morePermissions != now.morePermissions, MorePermissionsRole);
         old = std::move(now);
         const QModelIndex at = index(static_cast<int>(i));
         if (!roles.isEmpty())
@@ -168,6 +178,9 @@ void PluginGalleryModel::setProgress(const QString& id, double progress)
 // ---- the tab's view-model ---------------------------------------------------------
 
 struct PluginGallery::Download {
+    bool unreviewed = false;
+    bool enableAfterInstall = false;
+    bool bulk = false; // 全部更新's: put over the installed one without a question
     int status = 0;
     unsigned long error = 0;
     gallery::Problem check = gallery::Problem::None;
@@ -217,12 +230,57 @@ void PluginGallery::setFilter(const QString& filter)
     rebuild();
 }
 
+void PluginGallery::setUpdatesOnly(bool on)
+{
+    if (m_updatesOnly == on)
+        return;
+    m_updatesOnly = on;
+    emit updatesOnlyChanged();
+    rebuild();
+}
+
+void PluginGallery::setUpdates(PluginUpdates* updates)
+{
+    if (m_updates)
+        disconnect(m_updates, nullptr, this, nullptr);
+    m_updates = updates;
+    if (updates) {
+        connect(updates, &PluginUpdates::changed, this, [this] { // staged versions, the badge
+            rebuild();
+        });
+        connect(updates, &PluginUpdates::automaticChanged, this, &PluginGallery::stateChanged);
+    }
+    rebuild(); // (also announces updateCount)
+}
+
+int PluginGallery::updateCount() const
+{
+    if (m_preview)
+        return static_cast<int>(std::ranges::count_if(m_list.rows(), [](const PluginGalleryModel::Row& r) { return r.updatable && r.stage == u"update"_s; }));
+    return m_updates ? m_updates->count() : 0;
+}
+
+bool PluginGallery::automaticUpdates() const
+{
+    return m_updates && m_updates->automatic();
+}
+
+int PluginGallery::updatableCount() const
+{
+    return static_cast<int>(std::ranges::count_if(m_list.rows(), [](const PluginGalleryModel::Row& r) { return r.allUpdate; }));
+}
+
 void PluginGallery::setActive(bool on)
 {
     if (m_active == on)
         return;
     m_active = on;
     emit activeChanged();
+    if (on && !m_updatingAll && !m_updateStatus.isEmpty()) { // the last 全部更新's summary was read
+        m_updateStatus.clear();
+        m_updateFailures.clear();
+        emit stateChanged();
+    }
     if (!on || m_preview)
         return;
     if (!m_cacheRead)
@@ -252,12 +310,15 @@ void PluginGallery::readCache()
     QFile file(cachePath());
     if (!file.open(QIODevice::ReadOnly))
         return;
-    std::optional<gallery::Index> index = gallery::parse(file.read(gallery::kMaxIndexBytes), source(), nullptr);
+    const QByteArray body = file.read(gallery::kMaxIndexBytes);
+    std::optional<gallery::Index> index = gallery::parse(body, source(), nullptr);
     if (!index)
         return;
     m_index = std::move(*index);
     m_hasIndex = true;
     m_listTime = QFileInfo(file).lastModified();
+    if (m_updates)
+        m_updates->setList(body); // hints, as after a fetch: 只看可更新 and the badge then agree
     rebuild();
     emit stateChanged();
 }
@@ -272,7 +333,8 @@ void PluginGallery::refresh()
     emit stateChanged();
     const QString from = source();
     QThreadPool::globalInstance()->start([self = QPointer(this), from] {
-        gallery::Fetched fetched = gallery::fetch(from, gallery::kMaxIndexBytes + 1, webFetcher(kListTimeoutMs));
+        gallery::Fetched fetched = gallery::fetch(from, gallery::kMaxIndexBytes + 1, webFetcher(kListTimeoutMs), {},
+            [&](const QByteArray& bytes) { return bytes.size() <= gallery::kMaxIndexBytes && gallery::parse(bytes, from, nullptr).has_value(); });
         QMetaObject::invokeMethod(qApp, [self, from, fetched = std::move(fetched)] {
             if (self)
                 self->finishFetch(from, fetched);
@@ -306,6 +368,8 @@ void PluginGallery::finishFetch(const QString& from, const gallery::Fetched& fet
         if (!file.open(QIODevice::WriteOnly) || file.write(fetched.body) != fetched.body.size() || !file.commit())
             qWarning().noquote() << "Plugin library: the list could not be kept:" << file.errorString();
     }
+    if (m_updates)
+        m_updates->setList(fetched.body); // for the badge: hints, never installed from
     rebuild();
     emit stateChanged();
 }
@@ -326,18 +390,46 @@ void PluginGallery::rebuild()
             r.id = item.id;
             r.name = item.name.pick(locale);
             r.description = item.description.pick(locale);
+            r.unreviewed = item.needsReviewConsent();
+            switch (item.review) {
+            case gallery::Review::Official: r.reviewLabel = tr("官方插件"); break;
+            case gallery::Review::Reviewed: r.reviewLabel = tr("已审核源码"); break;
+            case gallery::Review::UnreviewedNative: r.reviewLabel = tr("未审核的原生插件"); break;
+            case gallery::Review::Unspecified: r.reviewLabel = r.unreviewed ? tr("原生插件 · 审核状态未标注") : tr("审核状态未标注"); break;
+            }
             r.author = item.author;
             r.version = item.version;
             r.keywords = item.keywords;
             r.minWinShun = item.minWinShun;
             const gallery::Local local = host ? gallery::localOf(host->catalog(), bundledDir, item.id) : gallery::Local {};
             r.installedVersion = local.userVersion;
+            r.updatable = local.userCopy && !local.bundled && !item.bundled;
             switch (gallery::stateOf(item, local, appVersion)) {
             case gallery::State::Install: r.stage = u"install"_s; break;
             case gallery::State::Update: r.stage = u"update"_s; break;
             case gallery::State::Installed: r.stage = u"installed"_s; break;
             case gallery::State::Bundled: r.stage = u"bundled"_s; break;
             case gallery::State::NeedsNewerApp: r.stage = u"app"_s; break;
+            }
+            r.updatable = r.updatable && (r.stage == u"update"_s || r.stage == u"app"_s);
+            const plugin::Entry* installed = host ? host->catalog().find(item.id) : nullptr;
+            if (installed && plugin::updates::developerCopy(installed->dir)) // the author's to move (as the badge leaves it out)
+                r.updatable = false;
+            if (r.updatable && r.stage == u"update"_s) {
+                if (m_updates)
+                    r.staged = m_updates->stagedVersion(item.id);
+                const QStringList have = installed && installed->manifest ? installed->manifest->permissions.names() : QStringList();
+                QStringList added;
+                for (const QString& name : item.permissions) {
+                    if (!have.contains(name, Qt::CaseInsensitive)) {
+                        const std::optional<plugin::Permission> p = plugin::permissionFromName(name);
+                        added.push_back(p ? PluginSettings::permissionText(*p) : name);
+                    }
+                }
+                r.morePermissions = added.join(u"、"_s);
+                r.allUpdate = r.staged.isEmpty() && added.isEmpty() && !r.unreviewed;
+                // The same set as the badge's number: asked of the service, which also knows what was refused.
+                r.needsYou = m_updates ? m_updates->waiting(item.id) : r.staged.isEmpty();
             }
             // The icon of the copy here, if any (the list has none).
             const PluginListModel::Card* card = m_settings->m_list.card(item.id);
@@ -360,16 +452,20 @@ void PluginGallery::rebuild()
             r.busy = item.id == m_downloadId;
             r.progress = r.busy ? m_progress : 0;
             r.problem = m_problems.value(item.id);
-            r.words = QStringList {item.id, item.name.zh, item.name.en, item.description.zh, item.description.en, item.keywords.join(u' ')}
+            r.words = QStringList {item.id, item.name.zh, item.name.en, item.description.zh, item.description.en, item.keywords.join(u' '), r.reviewLabel}
                           .join(u'\n')
                           .toLower();
             rows.push_back(std::move(r));
         }
     }
     for (PluginGalleryModel::Row& r : rows)
-        r.shown = fits(r.words, m_filter);
+        r.shown = fits(r.words, m_filter) && (!m_updatesOnly || (m_preview ? r.updatable : r.needsYou));
     m_list.setRows(std::move(rows));
     emit listChanged();
+    if (const int count = updateCount(); count != m_announcedCount) {
+        m_announcedCount = count;
+        emit updateCountChanged();
+    }
 }
 
 void PluginGallery::setRowProgress(const QString& id, double progress)
@@ -382,10 +478,22 @@ void PluginGallery::setRowProgress(const QString& id, double progress)
 
 void PluginGallery::install(const QString& id)
 {
+    beginInstall(id, false);
+}
+
+void PluginGallery::installAndEnable(const QString& id)
+{
+    beginInstall(id, true);
+}
+
+void PluginGallery::beginInstall(const QString& id, bool enableAfterInstall, bool bulk)
+{
     if (m_preview || !m_downloadId.isEmpty() || !m_settings->m_host)
         return;
     const gallery::Item* found = m_index.find(id);
     if (!found)
+        return;
+    if (bulk && found->needsReviewConsent())
         return;
     const auto& rows = m_list.rows();
     const auto row = std::ranges::find_if(rows, [&](const PluginGalleryModel::Row& r) { return r.id == id; });
@@ -404,7 +512,19 @@ void PluginGallery::install(const QString& id)
     const quint64 generation = ++m_generation;
     rebuild();
     emit stateChanged();
-    QThreadPool::globalInstance()->start([self = QPointer(this), item = *found, cancel, generation] {
+    // An elevated Win顺 updating a plugin it runs as administrator: the
+    // checked bytes become its confirmed copy too (plugin::elevation).
+    // This tab's list is not checked against a signature (and its kept copy
+    // is the user's to change): only when the signed list has the very same
+    // package does it become the confirmed copy.
+    const plugin::Host* host = m_settings->m_host;
+    const std::optional<plugin::gallery::Item> signedItem = m_updates ? m_updates->signedItem(id) : std::nullopt;
+    const bool elevated = !found->needsReviewConsent() && host && host->hostElevated() && signedItem && signedItem->version == found->version
+        && signedItem->sha256 == found->sha256 && signedItem->size == found->size;
+    const plugin::elevation::Store store = host ? host->elevationStore() : plugin::elevation::Store {};
+    const QString pluginDir = QDir::toNativeSeparators(QDir(m_settings->m_userDir).filePath(found->id));
+    QThreadPool::globalInstance()->start([self = QPointer(this), item = *found, cancel, generation, enableAfterInstall, bulk, elevated, store,
+                                             pluginDir] {
         // The progress told now and then: a piece of the body each time would flood the page.
         QElapsedTimer sinceTold;
         sinceTold.start();
@@ -422,14 +542,21 @@ void PluginGallery::install(const QString& id)
             return true;
         };
         // One byte more than the list says: a bigger package shows as one.
-        gallery::Fetched fetched = gallery::fetch(item.url, item.size + 1, webFetcher(kPackageTimeoutMs), progress);
+        gallery::Fetched fetched = gallery::fetch(item.url, item.size + 1, webFetcher(kPackageTimeoutMs), progress,
+            [&](const QByteArray& bytes) { return gallery::check(item, bytes) == gallery::Problem::None; });
         Download d;
+        d.unreviewed = item.needsReviewConsent();
+        d.enableAfterInstall = enableAfterInstall;
+        d.bulk = bulk;
         d.status = fetched.status;
         d.error = fetched.error;
         if (fetched.status == 200 && !cancel->load()) {
             d.check = gallery::check(item, fetched.body);
-            if (d.check == gallery::Problem::None)
+            if (d.check == gallery::Problem::None) {
+                if (QString why; elevated && !plugin::elevation::keepConfirmed(store, item.id, pluginDir, fetched.body, &why))
+                    qWarning().noquote() << "Plugin library:" << item.id << "confirmed copy not kept:" << why;
                 d.path = gallery::saveTemporary(item, fetched.body, &d.saveError);
+            }
         }
         QMetaObject::invokeMethod(qApp, [self, d, id = item.id, generation, cancel] {
             if (!self || cancel->load() || self->m_generation != generation) {
@@ -452,6 +579,11 @@ void PluginGallery::cancel(const QString& id)
     m_downloadId.clear();
     m_progress = 0;
     ++m_generation;
+    if (m_updatingAll) { // the rest is not done either
+        m_updateQueue.clear();
+        nextUpdate();
+        return;
+    }
     rebuild();
     emit stateChanged();
 }
@@ -471,21 +603,106 @@ void PluginGallery::finishDownload(const QString& id, const Download& d)
             problem = tr("下载的文件存不下：%1").arg(d.saveError);
         qWarning().noquote() << "Plugin library: not installed:" << id << d.status << d.error << static_cast<int>(d.check) << d.saveError;
         m_problems.insert(id, problem);
+        if (d.bulk) {
+            noteUpdate(id, problem);
+            return;
+        }
         rebuild();
         emit stateChanged();
+        return;
+    }
+    if (d.bulk) { // 全部更新: no question; what asks for more than was allowed is left to be updated on its own
+        const gallery::Item* listed = m_index.find(id);
+        const QString problem = m_settings->installUpdate(d.path, id, listed ? listed->version : QString());
+        QFile::remove(d.path);
+        if (!problem.isEmpty())
+            qWarning().noquote() << "Plugin library: not updated:" << id << problem;
+        noteUpdate(id, problem);
         return;
     }
     rebuild();
     emit stateChanged();
     // The page's own install: its questions, what it says when done, and
-    // the plugin off until it is turned on. It has read the package by the
-    // time it returns (an archive is unpacked into a folder of its own,
+    // enabling it through the normal permission dialog when explicitly asked.
+    // It has read the package by the time it returns (an archive is unpacked
+    // into a folder of its own,
     // waiting there for a question's answer), so the file can go. It may
     // run events meanwhile (a plugin's program let go of): nothing of the
     // rows is held across it.
     const gallery::Item* item = m_index.find(id);
-    m_settings->installFrom(d.path, id, item ? item->name.pick(m_settings->m_locale) : id);
+    m_settings->installFrom(d.path, id, item ? item->name.pick(m_settings->m_locale) : id, d.enableAfterInstall, d.unreviewed);
     QFile::remove(d.path);
+}
+
+void PluginGallery::readList()
+{
+    if (!m_preview && !m_cacheRead)
+        readCache();
+}
+
+void PluginGallery::updateAll()
+{
+    if (m_preview || m_updatingAll || !m_downloadId.isEmpty() || !m_settings->m_host)
+        return;
+    m_updateQueue.clear();
+    for (const PluginGalleryModel::Row& r : m_list.rows()) {
+        if (r.allUpdate)
+            m_updateQueue.push_back(r.id);
+    }
+    if (m_updateQueue.isEmpty())
+        return;
+    m_updatingAll = true;
+    m_updateTotal = static_cast<int>(m_updateQueue.size());
+    m_updateDone = 0;
+    m_updateFailures.clear();
+    nextUpdate();
+}
+
+void PluginGallery::nextUpdate()
+{
+    while (!m_updateQueue.isEmpty()) {
+        const QString id = m_updateQueue.takeFirst();
+        const int position = m_updateTotal - static_cast<int>(m_updateQueue.size());
+        m_updateStatus = tr("正在更新 %1/%2…").arg(position).arg(m_updateTotal);
+        beginInstall(id, false, true);
+        if (!m_downloadId.isEmpty()) // on its way: finishDownload goes on
+            return;
+        const gallery::Item* item = m_index.find(id);
+        m_updateFailures.push_back(tr("%1 没有更新：%2").arg(item ? item->name.pick(m_settings->m_locale) : id, m_problems.value(id)));
+    }
+    m_updatingAll = false;
+    QStringList parts;
+    if (m_updateDone > 0)
+        parts.push_back(tr("已更新 %n 个插件", "", m_updateDone));
+    parts += m_updateFailures;
+    m_updateStatus = parts.join(u"；"_s);
+    rebuild();
+    emit stateChanged();
+}
+
+void PluginGallery::noteUpdate(const QString& id, const QString& problem)
+{
+    if (problem.isEmpty()) {
+        ++m_updateDone;
+        m_problems.remove(id);
+    } else {
+        m_problems.insert(id, problem);
+        const gallery::Item* item = m_index.find(id);
+        m_updateFailures.push_back(tr("%1 没有更新：%2").arg(item ? item->name.pick(m_settings->m_locale) : id, problem));
+    }
+    nextUpdate();
+}
+
+void PluginGallery::applyNow(const QString& id)
+{
+    if (m_preview || !m_updates)
+        return;
+    const QString problem = m_updates->applyNow(id);
+    if (problem.isEmpty())
+        m_problems.remove(id);
+    else
+        m_problems.insert(id, problem);
+    m_settings->rebuild();
 }
 
 QString PluginGallery::networkProblem(const gallery::Fetched& fetched) const
@@ -561,14 +778,33 @@ void PluginGallery::loadPreview()
         r.installedVersion = u"1.1.0"_s;
         r.keywords = {u"kill"_s, u"jc"_s};
         r.permissions = {permission(plugin::Permission::Processes)};
+        r.updatable = true;
+        r.morePermissions = PluginSettings::permissionText(plugin::Permission::Processes); // the version before asked for none
         rows.push_back(r);
     }
     {
-        PluginGalleryModel::Row r = row(u"winshun.bookmarks"_s, tr("浏览器书签"), tr("bm 词：搜 Chrome 和 Edge 的书签，Enter 打开"), u"1.1.0"_s, u"bundled"_s);
+        PluginGalleryModel::Row r = row(u"lingcore.todo"_s, tr("待办"), tr("dbn 事项：记一件事，到点提醒"), u"1.1.0"_s, u"update"_s);
+        r.icon = glyph(u"U+E73E"_s);
+        r.installedVersion = u"1.0.0"_s;
+        r.keywords = {u"dbn"_s};
+        r.updatable = true;
+        r.staged = r.version; // kept aside: it takes effect when Win顺 starts again
+        rows.push_back(r);
+    }
+    {
+        PluginGalleryModel::Row r = row(u"lingcore.clock"_s, tr("世界时钟"), tr("sj 城市：几个城市现在几点"), u"1.0.3"_s, u"update"_s);
+        r.icon = glyph(u"U+E916"_s);
+        r.installedVersion = u"1.0.2"_s;
+        r.keywords = {u"sj"_s};
+        r.updatable = true;
+        r.allUpdate = true;
+        rows.push_back(r);
+    }
+    {
+        PluginGalleryModel::Row r = row(u"winshun.bookmarks"_s, tr("浏览器书签"), tr("bm 词：搜 Chrome 和 Edge 的书签，Enter 打开"), u"2.0.0"_s, u"install"_s);
         r.icon = glyph(u"U+E728"_s);
         r.keywords = {u"bm"_s, u"sq"_s};
         r.permissions = {permission(plugin::Permission::FilesRead)};
-        r.needs = tr("需要 Python 3");
         rows.push_back(r);
     }
     {

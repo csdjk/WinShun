@@ -51,8 +51,15 @@ public:
 
     // Pressing here drags the window; a double click emits doubleClicked().
     Q_INVOKABLE void addDragArea(QQuickItem* item);
+    // A visible grip may occupy the native resize border; only its own
+    // rectangle moves the window there. Other edges continue to resize.
+    Q_INVOKABLE void addDragHandle(QQuickItem* item) { if (item) m_dragHandles.append(item); }
     // Inside a drag area, still the window's own (buttons, text fields).
     Q_INVOKABLE void addControl(QQuickItem* item);
+    // The native sizing border in logical pixels; controls beside it keep
+    // their hit areas inside this inset, including at fractional scale.
+    Q_INVOKABLE qreal resizeMargin(qreal devicePixelRatio) const;
+    Q_INVOKABLE QRect availableArea(QQuickItem* item) const;
     // Laid over the window while it is shown (an open menu: DropMenu.qml, the
     // editor's key list): the window's own, ahead of everything here (drag
     // areas, the maximise button, resizing edges), so a press on it is its
@@ -61,7 +68,7 @@ public:
     Q_INVOKABLE void addPopup(QQuickItem* item);
     // Inside a drag area, dragged it moves the window as the rest does;
     // clicked (let go before the system's drag distance) it emits
-    // handleClicked() (the launcher's search icon: the settings). Not a
+    // handleClicked(button) (the launcher's logo). Not a
     // control: QML hears of the pointer over it from `pointer` alone.
     Q_INVOKABLE void addHandle(QQuickItem* item);
     // With ownFrame: hit-tested as the maximise button (Snap Layouts).
@@ -93,18 +100,23 @@ public:
     QPointF pointer() const { return m_pointer; }
     bool maximizeHovered() const { return m_maximizeHovered; }
     bool maximizePressed() const { return m_maximizePressed; }
-    QString icon() const;
+    QString icon() const { return s_icon; }
+    // The program's icon as an image URL, set once before any title bar is
+    // made: WinShun's from its file icon provider, the screen capture plugin's
+    // from its own (no file icons there).
+    static void setIcon(const QString& url) { s_icon = url; }
 
 signals:
     void pointerChanged();
     void maximizeButtonChanged();
     void doubleClicked(); // on a drag area
-    void handleClicked(); // see addHandle
+    void handleClicked(Qt::MouseButton button); // see addHandle
     void frameShown(); // see afterNextFrame
     void sideGrabbed(bool left); // see setSideSizing
     void sideDoubleClicked();
 
 private:
+    static inline QString s_icon;
     struct Hook; // the window procedure subclass
     friend struct Hook;
 
@@ -120,6 +132,7 @@ private:
     QPointer<QWindow> m_window;
     WId m_hwnd = 0;
     QList<QPointer<QQuickItem>> m_dragAreas;
+    QList<QPointer<QQuickItem>> m_dragHandles;
     QList<QPointer<QQuickItem>> m_controls;
     QList<QPointer<QQuickItem>> m_popups;
     QList<QPointer<QQuickItem>> m_handles;
@@ -131,6 +144,8 @@ private:
     bool m_noActivate = false;
     bool m_resizable = false;
     bool m_sideSizing = false;
+    Qt::MouseButton m_handleButton = Qt::NoButton;
+    QPoint m_handlePress;
     // afterNextFrame, set on the render thread: armed, then synchronised.
     std::atomic<bool> m_frameArmed = false;
     std::atomic<bool> m_frameSynced = false;

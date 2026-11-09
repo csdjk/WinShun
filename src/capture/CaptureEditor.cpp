@@ -1,6 +1,7 @@
 #include "CaptureEditor.h"
 
 #include "AnnotationFormat.h"
+#include "CaptureSession.h"
 #include "Geometry.h"
 
 #include <QCursor>
@@ -22,8 +23,7 @@ namespace ws::capture {
 
 namespace {
 
-// CaptureSession::Action, which the toolbar's buttons send.
-enum Action { ActionCopy = 0, ActionSave = 1, ActionCancel = 2, ActionPin = 3, ActionOcr = 4 };
+using Action = CaptureSession::Action;
 
 // Logical px one wheel notch scrolls.
 constexpr int kScrollNotch = 64;
@@ -747,6 +747,8 @@ bool CaptureEditor::keyPressed(int key, int modifiers)
 {
     if (!m_open)
         return false;
+    if (m_choosingSave)
+        return true;
     const Qt::KeyboardModifiers mods = Qt::KeyboardModifiers(modifiers) & ~Qt::KeypadModifier;
     if (m_model.key(key, mods))
         return true;
@@ -754,6 +756,16 @@ bool CaptureEditor::keyPressed(int key, int modifiers)
     const bool alt = mods & (Qt::AltModifier | Qt::MetaModifier);
     if (key == Qt::Key_F4 && (mods & Qt::AltModifier)) { // as the close button: emptied, then hidden
         close();
+        return true;
+    }
+    // The user's keys for saving and pinning; the fixed keys below stay as they are.
+    // The validator keeps these clear of them, so the order does not matter.
+    if (m_keys.matches(KeyAction::Save, key, mods)) {
+        act(static_cast<int>(Action::Save));
+        return true;
+    }
+    if (m_keys.matches(KeyAction::Pin, key, mods)) {
+        act(static_cast<int>(Action::Pin));
         return true;
     }
     if (alt)
@@ -769,14 +781,6 @@ bool CaptureEditor::keyPressed(int key, int modifiers)
         if (!ctrl)
             return false;
         done();
-        return true;
-    case Qt::Key_S:
-        if (!ctrl)
-            return false;
-        act(ActionSave);
-        return true;
-    case Qt::Key_F3:
-        act(ActionPin);
         return true;
     case Qt::Key_Z:
         if (ctrl)
@@ -861,25 +865,40 @@ QByteArray CaptureEditor::packProject()
 
 void CaptureEditor::act(int action)
 {
-    if (!m_open)
+    if (!m_open || m_choosingSave)
         return;
-    switch (action) {
-    case ActionCopy:
+    switch (static_cast<Action>(action)) {
+    case Action::Copy:
         done();
         break;
-    case ActionSave: {
+    case Action::Save:
+    case Action::SavePrevious:
+    case Action::SaveAs: {
+        // A save folder chosen: Save goes straight into it, 另存为… asks (#194).
+        const bool pick = static_cast<Action>(action) == Action::SaveAs
+            || (static_cast<Action>(action) == Action::Save && !m_model.saveDirect());
+        QString path;
+        if (pick) {
+            if (!m_hooks.chooseSavePath)
+                break;
+            m_choosingSave = true;
+            path = m_hooks.chooseSavePath(m_window);
+            m_choosingSave = false;
+            if (path.isEmpty() || !m_open)
+                break;
+        }
         const QImage image = m_model.composed();
         if (image.isNull())
             break;
         const QByteArray project = packProject();
         if (m_hooks.save)
-            m_hooks.save(image, QString());
+            m_hooks.save(image, path);
         if (m_hooks.record)
             m_hooks.record(image, project);
         close();
         break;
     }
-    case ActionPin: {
+    case Action::Pin: {
         if (fromPin()) { // it is a pin already: 完成
             done();
             break;
@@ -902,13 +921,13 @@ void CaptureEditor::act(int action)
         close();
         break;
     }
-    case ActionOcr: {
+    case Action::Ocr: {
         const QImage image = m_model.composed();
         if (!image.isNull() && m_hooks.ocr)
             m_hooks.ocr(image, m_dpr, canvasOnScreen());
         break;
     }
-    case ActionCancel:
+    case Action::Cancel:
         close();
         break;
     default:

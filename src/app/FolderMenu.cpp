@@ -1,9 +1,12 @@
 #include "FolderMenu.h"
 
 #include "DiagnosticLog.h"
+#include "AppCatalog.h"
+#include "FileIconProvider.h"
 #include "Favorites.h"
 #include "History.h"
 #include "RecentFolders.h"
+#include "SystemCatalog.h"
 #include "platform/FileDialog.h"
 #include "platform/FileManagers.h"
 #include "platform/Integrity.h"
@@ -15,9 +18,11 @@
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QClipboard>
 #include <QGuiApplication>
 #include <QJsonObject>
 #include <QScreen>
+#include <QStandardPaths>
 #include <QStyleHints>
 #include <QTimer>
 #include <QWindow>
@@ -26,9 +31,11 @@
 #include <tlhelp32.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 using namespace std::chrono_literals;
@@ -38,9 +45,7 @@ namespace ws {
 
 namespace {
 
-constexpr int kMaxFavorites = 12;
-constexpr int kMaxRecent = 5;
-constexpr int kMaxWindows = 5;
+constexpr int kMaxRecent = 20; // bounded shell history, with room beyond the ten direct rows
 constexpr int kMaxJournal = 24; // different stories of the double click a run (journal())
 
 // The DPI awareness a window was made with, for the journal.
@@ -89,16 +94,16 @@ QString nameOf(const QString& folder)
     return slash < 0 || slash == folder.size() - 1 ? folder : folder.mid(slash + 1);
 }
 
-// Where it is: its parent folder, shortened from the left.
-QString detailOf(const QString& folder)
+const AppInfo* findApp(const AppList& apps, const QString& path)
 {
-    const qsizetype slash = folder.lastIndexOf(u'\\');
-    if (slash < 0 || slash == folder.size() - 1)
-        return {};
-    QString parent = folder.left(slash == 2 ? 3 : slash);
-    if (parent.size() > 40)
-        parent = u"…"_s + parent.right(39);
-    return parent;
+    const auto found = std::ranges::find(apps, appIdOf(path), &AppInfo::id);
+    return found == apps.end() ? nullptr : &*found;
+}
+
+const PlaceInfo* findPlace(const PlaceList& places, const QString& path)
+{
+    const auto found = std::ranges::find(places, placeKeyOf(path), &PlaceInfo::key);
+    return found == places.end() ? nullptr : &*found;
 }
 
 bool samePath(const QString& a, const QString& b)
@@ -219,10 +224,46 @@ void FolderMenu::setGroups(bool favorites, bool recent, bool windows)
     m_listWindows = windows;
 }
 
+void FolderMenu::setInlineCounts(int recent, int windows)
+{
+    m_recentInline = std::clamp(recent, 0, 10);
+    m_windowsInline = std::clamp(windows, 0, 10);
+}
+
+QVariantList FolderMenu::groupEntries(const QString& title, const QString& glyph, const QVariantList& children, int inlineCount)
+{
+    inlineCount = std::clamp(inlineCount, 0, 10);
+    QVariantMap group {{u"text"_s, title}, {u"glyph"_s, glyph}, {u"children"_s, children},
+        {u"detail"_s, QString::number(children.size())}, {u"disabled"_s, children.isEmpty()}};
+    if (inlineCount == 0 || children.isEmpty())
+        return {group};
+    QVariantList rows {QVariantMap {{u"text"_s, title}, {u"heading"_s, true}, {u"disabled"_s, true}}};
+    const qsizetype count = std::min<qsizetype>(inlineCount, children.size());
+    rows.append(children.first(count));
+    if (count < children.size()) {
+        group[u"text"_s] = tr("更多…");
+        group[u"pageTitle"_s] = title;
+        group[u"children"_s] = children.sliced(count);
+        group[u"detail"_s] = QString::number(children.size() - count);
+        rows.append(group);
+    }
+    return rows;
+}
+
+void FolderMenu::setItems(bool search, bool copyPath, bool cmd, bool powerShell, bool favorite, bool settings)
+{
+    m_itemSearch = search;
+    m_itemCopyPath = copyPath;
+    m_itemCmd = cmd;
+    m_itemPowerShell = powerShell;
+    m_itemFavorite = favorite;
+    m_itemSettings = settings;
+}
+
 void FolderMenu::doubleClicked(HWND window, POINT pt)
 {
     // On the listener thread: class names only, nothing that waits.
-    const folderview::Hit hit = folderview::classify(window, pt, true);
+    const folderview::Hit hit = folderview::classifyMenu(window, pt);
     if (hit.surface == folderview::Surface::None) {
         // A folder view's window all the same, of a kind not known (another
         // shell's, a file dialog's): for the journal (GitHub #45).
@@ -302,7 +343,7 @@ void FolderMenu::journal(const QString& step, const folderview::Hit& hit, const 
                                                                          : u"none"_s;
     details[u"classes"_s] = classes;
     if (trace) {
-        if (trace->msaa.empty())
+        if (trace->msaa.empty() && std::string_view(trace->by) != "desktop-background")
             trace->msaa = folderview::accessibleTrace(hit); // what the walk alone would have said
         details[u"by"_s] = QString::fromLatin1(trace->by);
         details[u"uia"_s] = QString::fromStdWString(trace->uiaClass);
@@ -513,7 +554,8 @@ void FolderMenu::show(const folderview::Hit& hit, const Found& found)
     // dialog given the front back from its bar may not have it yet.)
     const HWND foreground = ::GetForegroundWindow();
     const HWND front = foreground ? ::GetAncestor(foreground, GA_ROOT) : nullptr;
-    if (!front || (front != hit.root && !(m_dialogOf && m_dialogOf(front) == hit.root))) {
+    const bool desktop = hit.surface == folderview::Surface::Desktop && folderview::sameDesktop(front, hit.root);
+    if (!front || (front != hit.root && !desktop && !(m_dialogOf && m_dialogOf(front) == hit.root))) {
         if (hit.view) // a double click's (the hotkey's have no view)
             m_worker.post([this, hit, front = QString::fromStdWString(folderview::classChain(front))] {
                 journal(u"not-in-front"_s, hit, {}, nullptr, {{u"front"_s, front}});
@@ -522,64 +564,105 @@ void FolderMenu::show(const folderview::Hit& hit, const Found& found)
     }
     m_hit = hit;
     m_folder = found.folder;
+    if (m_folder.isEmpty() && hit.surface == folderview::Surface::Desktop)
+        m_folder = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
     m_entries.clear();
     m_actions.clear();
-    const auto add = [this](Kind kind, const QString& path, const QString& text, const QString& detail,
-                         const QString& glyph) {
-        m_entries.append(QVariantMap {{u"text"_s, text}, {u"detail"_s, detail}, {u"glyph"_s, glyph}});
-        m_actions.push_back({kind, path});
+    const auto action = [this](Kind kind, const QString& path, const QString& text, const QString& detail,
+                            const QString& glyph, const QString& icon = QString(), const QString& tooltip = QString()) {
+        const int index = static_cast<int>(m_actions.size());
+        m_actions.push_back({kind, path, text});
+        return QVariantMap {{u"text"_s, text}, {u"detail"_s, detail}, {u"glyph"_s, glyph},
+            {u"icon"_s, icon}, {u"tooltip"_s, tooltip}, {u"action"_s, index}};
+    };
+    const auto group = [this](const QString& text, const QString& glyph, const QVariantList& children) {
+        m_entries.append(groupEntries(text, glyph, children));
     };
     const auto separator = [this] {
         if (!m_entries.isEmpty() && !m_entries.last().toMap().value(u"separator"_s).toBool()) {
             m_entries.append(QVariantMap {{u"separator"_s, true}});
-            m_actions.push_back({});
         }
     };
-    QStringList listed;
-    if (!m_folder.isEmpty())
-        listed.append(m_folder); // where it is already
-    const bool listFavorites = m_listFavorites;
-    int favorites = 0;
-    for (const Favorite& f : listFavorites && m_favorites ? m_favorites->items() : FavoriteList()) {
-        if (f.kind != Favorite::Kind::Folder || favorites >= kMaxFavorites || listed.contains(f.path, Qt::CaseInsensitive))
-            continue;
-        add(Kind::Folder, f.path, f.name.isEmpty() ? nameOf(f.path) : f.name, f.keyword.isEmpty() ? detailOf(f.path) : f.keyword,
-            u"\uE734"_s); // FavoriteStar
-        listed.append(f.path);
-        ++favorites;
+    if (m_listFavorites) {
+        QVariantList favorites;
+        const auto apps = m_apps ? m_apps->apps() : nullptr;
+        const auto places = m_places ? m_places->places() : nullptr;
+        const bool dark = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+        for (const Favorite& f : m_favorites ? m_favorites->items() : FavoriteList()) {
+            QString icon;
+            QString glyph = u"\uE734"_s;
+            QString tooltip = f.path;
+            switch (f.kind) {
+            case Favorite::Kind::Folder:
+            case Favorite::Kind::File:
+                icon = FileIconProvider::iconUrl(f.path, f.kind == Favorite::Kind::Folder);
+                break;
+            case Favorite::Kind::Command:
+                glyph = u"\uE756"_s;
+                tooltip = f.command;
+                icon = FileIconProvider::commandIconUrl(f.command, f.workingDirectory.isEmpty() ? m_folder : f.workingDirectory,
+                    f.icon, dark);
+                break;
+            case Favorite::Kind::App: {
+                const AppInfo* app = apps ? findApp(*apps, f.path) : nullptr;
+                const bool packaged = app && (app->kind == AppKind::Store || app->kind == AppKind::System || app->kind == AppKind::Package);
+                icon = FileIconProvider::appIconUrl(appIdOf(f.path), packaged, dark);
+                break;
+            }
+            case Favorite::Kind::Place:
+                glyph = u"\uE713"_s;
+                if (const PlaceInfo* place = places ? findPlace(*places, f.path) : nullptr) {
+                    icon = place->icon.startsWith(u"app:") ? FileIconProvider::appIconUrl(place->icon.mid(4), true, dark)
+                                                           : FileIconProvider::placeIconUrl(place->icon);
+                    tooltip = place->command;
+                }
+                break;
+            }
+            favorites.append(action(Kind::Favorite, f.path, f.name.isEmpty() ? nameOf(f.path) : f.name, f.keyword,
+                glyph, icon, tooltip));
+        }
+        group(tr("收藏夹"), u"\uE734"_s, favorites);
     }
-    if (listFavorites && favorites == 0) {
-        m_entries.append(QVariantMap {{u"text"_s, tr("还没有收藏的文件夹")}, {u"detail"_s, QString()},
-            {u"glyph"_s, u"\uE734"_s}, {u"disabled"_s, true}});
-        m_actions.push_back({});
-    }
-    const auto addList = [&](const QStringList& folders, int max, const QString& glyph) {
-        bool first = true;
-        int count = 0;
+    const auto addList = [&](const QString& text, const QStringList& folders, qsizetype max, const QString& glyph, int inlineCount) {
+        QVariantList children;
+        QStringList listed;
+        if (!m_folder.isEmpty())
+            listed.append(m_folder);
         for (const QString& folder : folders) {
-            if (count >= max || listed.contains(folder, Qt::CaseInsensitive))
+            if (children.size() >= max || listed.contains(folder, Qt::CaseInsensitive))
                 continue;
-            if (std::exchange(first, false))
-                separator();
-            add(Kind::Folder, folder, nameOf(folder), detailOf(folder), glyph);
+            children.append(action(Kind::Folder, folder, nameOf(folder), {}, u"\uE8B7"_s,
+                FileIconProvider::iconUrl(folder, true), folder));
             listed.append(folder);
-            ++count;
         }
+        m_entries.append(groupEntries(text, glyph, children, inlineCount));
     };
-    addList(found.recent, kMaxRecent, u"\uE81C"_s); // History
-    addList(found.windows, kMaxWindows, u"\uE8A7"_s); // OpenInNewWindow
-    if (m_entries.isEmpty() && m_folder.isEmpty()) { // only groups with nothing in them: not a blank menu
-        m_entries.append(QVariantMap {{u"text"_s, tr("\u6CA1\u6709\u53EF\u5217\u51FA\u7684\u6587\u4EF6\u5939")}, {u"detail"_s, QString()},
-            {u"glyph"_s, u"\uE81C"_s}, {u"disabled"_s, true}});
-        m_actions.push_back({});
-    }
+    if (m_listRecent && m_recordHistory)
+        addList(tr("最近的文件夹"), found.recent, kMaxRecent, u"\uE81C"_s, m_recentInline);
+    if (m_listWindows)
+        addList(tr("已打开的文件夹"), found.windows, found.windows.size(), u"\uE8A7"_s, m_windowsInline);
     if (!m_folder.isEmpty()) {
         separator();
-        add(Kind::Search, m_folder, tr("在“%1”里搜索").arg(nameOf(m_folder)), QString(), u"\uE721"_s); // Search
-        if (m_favorites && m_favorites->contains(m_folder))
-            add(Kind::RemoveFavorite, m_folder, tr("从收藏夹移除这个文件夹"), QString(), u"\uE8D9"_s); // Unfavorite
-        else
-            add(Kind::AddFavorite, m_folder, tr("收藏这个文件夹"), QString(), u"\uE734"_s);
+        if (m_itemSearch)
+            m_entries.append(action(Kind::Search, m_folder, tr("在“%1”里搜索").arg(nameOf(m_folder)), {}, u"\uE721"_s));
+        if (m_itemCopyPath) // plain text, no quotes (#137); not offered where there is no folder path
+            m_entries.append(action(Kind::CopyPath, m_folder, tr("复制路径"), {}, u"\uE8C8"_s));
+        if (m_itemCmd)
+            m_entries.append(action(Kind::Terminal, m_folder, tr("在此打开命令提示符"), {}, u"\uE756"_s));
+        if (m_itemPowerShell)
+            m_entries.append(action(Kind::PowerShell, m_folder, tr("在此打开 PowerShell"), {}, u"\uE756"_s));
+        if (m_itemFavorite) {
+            if (m_favorites && m_favorites->contains(m_folder))
+                m_entries.append(action(Kind::RemoveFavorite, m_folder, tr("从收藏夹移除这个文件夹"), {}, u"\uE8D9"_s));
+            else
+                m_entries.append(action(Kind::AddFavorite, m_folder, tr("收藏这个文件夹"), {}, u"\uE734"_s));
+        }
+    }
+    if (m_itemSettings) {
+        separator();
+        m_entries.append(action(Kind::Settings, {}, tr("Win顺 设置…"), {}, u"\uE713"_s));
+    } else if (!m_entries.isEmpty() && m_entries.last().toMap().value(u"separator"_s).toBool()) {
+        m_entries.removeLast(); // no action left to stand under it
     }
     emit entriesChanged();
 
@@ -632,7 +715,7 @@ void FolderMenu::startKeys(HWND target)
         }, Qt::QueuedConnection);
     };
     auto router = std::make_unique<KeyRouter>(target, reinterpret_cast<HWND>(m_window->winId()), std::move(callbacks),
-        Qt::NoModifier, KeyRouter::Policy::Menu);
+        Qt::NoModifier, 0, KeyRouter::Policy::Menu);
     if (!router->isActive()) {
         qWarning() << "Folder menu: no keyboard hook; the mouse only";
         return;
@@ -668,8 +751,17 @@ void FolderMenu::trigger(int index)
     if (index < 0 || index >= static_cast<int>(m_actions.size()))
         return;
     const Entry entry = m_actions[static_cast<size_t>(index)];
-    if (entry.path.isEmpty())
+    if (entry.path.isEmpty() && entry.kind != Kind::Settings)
         return;
+    const QString title = entry.title;
+    const auto done = [guard = QPointer(this), title](bool ok) {
+        if (!ok) {
+            QMetaObject::invokeMethod(qApp, [guard, title] {
+                if (guard)
+                    emit guard->notice(tr("无法打开“%1”，请检查命令和工作目录").arg(title));
+            }, Qt::QueuedConnection);
+        }
+    };
     dismiss();
     switch (entry.kind) {
     case Kind::Folder:
@@ -685,6 +777,53 @@ void FolderMenu::trigger(int index)
     case Kind::RemoveFavorite:
         if (m_favorites)
             m_favorites->remove(entry.path);
+        break;
+    case Kind::Terminal:
+        shell::openTerminal(entry.path, done);
+        break;
+    case Kind::PowerShell:
+        shell::openPowerShell(entry.path, done);
+        break;
+    case Kind::Favorite: {
+        const auto favoriteIndex = m_favorites ? indexOfFavorite(m_favorites->items(), entry.path) : -1;
+        if (favoriteIndex < 0) {
+            emit notice(tr("这一项已移除，请重新打开菜单"));
+            break;
+        }
+        const Favorite favorite = m_favorites->items()[favoriteIndex];
+        switch (favorite.kind) {
+        case Favorite::Kind::Folder:
+            goTo(favorite.path);
+            break;
+        case Favorite::Kind::File:
+            shell::open(favorite.path);
+            break;
+        case Favorite::Kind::App:
+            shell::launchApp(favorite.path);
+            break;
+        case Favorite::Kind::Place: {
+            const auto places = m_places ? m_places->places() : nullptr;
+            if (const PlaceInfo* place = places ? findPlace(*places, favorite.path) : nullptr)
+                shell::run(place->command);
+            else
+                emit notice(tr("这一项暂不可用，请稍后重试"));
+            break;
+        }
+        case Favorite::Kind::Command:
+            shell::runCustom(favorite.command, favorite.workingDirectory.isEmpty() ? m_folder : favorite.workingDirectory,
+                m_folder, done, {favorite.silent, favorite.runAsAdmin});
+            break;
+        }
+        break;
+    }
+    case Kind::CopyPath:
+        if (const QString text = QDir::toNativeSeparators(entry.path); m_clipboardWriter)
+            m_clipboardWriter(text);
+        else
+            QGuiApplication::clipboard()->setText(text);
+        break;
+    case Kind::Settings:
+        emit settingsRequested();
         break;
     }
 }

@@ -11,16 +11,32 @@ import WinShun
 // right (the three used most; the info button after them lists the rest),
 // then a button that clears the recent items (while there are some to clear),
 // and in the panel at the very right its 列表 / 大图 switch. The divider above
-// shows work going on. Dragging it moves the window.
+// shows work going on. Window movement belongs to the visible header handles.
 Item {
     id: footer
 
     required property Launcher launcher
     required property WindowFrame frame
+    property bool compact: false
 
     signal galleryRequested(bool gallery) // the panel's view switch
 
-    implicitHeight: Theme.footerHeight // 界面大小
+    // The 更多 sort menu is open: Esc closes just it, and it never outlives the launcher (Main.qml).
+    property alias sortMenuOpen: sortMenu.open
+
+    // The window's, read once by the host (GitHub #111).
+    property real dpr: Screen.devicePixelRatio
+
+    readonly property real hintsRight: info.visible ? info.x - 8
+        : clearHistory.visible ? clearHistory.x - 8 : viewSwitch.visible ? viewSwitch.x - 10 : width - 18
+
+    implicitHeight: compact ? 32 : Theme.footerHeight
+
+    // The chrome's layer (as the search row's), on the window's base.
+    Rectangle {
+        anchors.fill: parent
+        color: Theme.layer
+    }
 
     // The divider shows work only once it has lasted a moment, so brief
     // work does not make it blink.
@@ -36,7 +52,6 @@ Item {
     }
     Component.onCompleted: {
         showBusy = busy
-        frame.addDragArea(footer)
     }
     Timer {
         id: busyDelay
@@ -69,12 +84,12 @@ Item {
         onFractionChanged: update()
 
         width: parent.width
-        height: Theme.edge(Screen.devicePixelRatio) // the divider line and the progress on it, whole device pixels
+        height: Theme.edge(footer.dpr) // the divider line and the progress on it, whole device pixels
         clip: true
 
-        Rectangle {
+        Rectangle { // where the chrome's layer meets the rows
             anchors.fill: parent
-            color: Theme.divider
+            color: Theme.layerEdge
         }
 
         Item {
@@ -129,11 +144,11 @@ Item {
         text: footer.launcher.statusText
         textFormat: Text.PlainText // may name a file
         color: Theme.subtext
-        font.pixelSize: Theme.uiBody
+        font.pixelSize: footer.compact ? 12 : Theme.uiBody
         elide: Text.ElideRight
     }
 
-    // A few choices side by side, the current one raised (as ScopeTabs, smaller).
+    // A few choices side by side, on the style's segmented part (role "sort").
     component Choices: Row {
         id: choices
 
@@ -142,10 +157,25 @@ Item {
         property string glyph
         property string tip
         readonly property bool tipWanted: hover.hovered
+        property int hoveredIndex: -1
+        property int pressedIndex: -1
+        // Each choice's place in the part, [{x, width}]: laid out here.
+        property var segments: []
+        function placeSegments() {
+            const list = []
+            for (let i = 0; i < options.count; ++i) {
+                const chip = options.itemAt(i)
+                if (chip)
+                    list.push({ x: chips.x + chip.x, width: chip.width })
+            }
+            segments = list
+        }
 
         signal activated(int index)
 
         spacing: 6
+
+        function onPixel(v) { return Math.round(v * footer.dpr) / footer.dpr }
 
         HoverHandler { id: hover }
 
@@ -156,23 +186,35 @@ Item {
             color: Theme.faint
         }
 
-        Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
+        Item {
+            y: choices.onPixel((choices.height - height) / 2) // whole device pixels: centred, at 150 % it sat on half ones
             width: chips.implicitWidth + 4
             height: Theme.chipHeight
-            radius: Theme.cardRadius
-            color: Theme.track
+
+            Hook {
+                id: track
+                anchors.fill: parent
+                part: Theme.segmented
+                count: options.count
+                currentIndex: choices.current
+                hoveredIndex: choices.hoveredIndex
+                pressedIndex: choices.pressedIndex
+                segments: choices.segments
+                role: "sort"
+                dpr: footer.dpr
+            }
 
             Row {
                 id: chips
                 x: 2
                 y: 2
                 spacing: 2
+                onPositioningComplete: choices.placeSegments()
 
                 Repeater {
                     id: options
 
-                    delegate: Rectangle {
+                    delegate: Item {
                         id: chip
 
                         required property int index
@@ -181,24 +223,18 @@ Item {
 
                         width: Math.ceil(label.implicitWidth) + 16 // whole pixels: the labels after it stay sharp
                         height: Theme.chipHeight - 4
-                        radius: Theme.controlRadius
-                        color: active ? Theme.chipActive : area.containsMouse ? Theme.chipHover : "transparent"
-                        border.width: active ? 1 : 0
-                        border.color: Theme.chipBorder
                         Accessible.role: Accessible.RadioButton
                         Accessible.name: modelData
                         Accessible.checked: active
 
-                        function onPixel(v) { return Math.round(v * Screen.devicePixelRatio) / Screen.devicePixelRatio }
-
                         Text {
                             id: label
-                            x: chip.onPixel((chip.width - width) / 2)
-                            y: chip.onPixel((chip.height - height) / 2)
+                            x: choices.onPixel((chip.width - width) / 2)
+                            y: choices.onPixel((chip.height - height) / 2 + track.call("labelOffsetY", [chip.index], 0))
                             text: chip.modelData
-                            color: chip.active || area.containsMouse ? Theme.text : Theme.subtext
+                            color: track.call("labelColor", [chip.index], chip.active || area.containsMouse ? Theme.text : Theme.subtext)
                             font.pixelSize: Theme.uiCaption
-                            font.weight: chip.active ? Font.DemiBold : Font.Normal
+                            font.weight: track.call("labelWeight", [chip.index], chip.active ? Theme.fontStrong : Font.Normal)
                         }
 
                         MouseArea {
@@ -206,6 +242,18 @@ Item {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
+                            onContainsMouseChanged: {
+                                if (containsMouse)
+                                    choices.hoveredIndex = chip.index
+                                else if (choices.hoveredIndex === chip.index)
+                                    choices.hoveredIndex = -1
+                            }
+                            onPressedChanged: {
+                                if (pressed)
+                                    choices.pressedIndex = chip.index
+                                else if (choices.pressedIndex === chip.index)
+                                    choices.pressedIndex = -1
+                            }
                             onClicked: choices.activated(chip.index)
                         }
                     }
@@ -220,6 +268,7 @@ Item {
 
     Choices {
         id: order
+        objectName: "footerOrder" // the previews click its last chip
         // Not at the start with no start list (set so in the settings, GitHub #24).
         visible: footer.launcher.pluginKeyword.length === 0 && !footer.launcher.panel // the panel's columns order it
                  && !(footer.atStart && footer.launcher.startList === Launcher.NoStartList)
@@ -228,14 +277,17 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         glyph: footer.atStart ? "\uE81C" : "\uE8CB" // History, Sort
         // Last chip: "更多", or the name of the sort chosen from its menu (#44).
-        labels: footer.atStart ? [qsTr("最近打开"), qsTr("最近修改")]
+        labels: footer.compact ? [footer.compactSortLabels[footer.atStart ? footer.launcher.startList : footer.launcher.sort] ?? qsTr("更多")]
+                              : footer.atStart ? [qsTr("最近打开"), qsTr("最近修改")]
                                  : [qsTr("最匹配"), qsTr("最新"), qsTr("最早"),
                                     footer.moreSorts ? footer.sortChipLabels[footer.launcher.sort - 3] : qsTr("更多")]
-        current: footer.atStart ? footer.launcher.startList : footer.moreSorts ? 3 : footer.launcher.sort
+        current: footer.compact ? 0 : footer.atStart ? footer.launcher.startList : footer.moreSorts ? 3 : footer.launcher.sort
         tip: footer.atStart ? qsTr("不输入时列出最近打开的，或最近修改的文件")
                               : qsTr("最匹配的在前，或按修改时间：最新的在前、最早的在前；“更多”里还能按名称、所在文件夹、类型、大小排")
         onActivated: (index) => {
-            if (footer.atStart)
+            if (footer.compact)
+                sortMenu.open = !sortMenu.open
+            else if (footer.atStart)
                 footer.launcher.startList = index
             else if (index === 3)
                 sortMenu.open = !sortMenu.open // opened by it, closed by it again
@@ -247,6 +299,8 @@ Item {
 
     // The sorts the chips have no room for (Launcher.Sort from ByName on).
     readonly property var sortLabels: [qsTr("名称"), qsTr("所在文件夹"), qsTr("类型"), qsTr("大的在前"), qsTr("小的在前")]
+    readonly property var compactSortLabels: atStart ? [qsTr("最近打开"), qsTr("最近修改")]
+        : [qsTr("最匹配"), qsTr("最新"), qsTr("最早")].concat(sortLabels)
     // On the chip the short word, so a long name does not push the key hints
     // out of the bar (#44); the menu has the full ones.
     readonly property var sortChipLabels: [qsTr("名称"), qsTr("文件夹"), qsTr("类型"), qsTr("大在前"), qsTr("小在前")]
@@ -256,11 +310,17 @@ Item {
         id: sortMenu
         anchor: order
         menuWidth: 150
-        entries: footer.sortLabels.map((label, i) => ({
+        entries: (footer.compact ? footer.compactSortLabels : footer.sortLabels).map((label, i) => ({
             text: label,
-            glyph: footer.launcher.sort === i + Launcher.ByName ? "" : "" // CheckMark: the one in force
+            glyph: (footer.compact ? (footer.atStart ? footer.launcher.startList : footer.launcher.sort) === i
+                                  : footer.launcher.sort === i + Launcher.ByName) ? "" : ""
         }))
-        onActivated: (index) => footer.launcher.sort = Launcher.ByName + index
+        onActivated: (index) => {
+            if (footer.compact && footer.atStart)
+                footer.launcher.startList = index
+            else
+                footer.launcher.sort = (footer.compact ? 0 : Launcher.ByName) + index
+        }
     }
 
     Connections {
@@ -270,8 +330,11 @@ Item {
 
     Row {
         id: hints
-        anchors.right: info.left
-        anchors.rightMargin: 8
+        objectName: "footerKeyHints"
+        visible: footer.launcher.footerHints
+        width: visible ? implicitWidth : 0
+        anchors.right: parent.right
+        anchors.rightMargin: footer.width - footer.hintsRight
         anchors.verticalCenter: parent.verticalCenter
         spacing: 14
 
@@ -287,7 +350,7 @@ Item {
         // and all show. Worked out from the full widths, not the laid-out
         // ones, which depend on it.
         readonly property real statusNeeds: Math.ceil(statusMetrics.advanceWidth)
-        readonly property real statusRoom: info.x - 8 - (order.visible ? 16 + order.width + 14 : 18) - 12
+        readonly property real statusRoom: footer.hintsRight - (order.visible ? 16 + order.width + 14 : 18) - 12
         function roomWith(shown) { // the status's, with these hints shown
             const widths = shown.map(h => h.fullWidth).filter(w => w > 0)
             return statusRoom - widths.reduce((a, b) => a + b, 0) - hints.spacing * Math.max(0, widths.length - 1)
@@ -297,41 +360,31 @@ Item {
 
         TextMetrics {
             id: statusMetrics
-            font.pixelSize: Theme.uiBody
+            font.pixelSize: footer.compact ? 12 : Theme.uiBody
             text: footer.launcher.statusText
         }
 
-        KeyHint { id: enterHint; visible: hints.given < 1 && label.length > 0; keys: "Enter"; label: hints.keyHints.enter ?? "" }
-        KeyHint { id: secondHint; visible: hints.given < 2 && label.length > 0; keys: hints.keyHints.secondKeys ?? ""; label: hints.keyHints.second ?? "" }
-        KeyHint { id: tabHint; visible: label.length > 0; keys: hints.keyHints.tabKeys || "Tab"; label: hints.keyHints.tab ?? "" }
+        KeyHint { dpr: footer.dpr; id: enterHint; visible: hints.given < 1 && label.length > 0; keys: "Enter"; label: hints.keyHints.enter ?? "" }
+        KeyHint { dpr: footer.dpr; id: secondHint; visible: hints.given < 2 && label.length > 0; keys: hints.keyHints.secondKeys ?? ""; label: hints.keyHints.second ?? "" }
+        KeyHint { dpr: footer.dpr; id: tabHint; objectName: "footerTabHint"; visible: label.length > 0 && label !== qsTranslate("ws::Launcher", "切换范围"); keys: hints.keyHints.tabKeys || "Tab"; label: hints.keyHints.tab ?? "" }
     }
 
-    // The launcher's other shortcuts, while the mouse rests on it.
+    // The launcher's other shortcuts, when it is clicked.
     ShortcutsButton {
         id: info
+        objectName: "shortcutsButton"
+        visible: footer.launcher.shortcutHelp
 
         readonly property string modifier: footer.launcher.numberKeys === "alt" ? "Alt" : "Ctrl"
-        shortcuts: [
-            ["Shift+Tab", qsTr("切换到上一个范围")],
-            ["Ctrl+Tab", qsTr("在“文件”里切换类型，在“内容”里换个文件夹")],
-            ["↑ ↓", qsTr("上下移动，PgUp PgDn 翻页")],
-            ["Shift+↑ ↓", qsTr("选中多行，也可 Ctrl+单击、Shift+单击")],
-            ["Ctrl+Shift+Enter", qsTr("以管理员身份运行")],
-            ["Ctrl+C", qsTr("复制文件")],
-            ["Ctrl+Shift+C", qsTr("复制路径")],
-            ["Alt+P", qsTr("预览文件；再按一次关闭")],
-            ["Ctrl+S", qsTr("切换排序；不输入时切换最近打开、最近修改")],
-            ["Ctrl+E", qsTr("展开为搜索面板，或收回搜索框")],
-            ["Ctrl+T", qsTr("钉住：点别处、打开文件后都不收起；再按一次取消")]
-        ].concat(footer.launcher.typingFolder.length === 0 // typed in a folder's window (GitHub #110): where
-                 || footer.launcher.scope === Launcher.Content || footer.launcher.panel ? [] // switchTypingFolder takes it
-                 : [["Ctrl+D", qsTr("只搜当前文件夹，或也搜其他位置")]])
-         .concat(footer.launcher.numberKeys === "off" ? []
-                 : [[modifier + "+1…9", qsTr("打开第几行（图标上标着快捷键）")]])
-         .concat([
-            ["Shift+F10", qsTr("右键菜单")],
-            ["Esc", qsTr("关闭；选中了多行时先取消选择")]
-        ])
+        where: "launcher"
+        context: ({
+            previewKey: footer.launcher.previewHotkey,
+            historyModifier: !footer.launcher.queryHistoryEnabled || footer.launcher.historyKeys === "off" ? "" : footer.launcher.historyKeys === "alt" ? "Alt" : "Ctrl",
+            numberModifier: footer.launcher.numberKeys === "off" ? "" : modifier,
+            // typed in a folder's window (GitHub #110): where switchTypingFolder takes it
+            folderTyping: footer.launcher.typingFolder.length > 0
+                          && footer.launcher.scope !== Launcher.Content && !footer.launcher.panel
+        })
 
         host: footer.launcher
         frame: footer.frame
@@ -342,11 +395,13 @@ Item {
 
     // Two clicks, as a row's delete button: the first arms it.
     RowAction {
+        dpr: footer.dpr
         id: clearHistory
 
         property bool armed: false
 
         visible: footer.launcher.canClearHistory
+        role: "footer"
         anchors.right: viewSwitch.visible ? viewSwitch.left : parent.right
         anchors.rightMargin: viewSwitch.visible ? 8 : 6
         anchors.verticalCenter: parent.verticalCenter
@@ -380,6 +435,7 @@ Item {
         anchors.rightMargin: 10
         anchors.verticalCenter: parent.verticalCenter
         launcher: footer.launcher
+        dpr: footer.dpr
         onModeRequested: gallery => footer.galleryRequested(gallery)
         Component.onCompleted: footer.frame.addControl(viewSwitch) // buttons, not part of the drag area
     }

@@ -39,7 +39,7 @@ Flickable {
             anchors.centerIn: parent
             color: WarmPalette.ink
             font.pixelSize: parent.fontSize
-            font.weight: Font.DemiBold
+            font.weight: Theme.fontStrong
         }
     }
 
@@ -90,7 +90,7 @@ Flickable {
                     text: work.modelData.name
                     color: WarmPalette.ink
                     font.pixelSize: Theme.fontTitle
-                    font.weight: Font.DemiBold
+                    font.weight: Theme.fontStrong
                     font.underline: link.containsMouse
                 }
                 Glyph {
@@ -165,7 +165,7 @@ Flickable {
                 color: WarmPalette.ink
                 opacity: 0.85
                 font.pixelSize: Theme.fontTitle
-                font.weight: Font.DemiBold
+                font.weight: Theme.fontStrong
             }
             Text {
                 text: qsTr("新作品做好就放在这里")
@@ -298,7 +298,7 @@ Flickable {
                         text: qsTr("作者主页")
                         color: WarmPalette.ink
                         font.pixelSize: Theme.fontCaption
-                        font.weight: Font.DemiBold
+                        font.weight: Theme.fontStrong
                     }
                     Glyph {
                         anchors.verticalCenter: parent.verticalCenter
@@ -347,7 +347,7 @@ Flickable {
         spacing: 18
         transform: Snapped { item: bottom }
 
-        // Write to me: a small tilted envelope, a heading and a capsule button.
+        // Feedback: a small tilted envelope, a heading and a capsule button.
         Column {
             width: parent.width
             spacing: 6
@@ -378,7 +378,7 @@ Flickable {
             Text {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                text: qsTr("有任何建议，或想对开发者说的话，欢迎写信给我")
+                text: qsTr("有任何建议，或想对开发者说的话，欢迎到官网反馈")
                 color: WarmPalette.ink
                 opacity: 0.85
                 font.pixelSize: Theme.fontCaption
@@ -389,10 +389,8 @@ Flickable {
                 topPadding: 8
                 spacing: 14
 
-                Rectangle { // new mail in the default mail program
+                Rectangle { // open the official feedback form
                     id: writeButton
-
-                    readonly property bool usable: Gleaning.feedbackEmail.length > 0
 
                     width: writeLabel.implicitWidth + 36
                     height: writeLabel.implicitHeight + 18
@@ -413,73 +411,21 @@ Flickable {
                             color: "white"
                         }
                         Text {
-                            text: writeButton.usable ? Gleaning.feedbackEmail : qsTr("还没有")
+                            text: qsTr("进官网反馈")
                             color: "white"
                             font.pixelSize: Theme.fontCaption
-                            font.weight: Font.DemiBold
+                            font.weight: Theme.fontStrong
                         }
                     }
                     MouseArea {
                         id: writeArea
                         anchors.fill: parent
-                        // Not `enabled: false` with a faded look: the wheat
-                        // would show through. Without an address it does nothing.
-                        enabled: writeButton.usable
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        // The subject names the program and version, so the author can sort the mail.
-                        onClicked: page.editor.openUrl("mailto:" + Gleaning.feedbackEmail + "?subject="
-                            + encodeURIComponent(qsTr("%1 %2 的建议").arg(qsTr("Win顺")).arg(Qt.application.version)))
+                        onClicked: page.editor.openUrl(Gleaning.feedbackUrl)
                     }
                 }
-                Text {
-                    // Nothing to copy without an address (the button says "还没有").
-                    visible: writeButton.usable
-                    // As wide as the longer of the two words, so the label
-                    // swapping to "已复制" does not shift the centred row.
-                    width: Math.max(copyShort.width, copyDone.width)
-                    horizontalAlignment: Text.AlignHCenter
-                    anchors.verticalCenter: writeButton.verticalCenter
-                    text: copyArea.copied ? qsTr("已复制") : qsTr("复制")
-                    color: WarmPalette.ink
-                    opacity: copyArea.containsMouse ? 1 : 0.85
-                    font.pixelSize: 13
-                    font.weight: Font.DemiBold
 
-                    MouseArea {
-                        id: copyArea
-
-                        property bool copied: false
-
-                        anchors.fill: parent
-                        anchors.margins: -6
-                        enabled: writeButton.usable
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            page.editor.copyText(Gleaning.feedbackEmail)
-                            copied = true
-                            copiedTimer.restart()
-                        }
-                        Timer {
-                            id: copiedTimer
-                            interval: 1500
-                            onTriggered: copyArea.copied = false
-                        }
-                    }
-                    TextMetrics {
-                        id: copyShort
-                        text: qsTr("复制")
-                        font.pixelSize: 13
-                        font.weight: Font.DemiBold
-                    }
-                    TextMetrics {
-                        id: copyDone
-                        text: qsTr("已复制")
-                        font.pixelSize: 13
-                        font.weight: Font.DemiBold
-                    }
-                }
             }
         }
 
@@ -537,7 +483,7 @@ Flickable {
                                     text: qsTr("感谢%1收录推荐").arg(thanked.modelData.name)
                                     color: WarmPalette.ink
                                     font.pixelSize: Theme.fontBody
-                                    font.weight: Font.DemiBold
+                                    font.weight: Theme.fontStrong
                                     font.underline: thanksArea.containsMouse
                                 }
                                 Glyph {

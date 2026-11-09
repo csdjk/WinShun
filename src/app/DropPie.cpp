@@ -166,7 +166,7 @@ QFont fontOf(int pixelSize, bool bold = false)
     QFont font = QGuiApplication::font(); // what a QML Text uses unless told otherwise
     font.setPixelSize(std::max(1, pixelSize));
     if (bold)
-        font.setWeight(QFont::DemiBold);
+        font.setWeight(QFont::Bold);
     return font;
 }
 
@@ -191,6 +191,10 @@ DropPie::DropPie(Favorites* favorites, SystemCatalog* places, piedrop::FileOpera
         ::GetCursorPos(&now);
         const bool moved = std::abs(now.x - m_shownAt.x) > 4 || std::abs(now.y - m_shownAt.y) > 4;
         if (moved || m_shownClock.elapsed() > 1000) {
+            // Nothing seen of it (unseen until DragEnter): a failure to the
+            // user, in the log at any level (GitHub #150).
+            qWarning().noquote() << u"Drop pie: shown, but the drag did not come over it in %1 ms (pointer moved %2)"_s
+                                        .arg(m_shownClock.elapsed()).arg(moved ? u"yes"_s : u"no"_s);
             hide("the drag did not come over it");
         } else {
             nudge();
@@ -242,21 +246,26 @@ void DropPie::setWindow(QQuickWindow* window)
 // Qt registered its own drop target when it made the window: ours in its
 // place. Qt never registers again unless the window is made anew (then its
 // handle is another), so this is looked at before every showing.
-void DropPie::takeDropSite()
+bool DropPie::takeDropSite()
 {
     if (!m_window)
-        return;
+        return false;
     const auto hwnd = reinterpret_cast<HWND>(m_window->winId());
     if (hwnd == m_hwnd && m_target)
-        return;
+        return true;
     if (m_target)
         m_target->detach();
     ::RevokeDragDrop(hwnd);
     m_target = Microsoft::WRL::Make<piedrop::DropTarget>(static_cast<piedrop::Handler*>(this));
     const HRESULT hr = m_target ? ::RegisterDragDrop(hwnd, m_target.Get()) : E_OUTOFMEMORY;
-    if (FAILED(hr))
+    if (FAILED(hr)) {
         qWarning().noquote() << u"Drop pie: could not take the window's drops (0x%1)"_s.arg(static_cast<quint32>(hr), 8, 16, u'0');
+        m_target.Reset();
+        m_hwnd = nullptr; // retry at the next summon instead of remembering a failed registration
+        return false;
+    }
     m_hwnd = hwnd;
+    return true;
 }
 
 // Shown once, a pixel big, until its first frame: the graphics are set up
@@ -284,6 +293,16 @@ void DropPie::summoned(POINT pt, HWND captureWindow, DWORD sourcePid)
     QMetaObject::invokeMethod(this, [this, pt, captureWindow, sourcePid] {
         onSummoned(pt, captureWindow, sourcePid);
     }, Qt::QueuedConnection);
+}
+
+QString DropPie::keyTakenTitle()
+{
+    return tr("收藏圆盘打不开");
+}
+
+QString DropPie::keyTakenText()
+{
+    return tr("Esc 下面的 ` 键被另一个程序设成了快捷键，拖动文件时按它打不开圆盘。请在那个程序里换掉这个快捷键。");
 }
 
 void DropPie::buttonReleased()
@@ -349,7 +368,11 @@ void DropPie::open(POINT pt)
     emit stateChanged();
 
     m_window->setGeometry(rect);
-    takeDropSite();
+    if (!takeDropSite()) {
+        hide("drop registration failed");
+        if (m_notify) m_notify(tr("收藏圆盘未打开"), tr("暂时无法接收文件拖放，请松开鼠标后重试。"));
+        return;
+    }
     m_window->show();
     m_window->raise();
     m_shownAt = pt;
@@ -369,6 +392,36 @@ void DropPie::open(POINT pt)
 // the middle's size from the pointer, the pointer is to go to the middle
 // (m_warp). Returns the window's rectangle; the middle and the line are set
 // in it.
+void DropPie::preview(POINT pt, int hovered)
+{
+    QScreen* screen = screenAt(pt);
+    if (!screen || !m_window)
+        return;
+    updateSectors();
+    const QRect rect = place(screen, pt);
+    m_open = true;
+    m_entered = true;
+    m_confirming = false;
+    m_allowed = DROPEFFECT_MOVE | DROPEFFECT_COPY;
+    m_items.clear();
+    m_count = 1;
+    m_plain = false;
+    m_dpr = screen->devicePixelRatio();
+    m_blocks.assign(m_folders.size(), Block::None);
+    for (std::size_t i = 0; i < m_folders.size(); ++i)
+        m_blocks[i] = blockOf(m_folders[i]);
+    m_sameDrive.assign(m_folders.size(), false);
+    m_hit = {};
+    m_keys = {};
+    m_hovered = m_picked = hovered;
+    updateSectors();
+    updateTexts();
+    emit layoutChanged();
+    emit stateChanged();
+    m_window->setGeometry(rect);
+    setRevealed(true);
+}
+
 QRect DropPie::place(QScreen* screen, POINT pt)
 {
     const QPointF cursor = logicalOf(pt, screen);

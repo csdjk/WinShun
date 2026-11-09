@@ -35,13 +35,15 @@ public:
     // Explorer's (the user's session: network logons and all); our own
     // token restricted to medium integrity (no usable Explorer: the user
     // may not see network places the plugins should); our own as it is
-    // (not elevated: we are the user).
-    enum class TokenSource { None, Explorer, Restricted, Plain };
+    // (not elevated: we are the user); our own elevated one (the second
+    // runner, for the plugins allowed to follow an elevated Win顺: Elevation.h).
+    enum class TokenSource { None, Explorer, Restricted, Plain, Elevated };
 
     struct Spec {
         QString exe;
         QStringList args;
         QString cwd;
+        QString qtDir; // host-validated shared runtime; never accepted by an elevated runner
         QList<std::pair<QString, QString>> env; // added to the user's environment
         int memoryMB = 512;
         bool processes = false;
@@ -51,9 +53,19 @@ public:
         bool strict = false; // low integrity, restricted token
         bool oem = false; // its stdout is in the OEM code page
         bool stdinOpen = true; // false: its stdin is NUL (once plugins)
+        // "tools" | "switches": a plugin that comes with Win顺, run on a thread
+        // of the runner instead of `exe` (runner/InProcess.h); its pid is the runner's.
+        QString inProcess;
+        bool elevated = false; // Host's: start it on the elevated runner (not sent)
+        std::shared_ptr<void> hold; // Host's: kept until the process has started (elevation::Hold; not sent)
     };
 
+    // `elevated`: the second runner, started with Win顺's own token as it is
+    // (administrator, when Win顺 is), its pipe open to administrators and
+    // SYSTEM alone. Its instance numbers begin at `firstInstance`, apart from
+    // the first runner's, so the host can tell whose an instance is.
     explicit Runner(QString runnerExe, QObject* parent = nullptr);
+    Runner(QString runnerExe, bool elevated, std::uint64_t firstInstance, QObject* parent = nullptr);
     ~Runner() override; // ends the runner and with it every plugin
 
     // Makes the pipe and starts the runner. False with a reason when the
@@ -102,6 +114,7 @@ private:
     bool m_stopping = false;
     TokenSource m_tokenSource = TokenSource::None;
     QJsonObject m_facts;
+    bool m_elevated = false;
     std::uint64_t m_nextInstance = 1;
     std::vector<QByteArray> m_waiting; // lines to send once ready
 };
